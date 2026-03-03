@@ -14,7 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/beyond5959/codex-acp/pkg/codexacp"
+	codexacp "github.com/beyond5959/acp-adapter/pkg/acpadapter"
 	"github.com/beyond5959/go-acp-server/internal/agents"
 )
 

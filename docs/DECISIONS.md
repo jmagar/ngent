@@ -263,20 +263,20 @@ Use this template for new decisions.
 - Date: 2026-02-28
 - Context: sidecar mode required user-facing binary path configuration (`--codex-acp-go-bin`) and made deployment ergonomics/error modes depend on path wiring.
 - Decision:
-  - replace codex turn execution from external `codex-acp-go` process spawning to in-process `github.com/beyond5959/codex-acp/pkg/codexacp` embedded runtime.
-  - remove user-facing codex binary path flags; server now links codex-acp library directly.
+  - replace codex turn execution from external `codex-acp-go` process spawning to in-process `github.com/beyond5959/acp-adapter/pkg/acpadapter` embedded runtime.
+  - remove user-facing codex binary path flags; server now links acp-adapter library directly.
   - keep lazy startup and per-thread isolation by creating one embedded runtime per thread provider on first turn.
   - keep existing HTTP/SSE/permission/history contracts unchanged; permission round-trip remains fail-closed.
   - set `/v1/agents` codex status by embedded runtime preflight (`available`/`unavailable`) instead of path-config presence.
-- Consequences: simpler operator UX and fewer path misconfiguration failures; server binary is now more tightly coupled to codex-acp module/runtime behavior.
+- Consequences: simpler operator UX and fewer path misconfiguration failures; server binary is now more tightly coupled to acp-adapter module/runtime behavior.
 - Alternatives considered: keep sidecar-only mode; dual mode (embedded + sidecar fallback).
-- Follow-up actions: define codex-acp version pin/upgrade policy and add compatibility smoke checks across codex CLI/app-server versions.
+- Follow-up actions: define acp-adapter version pin/upgrade policy and add compatibility smoke checks across codex CLI/app-server versions.
 
 ## ADR-015: First-Turn Prompt Passthrough for Embedded Slash Commands
 
 - Status: Accepted
 - Date: 2026-02-28
-- Context: context-window injection always wrapped prompts with `[Conversation Summary]` / `[Recent Turns]` / `[Current User Input]`, which masked first-turn slash commands (for example `/mcp call`) in embedded codex-acp flows.
+- Context: context-window injection always wrapped prompts with `[Conversation Summary]` / `[Recent Turns]` / `[Current User Input]`, which masked first-turn slash commands (for example `/mcp call`) in embedded acp-adapter flows.
 - Decision:
   - keep context wrapper for normal multi-turn continuity.
   - when `summary == ""` and there are no visible recent turns, pass through raw `currentInput` (still bounded by `context-max-chars`) instead of wrapping.
@@ -284,7 +284,7 @@ Use this template for new decisions.
   - first-turn slash commands remain functional in embedded mode, enabling deterministic permission round-trip validation (`approved` / `declined`).
   - first-turn request text persisted in history no longer includes synthetic wrapper headings.
 - Alternatives considered:
-  - parse wrapped `[Current User Input]` inside codex-acp slash-command parser.
+  - parse wrapped `[Current User Input]` inside acp-adapter slash-command parser.
   - keep always-wrapped behavior and accept slash-command incompatibility.
 - Follow-up actions:
   - evaluate an explicit API-level raw-input toggle if future providers need slash-command compatibility beyond first turn.
@@ -430,14 +430,14 @@ Use this template for new decisions.
 - Date: 2026-03-03
 - Context:
   - Claude Code is the primary Anthropic coding agent; it was listed as a planned provider (`🔜`) since project inception.
-  - `github.com/beyond5959/codex-acp` already contained a complete parallel `pkg/claudeacp` package with identical API surface to `pkg/codexacp`; no new library dependency was needed.
+  - `github.com/beyond5959/acp-adapter` already contained a complete parallel `pkg/claudeacp` package with identical API surface to `pkg/acpadapter`; no new library dependency was needed.
   - Preflight for Claude does not require a binary path check — availability is determined entirely by the presence of `ANTHROPIC_AUTH_TOKEN` in the environment.
 - Decision:
   - implement `internal/agents/claude` as an embedded provider package mirroring `internal/agents/codex`.
   - replace `codexacp` references with `claudeacp`; `Preflight()` checks `ANTHROPIC_AUTH_TOKEN != ""` (no binary lookup).
   - `DefaultRuntimeConfig()` delegates to `claudeacp.DefaultRuntimeConfig()`, which reads `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_BASE_URL` from environment.
   - wire into server startup: preflight, `/v1/agents` status, `AllowedAgentIDs`, and `TurnAgentFactory`.
-  - for local development, add `replace github.com/beyond5959/codex-acp => /path/to/local/codex-acp` in `go.mod`; remove or publish before production release.
+  - for local development, add `replace github.com/beyond5959/acp-adapter => /path/to/local/acp-adapter` in `go.mod`; remove or publish before production release.
 - Consequences:
   - claude availability is purely environment-variable dependent; no binary installation required beyond valid API credentials.
   - `ANTHROPIC_BASE_URL` allows pointing at a compatible proxy or local endpoint (e.g., for testing or corporate gateways).
@@ -446,5 +446,5 @@ Use this template for new decisions.
   - implement as an ACP stdio provider wrapping the `claude` CLI binary (rejected: CLI spawns its own runtime per invocation with higher latency and no direct permission bridge).
   - share implementation with codex via generics/interface (rejected: would couple two independently-versioned runtimes).
 - Follow-up actions:
-  - publish `codex-acp` with `pkg/claudeacp` to a versioned tag and remove the `replace` directive from `go.mod`.
+  - publish `acp-adapter` with `pkg/claudeacp` to a versioned tag and remove the `replace` directive from `go.mod`.
   - add permission round-trip E2E test for Claude (approved/declined/cancelled paths).

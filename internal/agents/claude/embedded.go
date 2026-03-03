@@ -13,7 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/beyond5959/codex-acp/pkg/claudeacp"
+	"github.com/beyond5959/acp-adapter/pkg/claudeacp"
 	"github.com/beyond5959/go-acp-server/internal/agents"
 )
 

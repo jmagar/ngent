@@ -4,10 +4,12 @@ go 1.24
 
 require modernc.org/sqlite v1.18.2
 
-require github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
+require (
+	github.com/beyond5959/acp-adapter v0.0.0-20260303140435-63849e1a23f4
+	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
+)
 
 require (
-	github.com/beyond5959/codex-acp v0.0.0-20260303103032-9e0b617eb80f
 	github.com/google/uuid v1.3.0 // indirect
 	github.com/kballard/go-shellquote v0.0.0-20180428030007-95032a82bc51 // indirect
 	github.com/mattn/go-isatty v0.0.16 // indirect

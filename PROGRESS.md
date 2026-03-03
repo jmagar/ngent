@@ -69,14 +69,14 @@ This file is the source of milestone progress, validation commands, and next act
   - finalized canonical Go module path as `github.com/beyond5959/go-acp-server`.
   - replaced placeholder import path references across in-repo Go sources/tests.
 - `Post-M8` embedded codex migration completed:
-  - switched codex provider from external `codex-acp-go` path-based process spawning to embedded `github.com/beyond5959/codex-acp/pkg/codexacp`.
+  - switched codex provider from external `codex-acp-go` path-based process spawning to embedded `github.com/beyond5959/acp-adapter/pkg/acpadapter`.
   - removed user-facing codex binary path flags; codex runtime is now linked into server and lazily created per thread on first turn.
   - kept HTTP API semantics unchanged (`threads/turns/sse/permissions/history`) and preserved permission fail-closed round-trip.
   - updated `/v1/agents` codex status contract to runtime preflight-based `available|unavailable`.
   - updated codex smoke test gate to `E2E_CODEX=1` without `CODEX_ACP_GO_BIN` path dependency.
 - `Post-M8` real local codex regression completed:
   - fixed embedded runtime lifecycle bug in `internal/agents/codex/embedded.go` (`runtime.Start(context.Background())` instead of timeout-bound context) and kept retry-on-turn-start-failure guard.
-  - updated context composer so first turn with empty summary/history passes raw input, preserving slash-command semantics for embedded codex-acp flows.
+  - updated context composer so first turn with empty summary/history passes raw input, preserving slash-command semantics for embedded acp-adapter flows.
   - executed real HTTP/SSE regression with required prompts plus same-thread conflict (`409`), cancel convergence, and permission round-trip (`approved` + `declined`) using `/mcp call` on fresh threads.
 - `Post-M8` docs refresh completed:
   - added root `README.md` in English with project goal, `go install` instructions, and startup examples (local/public/auth) using default DB home `$HOME/.go-agent-server`.
@@ -215,7 +215,7 @@ This file is the source of milestone progress, validation commands, and next act
 - Optional enhancement 6: expose environment diagnostics for codex local state DB/schema mismatches (for example `~/.codex/state_5.sqlite` migration drift) and app-server method compatibility.
 
 - `Post-M8` Claude Code embedded provider completed:
-  - implemented `internal/agents/claude/embedded.go` backed by `github.com/beyond5959/codex-acp/pkg/claudeacp.EmbeddedRuntime`.
+  - implemented `internal/agents/claude/embedded.go` backed by `github.com/beyond5959/acp-adapter/pkg/claudeacp.EmbeddedRuntime`.
   - preflight checks `ANTHROPIC_AUTH_TOKEN` environment variable; status reports `available` when set, `unavailable` otherwise.
   - `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_BASE_URL` are read from environment via `claudeacp.DefaultRuntimeConfig()` at startup.
 - `Post-M8` thread delete lifecycle completed:
@@ -228,7 +228,7 @@ This file is the source of milestone progress, validation commands, and next act
     - pass: `go test ./...`
   - added unit tests (`TestPreflight_*`, `TestNew_*`, `TestClose_*`, `TestDefaultRuntimeConfig_ReadsEnv`) covering token presence/absence, default/custom timeouts, and idempotent close.
   - added optional real smoke test (`E2E_CLAUDE=1 go test ./internal/agents/claude/ -run TestClaudeE2ESmoke -v -timeout 120s`); confirmed `PONG` response and `stopReason=end_turn` (16.68s).
-  - added `go.mod` `replace` directive pointing to local `github.com/beyond5959/codex-acp` for local development; refreshed module dependencies for the embedded Claude runtime integration.
+  - added `go.mod` `replace` directive pointing to local `github.com/beyond5959/acp-adapter` for local development; refreshed module dependencies for the embedded Claude runtime integration.
   - wired claude into `cmd/agent-hub-server/main.go`: preflight call, `"claude"` in `AllowedAgentIDs`, `case "claude"` in `TurnAgentFactory`, real status in `supportedAgents`.
   - updated `main_test.go`: `supportedAgents` signature extended with `claudeAvailable bool`; added claude id/status assertions.
   - executed validation:
@@ -302,10 +302,10 @@ This file is the source of milestone progress, validation commands, and next act
 - Effective workaround:
   - used locally cached module `modernc.org/sqlite@v1.18.2` and offline-capable verification.
 - Failure 4:
-  - command: `go get github.com/beyond5959/codex-acp@dev`
+  - command: `go get github.com/beyond5959/acp-adapter@master`
   - error: `lookup proxy.golang.org: no such host`
 - Effective workaround:
-  - reused locally cached `github.com/beyond5959/codex-acp` pseudo-version already present in module cache and pinned it as direct dependency in `go.mod`.
+  - reused locally cached `github.com/beyond5959/acp-adapter` pseudo-version already present in module cache and pinned it as direct dependency in `go.mod`.
 
 ## Milestone Plan (M0-M8)
 
