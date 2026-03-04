@@ -80,7 +80,7 @@ func (c *Client) Stream(ctx context.Context, input string, onDelta func(delta st
 	defer os.RemoveAll(cliHome)
 
 	cmd := exec.Command("gemini", "--experimental-acp")
-	cmd.Env = appendOrReplace(os.Environ(), "GEMINI_CLI_HOME", cliHome)
+	cmd.Env = buildGeminiCLIEnv(cliHome)
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -299,29 +299,32 @@ func makeCLIHome() (string, error) {
 
 // readUserAuthType determines the auth type to configure in the temporary
 // GEMINI_CLI_HOME. Priority:
-//  1. If GEMINI_API_KEY is present in the environment, use "gemini-api-key".
-//  2. Otherwise read security.auth.selectedType from ~/.gemini/settings.json.
+//  1. Use ~/.gemini/settings.json explicit selection when present.
+//  2. Otherwise, if GEMINI_API_KEY is present in env, use "gemini-api-key".
 //  3. Fall back to "oauth-personal" (the default `gemini auth login` flow).
 func readUserAuthType(geminiDir string) string {
+	data, err := os.ReadFile(filepath.Join(geminiDir, "settings.json"))
+	if err == nil {
+		var cfg struct {
+			SelectedAuthType string `json:"selectedAuthType"`
+			Security         struct {
+				Auth struct {
+					SelectedType string `json:"selectedType"`
+				} `json:"auth"`
+			} `json:"security"`
+		}
+		if err := json.Unmarshal(data, &cfg); err == nil {
+			if t := strings.TrimSpace(cfg.Security.Auth.SelectedType); t != "" {
+				return t
+			}
+			if t := strings.TrimSpace(cfg.SelectedAuthType); t != "" {
+				return t
+			}
+		}
+	}
+
 	if os.Getenv("GEMINI_API_KEY") != "" {
 		return "gemini-api-key"
-	}
-	data, err := os.ReadFile(filepath.Join(geminiDir, "settings.json"))
-	if err != nil {
-		return "oauth-personal"
-	}
-	var cfg struct {
-		Security struct {
-			Auth struct {
-				SelectedType string `json:"selectedType"`
-			} `json:"auth"`
-		} `json:"security"`
-	}
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return "oauth-personal"
-	}
-	if t := strings.TrimSpace(cfg.Security.Auth.SelectedType); t != "" {
-		return t
 	}
 	return "oauth-personal"
 }
@@ -354,6 +357,15 @@ func appendOrReplace(env []string, key, value string) []string {
 		}
 	}
 	return append(result, prefix+value)
+}
+
+func buildGeminiCLIEnv(cliHome string) []string {
+	env := appendOrReplace(os.Environ(), "GEMINI_CLI_HOME", cliHome)
+	// Keep endpoint routing deterministic: explicit parent env must win.
+	if value, ok := os.LookupEnv("GOOGLE_GEMINI_BASE_URL"); ok {
+		env = appendOrReplace(env, "GOOGLE_GEMINI_BASE_URL", value)
+	}
+	return env
 }
 
 // ── JSON-RPC 2.0 transport ──────────────────────────────────────────────────
