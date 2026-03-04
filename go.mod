@@ -2,11 +2,10 @@ module github.com/beyond5959/go-acp-server
 
 go 1.24
 
-require modernc.org/sqlite v1.18.2
-
 require (
-	github.com/beyond5959/acp-adapter v0.0.0-20260303140435-63849e1a23f4
+	github.com/beyond5959/acp-adapter v0.0.0-20260304053113-80398110ab50
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
+	modernc.org/sqlite v1.18.2
 )
 
 require (

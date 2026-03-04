@@ -263,7 +263,7 @@ Use this template for new decisions.
 - Date: 2026-02-28
 - Context: sidecar mode required user-facing binary path configuration (`--codex-acp-go-bin`) and made deployment ergonomics/error modes depend on path wiring.
 - Decision:
-  - replace codex turn execution from external `codex-acp-go` process spawning to in-process `github.com/beyond5959/acp-adapter/pkg/acpadapter` embedded runtime.
+  - replace codex turn execution from external `codex-acp-go` process spawning to in-process `github.com/beyond5959/acp-adapter/pkg/codexacp` embedded runtime.
   - remove user-facing codex binary path flags; server now links acp-adapter library directly.
   - keep lazy startup and per-thread isolation by creating one embedded runtime per thread provider on first turn.
   - keep existing HTTP/SSE/permission/history contracts unchanged; permission round-trip remains fail-closed.
@@ -430,7 +430,7 @@ Use this template for new decisions.
 - Date: 2026-03-03
 - Context:
   - Claude Code is the primary Anthropic coding agent; it was listed as a planned provider (`🔜`) since project inception.
-  - `github.com/beyond5959/acp-adapter` already contained a complete parallel `pkg/claudeacp` package with identical API surface to `pkg/acpadapter`; no new library dependency was needed.
+  - `github.com/beyond5959/acp-adapter` already contained a complete parallel `pkg/claudeacp` package with identical API surface to `pkg/codexacp`; no new library dependency was needed.
   - Preflight for Claude does not require a binary path check — availability is determined entirely by the presence of `ANTHROPIC_AUTH_TOKEN` in the environment.
 - Decision:
   - implement `internal/agents/claude` as an embedded provider package mirroring `internal/agents/codex`.

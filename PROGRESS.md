@@ -69,7 +69,7 @@ This file is the source of milestone progress, validation commands, and next act
   - finalized canonical Go module path as `github.com/beyond5959/go-acp-server`.
   - replaced placeholder import path references across in-repo Go sources/tests.
 - `Post-M8` embedded codex migration completed:
-  - switched codex provider from external `codex-acp-go` path-based process spawning to embedded `github.com/beyond5959/acp-adapter/pkg/acpadapter`.
+  - switched codex provider from external `codex-acp-go` path-based process spawning to embedded `github.com/beyond5959/acp-adapter/pkg/codexacp`.
   - removed user-facing codex binary path flags; codex runtime is now linked into server and lazily created per thread on first turn.
   - kept HTTP API semantics unchanged (`threads/turns/sse/permissions/history`) and preserved permission fail-closed round-trip.
   - updated `/v1/agents` codex status contract to runtime preflight-based `available|unavailable`.
