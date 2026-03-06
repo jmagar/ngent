@@ -175,6 +175,58 @@ func TestV1AgentModels(t *testing.T) {
 	}
 }
 
+func TestV1AgentModelsUsesStoredCatalog(t *testing.T) {
+	h := newTestServer(t, testServerOptions{
+		allowedAgentIDs: []string{"codex"},
+		agentList: []AgentInfo{
+			{ID: "codex", Name: "Codex", Status: "available"},
+		},
+	})
+
+	storeImpl, ok := h.store.(*storage.Store)
+	if !ok {
+		t.Fatalf("server store type = %T, want *storage.Store", h.store)
+	}
+	if err := storeImpl.UpsertAgentConfigCatalog(context.Background(), storage.UpsertAgentConfigCatalogParams{
+		AgentID: "codex",
+		ModelID: storage.DefaultAgentConfigCatalogModelID,
+		ConfigOptionsJSON: `[
+			{
+				"id":"model",
+				"category":"model",
+				"type":"select",
+				"currentValue":"gpt-5",
+				"options":[
+					{"value":"gpt-5","name":"GPT-5"},
+					{"value":"gpt-5-mini","name":"GPT-5 Mini"}
+				]
+			}
+		]`,
+	}); err != nil {
+		t.Fatalf("UpsertAgentConfigCatalog(): %v", err)
+	}
+
+	rr := performJSONRequest(t, h, http.MethodGet, "/v1/agents/codex/models", nil, map[string]string{
+		"X-Client-ID": "client-a",
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want %d", rr.Code, http.StatusOK)
+	}
+
+	var body struct {
+		Models []agents.ModelOption `json:"models"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if got, want := len(body.Models), 2; got != want {
+		t.Fatalf("len(models) = %d, want %d", got, want)
+	}
+	if body.Models[1].ID != "gpt-5-mini" {
+		t.Fatalf("models[1].id = %q, want %q", body.Models[1].ID, "gpt-5-mini")
+	}
+}
+
 func TestV1AgentModelsNotFound(t *testing.T) {
 	h := newTestServer(t, testServerOptions{
 		allowedAgentIDs: []string{"codex"},
@@ -747,6 +799,178 @@ func TestThreadConfigOptionsGetAndSetModel(t *testing.T) {
 	}
 	if got := fmt.Sprintf("%v", threadResp.Thread.AgentOptions["modelId"]); got != "gpt-5.2-codex" {
 		t.Fatalf("persisted modelId = %q, want %q", got, "gpt-5.2-codex")
+	}
+}
+
+func TestThreadConfigOptionsGetUsesStoredCatalog(t *testing.T) {
+	root := t.TempDir()
+	h := newTestServer(t, testServerOptions{
+		allowedRoots: []string{root},
+		turnAgentFactory: func(thread storage.Thread) (agents.Streamer, error) {
+			_ = thread
+			return agents.NewFakeAgent(), nil
+		},
+	})
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	threadID := createThreadHTTP(t, ts.URL, "client-a", root)
+
+	storeImpl, ok := h.store.(*storage.Store)
+	if !ok {
+		t.Fatalf("server store type = %T, want *storage.Store", h.store)
+	}
+	if err := storeImpl.UpsertAgentConfigCatalog(context.Background(), storage.UpsertAgentConfigCatalogParams{
+		AgentID: "codex",
+		ModelID: storage.DefaultAgentConfigCatalogModelID,
+		ConfigOptionsJSON: `[
+			{
+				"id":"model",
+				"category":"model",
+				"type":"select",
+				"currentValue":"gpt-5.3-codex",
+				"options":[
+					{"value":"gpt-5.3-codex","name":"gpt-5.3-codex"},
+					{"value":"gpt-5.2-codex","name":"gpt-5.2-codex"}
+				]
+			},
+			{
+				"id":"thought_level",
+				"category":"reasoning",
+				"type":"select",
+				"currentValue":"medium",
+				"options":[
+					{"value":"medium","name":"Medium"},
+					{"value":"high","name":"High"}
+				]
+			}
+		]`,
+	}); err != nil {
+		t.Fatalf("UpsertAgentConfigCatalog(): %v", err)
+	}
+
+	getStatus, getBody := doJSON(
+		t,
+		http.MethodGet,
+		ts.URL+"/v1/threads/"+threadID+"/config-options",
+		nil,
+		map[string]string{"X-Client-ID": "client-a"},
+	)
+	if getStatus != http.StatusOK {
+		t.Fatalf("get config options status = %d, want %d, body=%s", getStatus, http.StatusOK, getBody)
+	}
+
+	var getResp struct {
+		ConfigOptions []agents.ConfigOption `json:"configOptions"`
+	}
+	if err := json.Unmarshal([]byte(getBody), &getResp); err != nil {
+		t.Fatalf("unmarshal get config options response: %v", err)
+	}
+	if got := acpmodel.CurrentValueForConfig(getResp.ConfigOptions, "model"); got != "gpt-5.3-codex" {
+		t.Fatalf("stored model currentValue = %q, want %q", got, "gpt-5.3-codex")
+	}
+	if got := acpmodel.CurrentValueForConfig(getResp.ConfigOptions, "thought_level"); got != "medium" {
+		t.Fatalf("stored thought_level currentValue = %q, want %q", got, "medium")
+	}
+}
+
+func TestThreadConfigOptionsPersistConfigOverrides(t *testing.T) {
+	root := t.TempDir()
+	streamer := newConfigOptionStreamer("gpt-5.3-codex", []agents.ConfigOptionValue{
+		{Value: "gpt-5.3-codex", Name: "gpt-5.3-codex"},
+		{Value: "gpt-5.2-codex", Name: "gpt-5.2-codex"},
+	})
+	streamer.options = append(streamer.options, agents.ConfigOption{
+		ID:           "thought_level",
+		Category:     "reasoning",
+		Name:         "Thought level",
+		Type:         "select",
+		CurrentValue: "medium",
+		Options: []agents.ConfigOptionValue{
+			{Value: "low", Name: "Low"},
+			{Value: "medium", Name: "Medium"},
+			{Value: "high", Name: "High"},
+		},
+	})
+	h := newTestServer(t, testServerOptions{
+		allowedRoots: []string{root},
+		turnAgentFactory: func(thread storage.Thread) (agents.Streamer, error) {
+			_ = thread
+			return streamer, nil
+		},
+	})
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	threadID := createThreadHTTP(t, ts.URL, "client-a", root)
+
+	setStatus, setBody := doJSON(
+		t,
+		http.MethodPost,
+		ts.URL+"/v1/threads/"+threadID+"/config-options",
+		map[string]any{
+			"configId": "thought_level",
+			"value":    "high",
+		},
+		map[string]string{"X-Client-ID": "client-a"},
+	)
+	if setStatus != http.StatusOK {
+		t.Fatalf("set config option status = %d, want %d, body=%s", setStatus, http.StatusOK, setBody)
+	}
+
+	var setResp struct {
+		ConfigOptions []agents.ConfigOption `json:"configOptions"`
+	}
+	if err := json.Unmarshal([]byte(setBody), &setResp); err != nil {
+		t.Fatalf("unmarshal set config options response: %v", err)
+	}
+	if got := acpmodel.CurrentValueForConfig(setResp.ConfigOptions, "thought_level"); got != "high" {
+		t.Fatalf("updated thought_level = %q, want %q", got, "high")
+	}
+
+	threadStatus, threadBody := doJSON(
+		t,
+		http.MethodGet,
+		ts.URL+"/v1/threads/"+threadID,
+		nil,
+		map[string]string{"X-Client-ID": "client-a"},
+	)
+	if threadStatus != http.StatusOK {
+		t.Fatalf("get thread status = %d, want %d, body=%s", threadStatus, http.StatusOK, threadBody)
+	}
+	var threadResp struct {
+		Thread struct {
+			AgentOptions map[string]any `json:"agentOptions"`
+		} `json:"thread"`
+	}
+	if err := json.Unmarshal([]byte(threadBody), &threadResp); err != nil {
+		t.Fatalf("unmarshal get thread response: %v", err)
+	}
+	rawOverrides, ok := threadResp.Thread.AgentOptions["configOverrides"].(map[string]any)
+	if !ok {
+		t.Fatalf("configOverrides missing or invalid: %#v", threadResp.Thread.AgentOptions["configOverrides"])
+	}
+	if got := fmt.Sprintf("%v", rawOverrides["thought_level"]); got != "high" {
+		t.Fatalf("persisted thought_level = %q, want %q", got, "high")
+	}
+	if got := fmt.Sprintf("%v", threadResp.Thread.AgentOptions["modelId"]); got != "gpt-5.3-codex" {
+		t.Fatalf("persisted modelId = %q, want %q", got, "gpt-5.3-codex")
+	}
+
+	storeImpl, ok := h.store.(*storage.Store)
+	if !ok {
+		t.Fatalf("server store type = %T, want *storage.Store", h.store)
+	}
+	catalog, err := storeImpl.GetAgentConfigCatalog(context.Background(), "codex", "gpt-5.3-codex")
+	if err != nil {
+		t.Fatalf("GetAgentConfigCatalog(): %v", err)
+	}
+	options, err := decodeStoredConfigOptions(catalog.ConfigOptionsJSON)
+	if err != nil {
+		t.Fatalf("decodeStoredConfigOptions(): %v", err)
+	}
+	if got := acpmodel.CurrentValueForConfig(options, "thought_level"); got != "high" {
+		t.Fatalf("persisted catalog thought_level = %q, want %q", got, "high")
 	}
 }
 

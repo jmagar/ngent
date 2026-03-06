@@ -29,6 +29,7 @@
 - ADR-025: Hard-delete thread endpoint with active-turn lock. (Accepted)
 - ADR-026: Thread-level model override update API and provider reset. (Accepted)
 - ADR-027: ACP-backed agent model catalog endpoint and UI dropdown wiring. (Accepted)
+- ADR-028: Persist thread config overrides and surface reasoning control in Web UI. (Accepted)
 
 ## ADR-018: Embedded Web UI via Go embed
 
@@ -60,6 +61,33 @@
 - Consequences: deletion is deterministic and race-safe with active turn startup, but remains irreversible (no soft-delete/recover endpoint).
 - Alternatives considered: soft-delete tombstone model, relying only on foreign-key cascades, and best-effort delete without turn-controller lock.
 - Follow-up actions: add optional audit trail for delete operations if compliance requirements increase.
+
+## ADR-028: Persist Thread Config Overrides and Surface Reasoning Control in Web UI
+
+- Status: Accepted
+- Date: 2026-03-06
+- Context:
+  - thread-scoped `config-options` support already enabled immediate model switching, but non-model settings like reasoning only lived inside the current ACP session.
+  - for stdio providers (`opencode`, `qwen`, `gemini`), a reasoning change would otherwise disappear on the next turn because each turn starts a fresh ACP process.
+  - Web UI only surfaced model in the composer footer, even though ACP can report model-specific reasoning choices in the same `configOptions` payload.
+- Decision:
+  - persist non-model current values returned by `POST /v1/threads/{threadId}/config-options` into `agentOptions.configOverrides`.
+  - keep `agentOptions.modelId` as the durable model mirror, and store other current config values by config id in `configOverrides`.
+  - update all built-in providers to reapply persisted non-model overrides on new ACP sessions:
+    - embedded (`codex`, `claude`) reapply overrides after `session/new` on cached runtime initialization.
+    - stdio (`opencode`, `qwen`, `gemini`) reapply overrides after `session/new` before `session/prompt`.
+  - extend the Web UI composer footer to show both `Model` and `Reasoning` controls sourced from thread `configOptions`, with reasoning options refreshed after model changes.
+  - cache config catalogs in the Web UI by agent id so same-agent threads reuse one shared model/reasoning option list without re-querying on every thread switch.
+- Consequences:
+  - reasoning-style settings now survive across future turns and restart/provider reinitialization boundaries.
+  - reasoning remains model-specific because the UI always redraws from the latest ACP-reported thread config options after model changes.
+  - switching between threads on the same agent is cheaper because the UI reuses the cached agent catalog and only applies thread-specific current values locally.
+  - other non-model config categories are persisted server-side but are not yet surfaced as first-class UI controls beyond reasoning.
+- Alternatives considered:
+  - UI-only reasoning selector without persistence.
+  - provider-specific persistence logic for reasoning rather than generic thread config override storage.
+- Follow-up actions:
+  - evaluate surfacing additional ACP config categories in the UI when product requirements justify more advanced controls.
 
 ## ADR-026: Thread-level Model Override Update API and Provider Reset
 
@@ -510,3 +538,34 @@ Use this template for new decisions.
   - expose only agent-level model catalog and infer current model from local metadata.
 - Follow-up actions:
   - optionally add richer Web UI rendering for non-model config categories (e.g. reasoning level) using the same API.
+
+## ADR-026: Persist agent config catalogs in SQLite and refresh them asynchronously on startup
+
+- Status: Accepted
+- Date: 2026-03-06
+- Context:
+  - thread config UX now depends on ACP `configOptions`, especially model-specific reasoning choices.
+  - querying live providers on every thread switch is unnecessary and becomes user-visible after server restart because model/reasoning catalogs are metadata, not per-turn output.
+  - different threads on the same agent can keep different selected model/reasoning values, while still reusing the same underlying catalog data.
+- Decision:
+  - add sqlite table `agent_config_catalogs(agent_id, model_id, config_options_json, updated_at)` and persist normalized ACP config-options snapshots there.
+  - keep per-thread selected values in `threads.agent_options_json`:
+    - `modelId`
+    - `configOverrides`
+  - read path:
+    - `GET /v1/threads/{threadId}/config-options` first loads the stored catalog row for the thread's selected model (or a reserved default snapshot when no model is selected yet), then overlays the thread's own selected current values.
+    - `GET /v1/agents/{agentId}/models` derives model list from stored catalogs before falling back to live discovery.
+  - write path:
+    - `POST /v1/threads/{threadId}/config-options` still mutates the live provider/session, then persists both thread selection state and the current model's returned config-options snapshot.
+  - startup behavior:
+    - launch a background refresher goroutine after server initialization.
+    - refresher queries default + per-model config catalogs for built-in agents and updates sqlite without delaying HTTP startup or blocking frontend requests.
+    - on partial refresh failure, keep previously stored rows for models that could not be refreshed instead of deleting them.
+- Consequences:
+  - restart no longer forces frontend-visible catalog discovery in the common case; stored model/reasoning metadata remains immediately available.
+  - reasoning lists remain model-specific while thread-selected current values stay isolated per thread.
+  - partial refresh strategy trades perfect freshness for availability and catalog continuity.
+- Alternatives considered:
+  - keep catalogs only in frontend memory and re-query on restart.
+  - store only an agent-level flat reasoning list (rejected because reasoning is model-dependent).
+  - block startup until all agents refresh live catalogs (rejected because it would directly impact frontend responsiveness).

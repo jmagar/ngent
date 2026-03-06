@@ -243,6 +243,7 @@ and upstream ACP schema:
 - Model configuration is sourced from ACP session config options, not hardcoded or static agent catalogs.
 - On thread open/new, UI reads current model from `session/new` equivalent data (`configOptions` where `category=model` or `id=model`).
 - Model switching is immediate on dropdown change (no apply button).
+- Reasoning configuration is sourced from the same thread `configOptions` payload and remains model-specific.
 
 ### 13.2 API Contract
 
@@ -258,7 +259,9 @@ and upstream ACP schema:
   - rejects while turn is active (`409 CONFLICT`).
   - applies runtime update through ACP `session/set_config_option`.
   - returns updated `configOptions`.
-  - when `configId=model`, persists thread `agentOptions.modelId` to mirror selected runtime value.
+  - persists thread config state for future turns:
+    - `configId=model` mirrors selected runtime value into `agentOptions.modelId`.
+    - non-model current values are mirrored into `agentOptions.configOverrides[configId]`.
 
 ### 13.3 Provider Behavior
 
@@ -268,13 +271,40 @@ and upstream ACP schema:
 - Embedded providers (`codex`, `claude`):
   - keep session-local config options in cached runtime.
   - `SetConfigOption` calls ACP `session/set_config_option` in the same session.
+  - on fresh runtime/session initialization, replay persisted `agentOptions.configOverrides` after `session/new`.
 - Stdio providers (`opencode`, `qwen`, `gemini`):
-  - perform ACP handshake for config query/apply and persist resulting model selection for subsequent turns.
+  - perform ACP handshake for config query/apply and persist resulting config state for subsequent turns.
+  - on each fresh `session/new`, replay persisted `agentOptions.configOverrides` before `session/prompt`.
   - preserve existing process-per-turn streaming execution model.
 
 ### 13.4 Web UI Behavior
 
-- Chat header model selector now uses thread-level config source (`/v1/threads/{id}/config-options`).
-- Selecting a model calls `POST /v1/threads/{id}/config-options` immediately.
-- Model option descriptions are rendered under selector for each selectable model.
-- During streaming or in-flight switch request, selector is disabled to preserve turn/config safety.
+- Composer footer now uses thread-level config source (`/v1/threads/{id}/config-options`) for both `Model` and `Reasoning`.
+- Selecting a model or reasoning value calls `POST /v1/threads/{id}/config-options` immediately.
+- Reasoning choices are re-read from the latest ACP response after model changes so the control stays model-specific.
+- frontend cache is keyed by `agent + selected model`, so same-agent threads can reuse the same model-specific catalog without incorrectly sharing another model's reasoning list.
+- Option descriptions are rendered inside the dropdown menus for selectable values.
+- During streaming or in-flight switch request, both controls are disabled to preserve turn/config safety.
+
+### 13.5 Catalog Persistence and Restart Refresh
+
+- Added sqlite table `agent_config_catalogs`:
+  - `agent_id`
+  - `model_id`
+  - `config_options_json`
+  - `updated_at`
+- Storage semantics:
+  - one reserved row per agent stores the default snapshot used when the thread has no explicit `modelId` yet.
+  - additional rows are stored per concrete model id and hold the ACP `configOptions` snapshot for that model, including model/reasoning option lists.
+- Read semantics:
+  - `GET /v1/threads/{threadId}/config-options` reads the persisted row matching the thread's selected model (or default row), then overlays thread-local selected values from `agentOptions.modelId` and `agentOptions.configOverrides`.
+  - `GET /v1/agents/{agentId}/models` derives normalized model list from persisted catalog rows before using live discovery fallback.
+- Write semantics:
+  - `POST /v1/threads/{threadId}/config-options` persists:
+    - thread-local current selection state into `threads.agent_options_json`
+    - current model's latest `configOptions` snapshot into `agent_config_catalogs`
+- Startup refresh:
+  - after HTTP server initialization, the process launches a background refresher goroutine.
+  - refresher queries default + per-model ACP config catalogs for all built-in agents and writes them back to sqlite.
+  - refresh is best-effort and non-blocking for HTTP startup.
+  - if some model refreshes fail, successful rows are upserted while older rows for failed models are preserved.

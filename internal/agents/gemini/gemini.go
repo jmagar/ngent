@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,14 +35,17 @@ type Config struct {
 	Dir string
 	// ModelID is the optional model identifier.
 	ModelID string
+	// ConfigOverrides are non-model ACP config values reapplied on new sessions.
+	ConfigOverrides map[string]string
 }
 
 // Client runs one gemini --experimental-acp process per Stream call.
 type Client struct {
 	mu sync.RWMutex
 
-	dir     string
-	modelID string
+	dir             string
+	modelID         string
+	configOverrides map[string]string
 }
 
 var _ agents.Streamer = (*Client)(nil)
@@ -54,8 +58,9 @@ func New(cfg Config) (*Client, error) {
 		return nil, errors.New("gemini: Dir is required")
 	}
 	return &Client{
-		dir:     dir,
-		modelID: strings.TrimSpace(cfg.ModelID),
+		dir:             dir,
+		modelID:         strings.TrimSpace(cfg.ModelID),
+		configOverrides: normalizeConfigOverrides(cfg.ConfigOverrides),
 	}, nil
 }
 
@@ -79,7 +84,7 @@ func (c *Client) ConfigOptions(ctx context.Context) ([]agents.ConfigOption, erro
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return c.runConfigSession(ctx, c.currentModelID(), "", "")
+	return c.runConfigSession(ctx, c.currentModelID(), c.currentConfigOverrides(), "", "")
 }
 
 // SetConfigOption applies one ACP session config option.
@@ -99,7 +104,7 @@ func (c *Client) SetConfigOption(ctx context.Context, configID, value string) ([
 		ctx = context.Background()
 	}
 
-	options, err := c.runConfigSession(ctx, c.currentModelID(), configID, value)
+	options, err := c.runConfigSession(ctx, c.currentModelID(), c.currentConfigOverrides(), configID, value)
 	if err != nil {
 		return nil, err
 	}
@@ -109,7 +114,13 @@ func (c *Client) SetConfigOption(ctx context.Context, configID, value string) ([
 			current = value
 		}
 		c.setModelID(current)
+		return options, nil
 	}
+	current := acpmodel.CurrentValueForConfig(options, configID)
+	if current == "" {
+		current = value
+	}
+	c.setConfigOverride(configID, current)
 	return options, nil
 }
 
@@ -123,6 +134,7 @@ func (c *Client) Stream(ctx context.Context, input string, onDelta func(delta st
 	}
 
 	modelID := c.currentModelID()
+	configOverrides := c.currentConfigOverrides()
 
 	// Create a fresh GEMINI_CLI_HOME to prevent Gemini CLI from writing
 	// interactive auth prompts to stdout, which would corrupt the ACP stream.
@@ -190,6 +202,9 @@ func (c *Client) Stream(ctx context.Context, input string, onDelta func(delta st
 	sessionID := parseSessionID(newResult)
 	if sessionID == "" {
 		return agents.StopReasonEndTurn, errors.New("gemini: session/new returned empty sessionId")
+	}
+	if _, err := c.applyConfigOverrides(ctx, conn, sessionID, acpmodel.ExtractConfigOptions(newResult), configOverrides); err != nil {
+		return agents.StopReasonEndTurn, err
 	}
 
 	// 3. Wire streaming: agent_message_chunk updates → onDelta.
@@ -298,7 +313,37 @@ func (c *Client) setModelID(modelID string) {
 	c.mu.Unlock()
 }
 
-func (c *Client) runConfigSession(ctx context.Context, modelID, configID, value string) ([]agents.ConfigOption, error) {
+func (c *Client) currentConfigOverrides() map[string]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return cloneConfigOverrides(c.configOverrides)
+}
+
+func (c *Client) setConfigOverride(configID, value string) {
+	configID = strings.TrimSpace(configID)
+	if configID == "" || strings.EqualFold(configID, "model") {
+		return
+	}
+	value = strings.TrimSpace(value)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if value == "" {
+		delete(c.configOverrides, configID)
+		return
+	}
+	if c.configOverrides == nil {
+		c.configOverrides = make(map[string]string)
+	}
+	c.configOverrides[configID] = value
+}
+
+func (c *Client) runConfigSession(
+	ctx context.Context,
+	modelID string,
+	configOverrides map[string]string,
+	configID, value string,
+) ([]agents.ConfigOption, error) {
 	cliHome, err := makeCLIHome()
 	if err != nil {
 		return nil, fmt.Errorf("gemini: config options create CLI home: %w", err)
@@ -356,15 +401,17 @@ func (c *Client) runConfigSession(ctx context.Context, modelID, configID, value 
 	if err != nil {
 		return nil, fmt.Errorf("gemini: config options session/new: %w", err)
 	}
-
-	options := acpmodel.ExtractConfigOptions(newResult)
-	if configID == "" {
-		return options, nil
-	}
-
 	sessionID := parseSessionID(newResult)
 	if sessionID == "" {
 		return nil, errors.New("gemini: config options session/new returned empty sessionId")
+	}
+
+	options, err := c.applyConfigOverrides(ctx, conn, sessionID, acpmodel.ExtractConfigOptions(newResult), configOverrides)
+	if err != nil {
+		return nil, err
+	}
+	if configID == "" {
+		return options, nil
 	}
 	setResult, err := conn.Call(ctx, methodSessionSetConfigOption, map[string]any{
 		"sessionId": sessionID,
@@ -380,6 +427,74 @@ func (c *Client) runConfigSession(ctx context.Context, modelID, configID, value 
 		return options, nil
 	}
 	return updated, nil
+}
+
+func (c *Client) applyConfigOverrides(
+	ctx context.Context,
+	conn *rpcConn,
+	sessionID string,
+	options []agents.ConfigOption,
+	overrides map[string]string,
+) ([]agents.ConfigOption, error) {
+	if len(overrides) == 0 {
+		return options, nil
+	}
+
+	configIDs := make([]string, 0, len(overrides))
+	for configID := range overrides {
+		configIDs = append(configIDs, configID)
+	}
+	sort.Strings(configIDs)
+
+	current := options
+	for _, configID := range configIDs {
+		value := strings.TrimSpace(overrides[configID])
+		if value == "" {
+			continue
+		}
+		setResult, err := conn.Call(ctx, methodSessionSetConfigOption, map[string]any{
+			"sessionId": sessionID,
+			"configId":  configID,
+			"value":     value,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("gemini: session/set_config_option(%s): %w", configID, err)
+		}
+		if updated := acpmodel.ExtractConfigOptions(setResult); len(updated) > 0 {
+			current = updated
+		}
+	}
+	return current, nil
+}
+
+func normalizeConfigOverrides(input map[string]string) map[string]string {
+	if len(input) == 0 {
+		return nil
+	}
+	normalized := make(map[string]string, len(input))
+	for rawID, rawValue := range input {
+		configID := strings.TrimSpace(rawID)
+		value := strings.TrimSpace(rawValue)
+		if configID == "" || value == "" || strings.EqualFold(configID, "model") {
+			continue
+		}
+		normalized[configID] = value
+	}
+	if len(normalized) == 0 {
+		return nil
+	}
+	return normalized
+}
+
+func cloneConfigOverrides(input map[string]string) map[string]string {
+	if len(input) == 0 {
+		return nil
+	}
+	cloned := make(map[string]string, len(input))
+	for configID, value := range input {
+		cloned[configID] = value
+	}
+	return cloned
 }
 
 // buildPermResponse constructs a RequestPermissionResponse for the given optionId.

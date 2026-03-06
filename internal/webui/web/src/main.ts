@@ -53,9 +53,11 @@ const claudeIconURL = '/claude-icon.png'
 const opencodeIconURL = '/opencode-icon.png'
 const qwenIconURL = '/qwen-icon.png'
 
+const defaultConfigCatalogCacheKey = '__default__'
 const threadConfigCache = new Map<string, ConfigOption[]>()
-const threadConfigInFlight = new Map<string, Promise<ConfigOption[]>>()
-const threadModelSwitching = new Set<string>()
+const agentConfigCatalogCache = new Map<string, ConfigOption[]>()
+const agentConfigCatalogInFlight = new Map<string, Promise<ConfigOption[]>>()
+const threadConfigSwitching = new Set<string>()
 
 function cloneConfigOptions(options: ConfigOption[]): ConfigOption[] {
   return options.map(option => ({
@@ -64,7 +66,7 @@ function cloneConfigOptions(options: ConfigOption[]): ConfigOption[] {
   }))
 }
 
-function normalizeConfigOptions(options: ConfigOption[]): ConfigOption[] {
+function normalizeConfigOptions(options: ConfigOption[], includeCurrentValue = true): ConfigOption[] {
   const byId = new Set<string>()
   const normalized: ConfigOption[] = []
 
@@ -87,7 +89,7 @@ function normalizeConfigOptions(options: ConfigOption[]): ConfigOption[] {
     }
 
     const currentValue = rawOption.currentValue?.trim() ?? ''
-    if (currentValue && !seenValue.has(currentValue)) {
+    if (includeCurrentValue && currentValue && !seenValue.has(currentValue)) {
       values.unshift({ value: currentValue, name: currentValue })
       seenValue.add(currentValue)
     }
@@ -105,9 +107,45 @@ function normalizeConfigOptions(options: ConfigOption[]): ConfigOption[] {
   return normalized
 }
 
-function cacheThreadConfigOptions(threadId: string, options: ConfigOption[]): ConfigOption[] {
+function normalizeConfigCatalogOptions(options: ConfigOption[]): ConfigOption[] {
+  return normalizeConfigOptions(options, false).map(option => ({
+    ...option,
+    currentValue: '',
+    options: [...(option.options ?? [])],
+  }))
+}
+
+function normalizeAgentConfigCatalogKey(agentId: string, modelId = ''): string {
+  const normalizedAgentID = agentId.trim().toLowerCase()
+  if (!normalizedAgentID) return ''
+  const normalizedModelID = modelId.trim() || defaultConfigCatalogCacheKey
+  return `${normalizedAgentID}::${normalizedModelID}`
+}
+
+function hasAgentConfigCatalog(agentId: string, modelId = ''): boolean {
+  const key = normalizeAgentConfigCatalogKey(agentId, modelId)
+  return !!key && agentConfigCatalogCache.has(key)
+}
+
+function getAgentConfigCatalog(agentId: string, modelId = ''): ConfigOption[] {
+  const key = normalizeAgentConfigCatalogKey(agentId, modelId)
+  if (!key) return []
+  return agentConfigCatalogCache.get(key) ?? []
+}
+
+function cacheAgentConfigCatalog(agentId: string, modelId: string, options: ConfigOption[]): ConfigOption[] {
+  const cacheKey = normalizeAgentConfigCatalogKey(agentId, modelId)
+  const normalized = normalizeConfigCatalogOptions(options)
+  if (cacheKey) {
+    agentConfigCatalogCache.set(cacheKey, normalized)
+  }
+  return normalized
+}
+
+function cacheThreadConfigOptions(thread: Thread, options: ConfigOption[], selectedModelID?: string): ConfigOption[] {
   const normalized = normalizeConfigOptions(options)
-  threadConfigCache.set(threadId, normalized)
+  threadConfigCache.set(thread.threadId, normalized)
+  cacheAgentConfigCatalog(thread.agent ?? '', selectedModelID ?? fallbackThreadModelID(thread), normalized)
   return normalized
 }
 
@@ -128,28 +166,30 @@ function fallbackThreadModelID(thread: Thread): string {
 }
 
 async function loadThreadConfigOptions(threadId: string): Promise<ConfigOption[]> {
-  const normalized = threadId.trim()
-  if (!normalized) return []
+  const thread = store.get().threads.find(item => item.threadId === threadId)
+  if (!thread) return []
+  const selectedModelID = fallbackThreadModelID(thread)
+  const catalogKey = normalizeAgentConfigCatalogKey(thread.agent ?? '', selectedModelID)
 
-  if (threadConfigCache.has(normalized)) {
-    return cloneConfigOptions(threadConfigCache.get(normalized) ?? [])
+  if (threadConfigCache.has(thread.threadId) || hasAgentConfigCatalog(thread.agent ?? '', selectedModelID)) {
+    return cloneConfigOptions(getThreadConfigOptionsForRender(thread))
   }
-  const inFlight = threadConfigInFlight.get(normalized)
+
+  const inFlight = catalogKey ? agentConfigCatalogInFlight.get(catalogKey) : undefined
   if (inFlight) {
-    return inFlight
+    return inFlight.then(() => cloneConfigOptions(getThreadConfigOptionsForRender(thread)))
   }
 
-  const task = api.getThreadConfigOptions(normalized)
-    .then(options => cloneConfigOptions(cacheThreadConfigOptions(normalized, options)))
-    .catch(err => {
-      threadConfigCache.set(normalized, [])
-      throw err
+  const task = api.getThreadConfigOptions(thread.threadId)
+    .then(options => {
+      cacheThreadConfigOptions(thread, options, selectedModelID)
+      return cloneConfigOptions(getThreadConfigOptionsForRender(thread))
     })
     .finally(() => {
-      threadConfigInFlight.delete(normalized)
+      if (catalogKey) agentConfigCatalogInFlight.delete(catalogKey)
     })
 
-  threadConfigInFlight.set(normalized, task)
+  if (catalogKey) agentConfigCatalogInFlight.set(catalogKey, task)
   return task
 }
 
@@ -319,30 +359,112 @@ function threadTitle(t: Thread): string {
   return t.cwd.split('/').filter(Boolean).pop() ?? t.cwd
 }
 
-type ModelPickerState = 'loading' | 'empty' | 'ready'
+type ConfigPickerState = 'loading' | 'empty' | 'ready'
 
-interface ModelPickerOption {
+interface ConfigPickerOption {
   value: string
   name: string
   description: string
 }
 
-function resolveModelPickerData(
-  modelOption: ConfigOption | null,
-  fallbackModelID: string,
-  loading: boolean,
-): {
-  state: ModelPickerState
+interface ConfigPickerLabels {
+  loadingLabel: string
+  emptyLabel: string
+}
+
+interface ConfigPickerData {
+  state: ConfigPickerState
+  configId: string
   selectedValue: string
   selectedLabel: string
-  options: ModelPickerOption[]
-} {
-  if (loading) {
-    return { state: 'loading', selectedValue: '', selectedLabel: 'Loading models…', options: [] }
+  options: ConfigPickerOption[]
+}
+
+function findReasoningOption(options: ConfigOption[]): ConfigOption | null {
+  for (const option of options) {
+    const category = option.category?.trim().toLowerCase() ?? ''
+    const id = option.id.trim().toLowerCase()
+    if (category === 'reasoning' || id === 'reasoning') {
+      return option
+    }
+  }
+  return null
+}
+
+function fallbackThreadConfigValue(thread: Thread, configId: string): string {
+  const trimmedConfigID = configId.trim()
+  if (!trimmedConfigID) return ''
+  if (trimmedConfigID.toLowerCase() === 'model') {
+    return fallbackThreadModelID(thread)
   }
 
-  const rawOptions = modelOption?.options ?? []
-  const options: ModelPickerOption[] = rawOptions
+  const rawOverrides = thread.agentOptions?.configOverrides
+  if (!rawOverrides || typeof rawOverrides !== 'object') return ''
+  const value = (rawOverrides as Record<string, unknown>)[trimmedConfigID]
+  return typeof value === 'string' ? value.trim() : ''
+}
+
+function currentValueForConfig(options: ConfigOption[], configId: string): string {
+  const trimmedConfigID = configId.trim()
+  if (!trimmedConfigID) return ''
+  const option = options.find(item => item.id === trimmedConfigID)
+  return option?.currentValue?.trim() ?? ''
+}
+
+function getThreadConfigOptionsForRender(thread: Thread): ConfigOption[] {
+  const threadOptions = threadConfigCache.get(thread.threadId) ?? []
+  const agentCatalog = getAgentConfigCatalog(thread.agent ?? '', fallbackThreadModelID(thread))
+
+  if (!agentCatalog.length) {
+    return cloneConfigOptions(threadOptions)
+  }
+
+  const merged: ConfigOption[] = []
+  const seen = new Set<string>()
+
+  for (const catalogOption of agentCatalog) {
+    const configId = catalogOption.id.trim()
+    if (!configId) continue
+    seen.add(configId)
+
+    const currentValue = currentValueForConfig(threadOptions, configId) || fallbackThreadConfigValue(thread, configId)
+    merged.push({
+      ...catalogOption,
+      currentValue,
+      options: [...(catalogOption.options ?? [])],
+    })
+  }
+
+  for (const threadOption of threadOptions) {
+    const configId = threadOption.id.trim()
+    if (!configId || seen.has(configId)) continue
+    merged.push({
+      ...threadOption,
+      options: [...(threadOption.options ?? [])],
+    })
+  }
+
+  return merged
+}
+
+function resolveConfigPickerData(
+  configOption: ConfigOption | null,
+  fallbackValue: string,
+  loading: boolean,
+  labels: ConfigPickerLabels,
+): ConfigPickerData {
+  if (loading) {
+    return {
+      state: 'loading',
+      configId: configOption?.id?.trim() ?? '',
+      selectedValue: '',
+      selectedLabel: labels.loadingLabel,
+      options: [],
+    }
+  }
+
+  const rawOptions = configOption?.options ?? []
+  const options: ConfigPickerOption[] = rawOptions
     .map(option => ({
       value: option.value.trim(),
       name: (option.name || option.value).trim() || option.value.trim(),
@@ -351,40 +473,49 @@ function resolveModelPickerData(
     .filter(option => !!option.value)
 
   if (!options.length) {
-    if (fallbackModelID) {
+    if (fallbackValue) {
       return {
         state: 'ready',
-        selectedValue: fallbackModelID,
-        selectedLabel: fallbackModelID,
-        options: [{ value: fallbackModelID, name: fallbackModelID, description: '' }],
+        configId: configOption?.id?.trim() ?? '',
+        selectedValue: fallbackValue,
+        selectedLabel: fallbackValue,
+        options: [{ value: fallbackValue, name: fallbackValue, description: '' }],
       }
     }
-    return { state: 'empty', selectedValue: '', selectedLabel: 'No models available', options: [] }
+    return {
+      state: 'empty',
+      configId: configOption?.id?.trim() ?? '',
+      selectedValue: '',
+      selectedLabel: labels.emptyLabel,
+      options: [],
+    }
   }
 
-  const selectedValue = modelOption?.currentValue?.trim() || fallbackModelID || options[0].value
+  const selectedValue = configOption?.currentValue?.trim() || fallbackValue || options[0].value
   const selectedOption = options.find(option => option.value === selectedValue) ?? options[0]
   return {
     state: 'ready',
+    configId: configOption?.id?.trim() ?? '',
     selectedValue: selectedOption.value,
     selectedLabel: selectedOption.name,
     options,
   }
 }
 
-function renderModelMenuOptions(
-  options: ModelPickerOption[],
+function renderConfigMenuOptions(
+  options: ConfigPickerOption[],
   selectedValue: string,
-  state: ModelPickerState,
+  state: ConfigPickerState,
+  labels: ConfigPickerLabels,
 ): string {
   if (state === 'loading') {
     return `<div class="thread-model-option-item thread-model-option-item--disabled">
-      <div class="thread-model-option-name">Loading models…</div>
+      <div class="thread-model-option-name">${escHtml(labels.loadingLabel)}</div>
     </div>`
   }
   if (state === 'empty' || !options.length) {
     return `<div class="thread-model-option-item thread-model-option-item--disabled">
-      <div class="thread-model-option-name">No models available</div>
+      <div class="thread-model-option-name">${escHtml(labels.emptyLabel)}</div>
     </div>`
   }
 
@@ -404,6 +535,76 @@ function renderModelMenuOptions(
       ${descHTML}
     </button>`
   }).join('')
+}
+
+function buildThreadAgentOptions(
+  base: Record<string, unknown>,
+  options: ConfigOption[],
+): Record<string, unknown> {
+  const next: Record<string, unknown> = { ...base }
+  const modelValue = findModelOption(options)?.currentValue?.trim() ?? ''
+  if (modelValue) {
+    next.modelId = modelValue
+  } else {
+    delete next.modelId
+  }
+
+  const configOverrides: Record<string, string> = {}
+  for (const option of options) {
+    const configId = option.id.trim()
+    if (!configId || configId.toLowerCase() === 'model') continue
+    const value = option.currentValue?.trim() ?? ''
+    if (!value) continue
+    configOverrides[configId] = value
+  }
+  if (Object.keys(configOverrides).length) {
+    next.configOverrides = configOverrides
+  } else {
+    delete next.configOverrides
+  }
+  return next
+}
+
+function renderComposerConfigSwitch(
+  key: 'model' | 'reasoning',
+  label: string,
+  pickerData: ConfigPickerData,
+  labels: ConfigPickerLabels,
+  disabled: boolean,
+): string {
+  return `
+    <div class="thread-model-switch thread-model-switch--composer" data-picker-key="${escHtml(key)}">
+      <button
+        id="thread-${escHtml(key)}-trigger"
+        class="thread-model-trigger"
+        type="button"
+        data-state="${escHtml(pickerData.state)}"
+        data-selected-value="${escHtml(pickerData.selectedValue)}"
+        data-config-id="${escHtml(pickerData.configId)}"
+        aria-haspopup="listbox"
+        aria-expanded="false"
+        aria-label="${escHtml(label)}"
+        ${disabled || pickerData.state !== 'ready' ? 'disabled' : ''}
+      >
+        <span class="thread-model-trigger-copy">
+          <span class="thread-model-trigger-value">${escHtml(pickerData.selectedLabel)}</span>
+        </span>
+        <span class="thread-model-trigger-arrow">▾</span>
+      </button>
+      <div class="thread-model-menu" id="thread-${escHtml(key)}-menu" role="listbox" hidden>
+        ${renderConfigMenuOptions(pickerData.options, pickerData.selectedValue, pickerData.state, labels)}
+      </div>
+    </div>`
+}
+
+const modelPickerLabels: ConfigPickerLabels = {
+  loadingLabel: 'Loading models…',
+  emptyLabel: 'No models available',
+}
+
+const reasoningPickerLabels: ConfigPickerLabels = {
+  loadingLabel: 'Loading reasoning…',
+  emptyLabel: 'No reasoning',
 }
 
 function renderAgentAvatar(agentId: string, variant: 'thread' | 'message'): string {
@@ -546,8 +747,7 @@ async function handleDeleteThread(threadId: string): Promise<void> {
   }
   clearPendingPermissions(threadId)
   threadConfigCache.delete(threadId)
-  threadConfigInFlight.delete(threadId)
-  threadModelSwitching.delete(threadId)
+  threadConfigSwitching.delete(threadId)
 
   store.set({
     threads: nextThreads,
@@ -712,22 +912,22 @@ function updateInputState(): void {
   const sendBtn  = document.getElementById('send-btn')   as HTMLButtonElement   | null
   const cancelBtn = document.getElementById('cancel-btn') as HTMLButtonElement   | null
   const inputEl  = document.getElementById('message-input') as HTMLTextAreaElement | null
-  const modelTriggerEl = document.getElementById('thread-model-trigger') as HTMLButtonElement | null
-  const isSwitchingModel = !!activeThreadId && threadModelSwitching.has(activeThreadId)
+  const isSwitchingConfig = !!activeThreadId && threadConfigSwitching.has(activeThreadId)
 
-  if (sendBtn)  sendBtn.disabled  = isStreaming || isSwitchingModel
-  if (inputEl)  inputEl.disabled  = isStreaming || isSwitchingModel
-  if (modelTriggerEl) {
-    const pickerState = modelTriggerEl.dataset.state ?? 'empty'
-    const noSelectableModel = pickerState !== 'ready'
-    const disabled = isStreaming || isSwitchingModel || noSelectableModel
-    modelTriggerEl.disabled = disabled
+  if (sendBtn)  sendBtn.disabled  = isStreaming || isSwitchingConfig
+  if (inputEl)  inputEl.disabled  = isStreaming || isSwitchingConfig
+  document.querySelectorAll<HTMLButtonElement>('.thread-model-trigger').forEach(triggerEl => {
+    const pickerState = triggerEl.dataset.state ?? 'empty'
+    const configID = triggerEl.dataset.configId?.trim() ?? ''
+    const noSelectableValue = pickerState !== 'ready' || !configID
+    const disabled = isStreaming || isSwitchingConfig || noSelectableValue
+    triggerEl.disabled = disabled
     if (disabled) {
-      modelTriggerEl.setAttribute('aria-expanded', 'false')
-      const menu = document.getElementById('thread-model-menu')
-      if (menu) menu.setAttribute('hidden', 'true')
+      triggerEl.setAttribute('aria-expanded', 'false')
+      const menu = triggerEl.parentElement?.querySelector<HTMLElement>('.thread-model-menu')
+      menu?.setAttribute('hidden', 'true')
     }
-  }
+  })
   if (cancelBtn) {
     cancelBtn.style.display = isStreaming ? '' : 'none'
     cancelBtn.disabled      = isCancelling
@@ -754,13 +954,26 @@ function renderChatEmpty(): string {
 function renderChatThread(t: Thread): string {
   const titleLabel   = threadTitle(t)
   const createdLabel = t.createdAt ? `Created ${formatTimestamp(t.createdAt)}` : ''
-  const hasConfigCache = threadConfigCache.has(t.threadId)
-  const loadingConfig = !hasConfigCache || threadConfigInFlight.has(t.threadId)
-  const configOptions = threadConfigCache.get(t.threadId) ?? []
+  const selectedModelID = fallbackThreadModelID(t)
+  const catalogKey = normalizeAgentConfigCatalogKey(t.agent ?? '', selectedModelID)
+  const hasConfigCache = threadConfigCache.has(t.threadId) || hasAgentConfigCatalog(t.agent ?? '', selectedModelID)
+  const loadingConfig = !hasConfigCache || (!!catalogKey && agentConfigCatalogInFlight.has(catalogKey))
+  const configOptions = getThreadConfigOptionsForRender(t)
   const modelOption = findModelOption(configOptions)
-  const fallbackModel = fallbackThreadModelID(t)
-  const modelPickerData = resolveModelPickerData(modelOption, fallbackModel, loadingConfig)
-  const isSwitching = threadModelSwitching.has(t.threadId)
+  const reasoningOption = findReasoningOption(configOptions)
+  const modelPickerData = resolveConfigPickerData(
+    modelOption,
+    fallbackThreadConfigValue(t, 'model'),
+    loadingConfig,
+    modelPickerLabels,
+  )
+  const reasoningPickerData = resolveConfigPickerData(
+    reasoningOption,
+    reasoningOption ? fallbackThreadConfigValue(t, reasoningOption.id) : '',
+    loadingConfig,
+    reasoningPickerLabels,
+  )
+  const isSwitching = threadConfigSwitching.has(t.threadId)
 
   return `
     <div class="chat-header">
@@ -792,24 +1005,9 @@ function renderChatThread(t: Thread): string {
           aria-label="Message input"
         ></textarea>
         <div class="input-compose-bar">
-          <div class="thread-model-switch thread-model-switch--composer">
-            <button
-              id="thread-model-trigger"
-              class="thread-model-trigger"
-              type="button"
-              data-state="${escHtml(modelPickerData.state)}"
-              data-selected-value="${escHtml(modelPickerData.selectedValue)}"
-              aria-haspopup="listbox"
-              aria-expanded="false"
-              aria-label="Thread model"
-              ${isSwitching || modelPickerData.state !== 'ready' ? 'disabled' : ''}
-            >
-              <span class="thread-model-trigger-label">${escHtml(modelPickerData.selectedLabel)}</span>
-              <span class="thread-model-trigger-arrow">▾</span>
-            </button>
-            <div class="thread-model-menu" id="thread-model-menu" role="listbox" hidden>
-              ${renderModelMenuOptions(modelPickerData.options, modelPickerData.selectedValue, modelPickerData.state)}
-            </div>
+          <div class="thread-config-switches">
+            ${renderComposerConfigSwitch('model', 'Model', modelPickerData, modelPickerLabels, isSwitching)}
+            ${renderComposerConfigSwitch('reasoning', 'Reasoning', reasoningPickerData, reasoningPickerLabels, isSwitching)}
           </div>
           <button class="btn btn-primary btn-send" id="send-btn" aria-label="Send message">
             ${iconSend}
@@ -863,86 +1061,90 @@ function updateChatArea(): void {
   bindInputResize()
   bindSendHandler()
   bindCancelHandler()
-  bindThreadModelSwitch(thread)
+  bindThreadConfigSwitches(thread)
   bindScrollBottom()
 
   // Always reload history from server (keeps view fresh; guards against overwrites during streaming)
   void loadHistory(thread.threadId)
 }
 
-function bindThreadModelSwitch(thread: Thread): void {
-  const triggerEl = document.getElementById('thread-model-trigger') as HTMLButtonElement | null
-  const menuEl = document.getElementById('thread-model-menu') as HTMLDivElement | null
-  if (!triggerEl || !menuEl) return
+function bindThreadConfigSwitches(thread: Thread): void {
+  const switchEls = Array.from(document.querySelectorAll<HTMLElement>('.thread-model-switch[data-picker-key]'))
+  if (!switchEls.length) return
 
-  const closeMenu = (): void => {
-    triggerEl.setAttribute('aria-expanded', 'false')
-    menuEl.setAttribute('hidden', 'true')
-  }
-  const openMenu = (): void => {
-    if (triggerEl.disabled) return
-    triggerEl.setAttribute('aria-expanded', 'true')
-    menuEl.removeAttribute('hidden')
-  }
-  const toggleMenu = (): void => {
-    const expanded = triggerEl.getAttribute('aria-expanded') === 'true'
-    if (expanded) {
-      closeMenu()
-    } else {
-      openMenu()
-    }
+  const closeMenu = (switchEl: HTMLElement): void => {
+    const triggerEl = switchEl.querySelector<HTMLButtonElement>('.thread-model-trigger')
+    const menuEl = switchEl.querySelector<HTMLElement>('.thread-model-menu')
+    triggerEl?.setAttribute('aria-expanded', 'false')
+    menuEl?.setAttribute('hidden', 'true')
   }
 
-  const renderModelUI = (): void => {
+  const closeAllMenus = (): void => {
+    switchEls.forEach(closeMenu)
+  }
+
+  const renderConfigUI = (): void => {
     const latest = store.get().threads.find(item => item.threadId === thread.threadId)
     if (!latest) return
 
-    const fallbackModel = fallbackThreadModelID(latest)
-    const loading = !threadConfigCache.has(thread.threadId) || threadConfigInFlight.has(thread.threadId)
-    const modelOption = findModelOption(threadConfigCache.get(thread.threadId) ?? [])
-    const pickerData = resolveModelPickerData(modelOption, fallbackModel, loading)
-    const isReady = pickerData.state === 'ready'
-    const disabled = loading || threadModelSwitching.has(thread.threadId) || !isReady
+    const selectedModelID = fallbackThreadModelID(latest)
+    const catalogKey = normalizeAgentConfigCatalogKey(latest.agent ?? '', selectedModelID)
+    const loading = (!threadConfigCache.has(thread.threadId) && !hasAgentConfigCatalog(latest.agent ?? '', selectedModelID))
+      || (!!catalogKey && agentConfigCatalogInFlight.has(catalogKey))
+    const options = getThreadConfigOptionsForRender(latest)
+    const modelOption = findModelOption(options)
+    const reasoningOption = findReasoningOption(options)
+    const pickerDataByKey = {
+      model: resolveConfigPickerData(modelOption, fallbackThreadConfigValue(latest, 'model'), loading, modelPickerLabels),
+      reasoning: resolveConfigPickerData(
+        reasoningOption,
+        reasoningOption ? fallbackThreadConfigValue(latest, reasoningOption.id) : '',
+        loading,
+        reasoningPickerLabels,
+      ),
+    } as const
+    const labelsByKey = {
+      model: modelPickerLabels,
+      reasoning: reasoningPickerLabels,
+    } as const
 
-    triggerEl.dataset.state = pickerData.state
-    triggerEl.dataset.selectedValue = pickerData.selectedValue
-    triggerEl.disabled = disabled
-    triggerEl.querySelector('.thread-model-trigger-label')!.textContent = pickerData.selectedLabel
-    menuEl.innerHTML = renderModelMenuOptions(pickerData.options, pickerData.selectedValue, pickerData.state)
-    if (!isReady || disabled) {
-      closeMenu()
-    }
+    switchEls.forEach(switchEl => {
+      const key = (switchEl.dataset.pickerKey === 'reasoning' ? 'reasoning' : 'model')
+      const triggerEl = switchEl.querySelector<HTMLButtonElement>('.thread-model-trigger')
+      const menuEl = switchEl.querySelector<HTMLDivElement>('.thread-model-menu')
+      if (!triggerEl || !menuEl) return
+
+      const pickerData = pickerDataByKey[key]
+      const labels = labelsByKey[key]
+      const isReady = pickerData.state === 'ready'
+      const disabled = loading || threadConfigSwitching.has(thread.threadId) || !isReady || !pickerData.configId
+
+      triggerEl.dataset.state = pickerData.state
+      triggerEl.dataset.selectedValue = pickerData.selectedValue
+      triggerEl.dataset.configId = pickerData.configId
+      triggerEl.disabled = disabled
+      const valueEl = triggerEl.querySelector<HTMLElement>('.thread-model-trigger-value')
+      if (valueEl) valueEl.textContent = pickerData.selectedLabel
+      menuEl.innerHTML = renderConfigMenuOptions(pickerData.options, pickerData.selectedValue, pickerData.state, labels)
+      if (!isReady || disabled) {
+        closeMenu(switchEl)
+      }
+    })
   }
 
   const setSwitching = (switching: boolean): void => {
     if (switching) {
-      threadModelSwitching.add(thread.threadId)
+      threadConfigSwitching.add(thread.threadId)
+      closeAllMenus()
     } else {
-      threadModelSwitching.delete(thread.threadId)
+      threadConfigSwitching.delete(thread.threadId)
     }
-    if (switching) closeMenu()
     if (store.get().activeThreadId === thread.threadId) {
       updateInputState()
     }
   }
 
-  renderModelUI()
-  if (!threadConfigCache.has(thread.threadId)) {
-    void loadThreadConfigOptions(thread.threadId)
-      .then(() => {
-        if (store.get().activeThreadId !== thread.threadId) return
-        renderModelUI()
-        updateInputState()
-      })
-      .catch(err => {
-        if (store.get().activeThreadId !== thread.threadId) return
-        renderModelUI()
-        const message = err instanceof Error ? err.message : String(err)
-        window.alert(`Failed to load model list: ${message}`)
-      })
-  }
-
-  const switchModel = async (nextModelID: string): Promise<void> => {
+  const switchConfig = async (configId: string, nextValue: string): Promise<void> => {
     const activeThreadID = store.get().activeThreadId
     if (!activeThreadID || activeThreadID !== thread.threadId) return
     if (getThreadStreamState(activeThreadID)) return
@@ -950,73 +1152,108 @@ function bindThreadModelSwitch(thread: Thread): void {
     const latest = store.get().threads.find(item => item.threadId === activeThreadID)
     if (!latest) return
 
-    nextModelID = nextModelID.trim()
-    if (!nextModelID) return
+    configId = configId.trim()
+    nextValue = nextValue.trim()
+    if (!configId || !nextValue) return
 
-    const modelOption = findModelOption(threadConfigCache.get(activeThreadID) ?? [])
-    const currentModelID = modelOption?.currentValue || fallbackThreadModelID(latest)
-    if (nextModelID === currentModelID) return
+    const currentOption = getThreadConfigOptionsForRender(latest).find(option => option.id === configId)
+    const currentValue = currentOption?.currentValue?.trim()
+      || fallbackThreadConfigValue(latest, configId)
+    if (nextValue === currentValue) return
 
     setSwitching(true)
     try {
       const updatedOptions = await api.setThreadConfigOption(activeThreadID, {
-        configId: 'model',
-        value: nextModelID,
+        configId,
+        value: nextValue,
       })
-      const normalized = cacheThreadConfigOptions(activeThreadID, updatedOptions)
-      const latestModelOption = findModelOption(normalized)
-      const appliedModelID = latestModelOption?.currentValue || nextModelID
-
+      const nextModelID = findModelOption(updatedOptions)?.currentValue?.trim() ?? fallbackThreadModelID(latest)
+      const normalized = cacheThreadConfigOptions(latest, updatedOptions, nextModelID)
       const { threads } = store.get()
       store.set({
         threads: threads.map(item => (
           item.threadId === activeThreadID
-            ? { ...item, agentOptions: { ...item.agentOptions, modelId: appliedModelID } }
+            ? { ...item, agentOptions: buildThreadAgentOptions(item.agentOptions, normalized) }
             : item
         )),
       })
-      renderModelUI()
+      renderConfigUI()
     } catch (err) {
-      renderModelUI()
+      renderConfigUI()
       const message = err instanceof Error ? err.message : String(err)
-      window.alert(`Failed to switch model: ${message}`)
+      const targetLabel = configId.toLowerCase() === 'model' ? 'model' : 'config option'
+      window.alert(`Failed to update ${targetLabel}: ${message}`)
     } finally {
       setSwitching(false)
-      renderModelUI()
+      renderConfigUI()
     }
   }
 
-  triggerEl.addEventListener('click', e => {
-    e.preventDefault()
-    toggleMenu()
-  })
+  renderConfigUI()
+  if (!threadConfigCache.has(thread.threadId) && !hasAgentConfigCatalog(thread.agent ?? '', fallbackThreadModelID(thread))) {
+    void loadThreadConfigOptions(thread.threadId)
+      .then(() => {
+        if (store.get().activeThreadId !== thread.threadId) return
+        renderConfigUI()
+        updateInputState()
+      })
+      .catch(err => {
+        if (store.get().activeThreadId !== thread.threadId) return
+        renderConfigUI()
+        const message = err instanceof Error ? err.message : String(err)
+        window.alert(`Failed to load thread config options: ${message}`)
+      })
+  }
 
-  menuEl.addEventListener('click', e => {
-    const target = e.target as HTMLElement | null
-    const optionBtn = target?.closest('.thread-model-option-item[data-value]') as HTMLButtonElement | null
-    if (!optionBtn || optionBtn.disabled) return
-    const nextModelID = (optionBtn.dataset.value ?? '').trim()
-    closeMenu()
-    void switchModel(nextModelID)
-  })
+  switchEls.forEach(switchEl => {
+    const triggerEl = switchEl.querySelector<HTMLButtonElement>('.thread-model-trigger')
+    const menuEl = switchEl.querySelector<HTMLDivElement>('.thread-model-menu')
+    if (!triggerEl || !menuEl) return
 
-  const switchEl = triggerEl.closest('.thread-model-switch') as HTMLDivElement | null
-  switchEl?.addEventListener('focusout', e => {
-    const related = e.relatedTarget as Node | null
-    if (!related || !switchEl.contains(related)) {
-      closeMenu()
+    const toggleMenu = (): void => {
+      const expanded = triggerEl.getAttribute('aria-expanded') === 'true'
+      if (expanded) {
+        closeMenu(switchEl)
+        return
+      }
+      if (triggerEl.disabled) return
+      closeAllMenus()
+      triggerEl.setAttribute('aria-expanded', 'true')
+      menuEl.removeAttribute('hidden')
     }
-  })
 
-  const onEsc = (e: KeyboardEvent): void => {
-    if (e.key === 'Escape') {
+    triggerEl.addEventListener('click', e => {
       e.preventDefault()
-      closeMenu()
-      triggerEl.focus()
+      toggleMenu()
+    })
+
+    menuEl.addEventListener('click', e => {
+      const target = e.target as HTMLElement | null
+      const optionBtn = target?.closest('.thread-model-option-item[data-value]') as HTMLButtonElement | null
+      if (!optionBtn || optionBtn.disabled) return
+      const configId = triggerEl.dataset.configId?.trim() ?? ''
+      const nextValue = optionBtn.dataset.value?.trim() ?? ''
+      closeMenu(switchEl)
+      void switchConfig(configId, nextValue)
+    })
+
+    switchEl.addEventListener('focusout', e => {
+      const related = e.relatedTarget as Node | null
+      if (!related || !switchEl.contains(related)) {
+        closeMenu(switchEl)
+      }
+    })
+
+    const onEsc = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        closeMenu(switchEl)
+        triggerEl.focus()
+      }
     }
-  }
-  triggerEl.addEventListener('keydown', onEsc)
-  menuEl.addEventListener('keydown', onEsc)
+    triggerEl.addEventListener('keydown', onEsc)
+    menuEl.addEventListener('keydown', onEsc)
+  })
 }
 
 // ── Scroll-to-bottom button ───────────────────────────────────────────────

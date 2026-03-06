@@ -379,6 +379,86 @@ func TestUpdateThreadAgentOptions(t *testing.T) {
 	}
 }
 
+func TestAgentConfigCatalogCRUD(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	defer func() {
+		_ = store.Close()
+	}()
+
+	base := time.Date(2026, 3, 6, 10, 0, 0, 0, time.UTC)
+	counter := 0
+	store.now = func() time.Time {
+		counter++
+		return base.Add(time.Duration(counter) * time.Second)
+	}
+
+	if err := store.UpsertAgentConfigCatalog(ctx, UpsertAgentConfigCatalogParams{
+		AgentID:           "codex",
+		ModelID:           DefaultAgentConfigCatalogModelID,
+		ConfigOptionsJSON: `[{"id":"model","currentValue":"gpt-5"}]`,
+	}); err != nil {
+		t.Fatalf("UpsertAgentConfigCatalog(default): %v", err)
+	}
+	if err := store.UpsertAgentConfigCatalog(ctx, UpsertAgentConfigCatalogParams{
+		AgentID:           "codex",
+		ModelID:           "gpt-5",
+		ConfigOptionsJSON: `[{"id":"reasoning","currentValue":"high"}]`,
+	}); err != nil {
+		t.Fatalf("UpsertAgentConfigCatalog(gpt-5): %v", err)
+	}
+
+	defaultCatalog, err := store.GetAgentConfigCatalog(ctx, "codex", DefaultAgentConfigCatalogModelID)
+	if err != nil {
+		t.Fatalf("GetAgentConfigCatalog(default): %v", err)
+	}
+	if defaultCatalog.ConfigOptionsJSON != `[{"id":"model","currentValue":"gpt-5"}]` {
+		t.Fatalf("default config_options_json = %q", defaultCatalog.ConfigOptionsJSON)
+	}
+
+	catalogs, err := store.ListAgentConfigCatalogsByAgent(ctx, "codex")
+	if err != nil {
+		t.Fatalf("ListAgentConfigCatalogsByAgent(): %v", err)
+	}
+	if got, want := len(catalogs), 2; got != want {
+		t.Fatalf("len(catalogs) = %d, want %d", got, want)
+	}
+	if got := catalogs[0].ModelID; got != DefaultAgentConfigCatalogModelID {
+		t.Fatalf("catalogs[0].model_id = %q, want %q", got, DefaultAgentConfigCatalogModelID)
+	}
+
+	if err := store.ReplaceAgentConfigCatalogs(ctx, "codex", []UpsertAgentConfigCatalogParams{
+		{
+			ModelID:           DefaultAgentConfigCatalogModelID,
+			ConfigOptionsJSON: `[{"id":"model","currentValue":"gpt-5-mini"}]`,
+		},
+		{
+			ModelID:           "gpt-5-mini",
+			ConfigOptionsJSON: `[{"id":"reasoning","currentValue":"medium"}]`,
+		},
+	}); err != nil {
+		t.Fatalf("ReplaceAgentConfigCatalogs(): %v", err)
+	}
+
+	replaced, err := store.ListAgentConfigCatalogsByAgent(ctx, "codex")
+	if err != nil {
+		t.Fatalf("ListAgentConfigCatalogsByAgent() after replace: %v", err)
+	}
+	if got, want := len(replaced), 2; got != want {
+		t.Fatalf("len(replaced) = %d, want %d", got, want)
+	}
+	if _, err := store.GetAgentConfigCatalog(ctx, "codex", "gpt-5"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetAgentConfigCatalog(removed) err = %v, want ErrNotFound", err)
+	}
+	miniCatalog, err := store.GetAgentConfigCatalog(ctx, "codex", "gpt-5-mini")
+	if err != nil {
+		t.Fatalf("GetAgentConfigCatalog(gpt-5-mini): %v", err)
+	}
+	if miniCatalog.ConfigOptionsJSON != `[{"id":"reasoning","currentValue":"medium"}]` {
+		t.Fatalf("mini config_options_json = %q", miniCatalog.ConfigOptionsJSON)
+	}
+}
+
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
 

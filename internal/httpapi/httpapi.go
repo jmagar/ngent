@@ -41,6 +41,9 @@ type ThreadStore interface {
 	DeleteThread(ctx context.Context, threadID string) error
 	UpdateThreadSummary(ctx context.Context, threadID, summary string) error
 	UpdateThreadAgentOptions(ctx context.Context, threadID, agentOptionsJSON string) error
+	UpsertAgentConfigCatalog(ctx context.Context, params storage.UpsertAgentConfigCatalogParams) error
+	GetAgentConfigCatalog(ctx context.Context, agentID, modelID string) (storage.AgentConfigCatalog, error)
+	ListAgentConfigCatalogsByAgent(ctx context.Context, agentID string) ([]storage.AgentConfigCatalog, error)
 	ListThreadsByClient(ctx context.Context, clientID string) ([]storage.Thread, error)
 	CreateTurn(ctx context.Context, params storage.CreateTurnParams) (storage.Turn, error)
 	GetTurn(ctx context.Context, turnID string) (storage.Turn, error)
@@ -356,8 +359,15 @@ func (s *Server) handleAgentModels(w http.ResponseWriter, r *http.Request, agent
 		return
 	}
 
-	models := []agents.ModelOption{}
-	if s.agentModelsFactory != nil {
+	models, found, err := s.loadStoredAgentModels(r.Context(), agentID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, codeInternal, "failed to load stored agent models", map[string]any{
+			"agent":  agentID,
+			"reason": err.Error(),
+		})
+		return
+	}
+	if !found && s.agentModelsFactory != nil {
 		discovered, err := s.agentModelsFactory(r.Context(), agentID)
 		if err != nil {
 			writeError(w, http.StatusServiceUnavailable, codeUpstreamUnavailable, "failed to query agent models", map[string]any{
@@ -1097,28 +1107,45 @@ func (s *Server) handleThreadConfigOptions(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	manager, err := s.resolveThreadConfigOptionManager(thread)
-	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, codeUpstreamUnavailable, "failed to resolve config options manager", map[string]any{
-			"agent":  thread.AgentID,
-			"reason": err.Error(),
-		})
-		return
-	}
-
 	switch r.Method {
 	case http.MethodGet:
-		options, err := manager.ConfigOptions(r.Context())
+		options, found, err := s.loadStoredThreadConfigOptions(r.Context(), thread)
 		if err != nil {
-			writeError(w, http.StatusServiceUnavailable, codeUpstreamUnavailable, "failed to query thread config options", map[string]any{
+			writeError(w, http.StatusInternalServerError, codeInternal, "failed to load stored thread config options", map[string]any{
 				"threadId": thread.ThreadID,
 				"reason":   err.Error(),
 			})
 			return
 		}
+		if !found {
+			manager, err := s.resolveThreadConfigOptionManager(thread)
+			if err != nil {
+				writeError(w, http.StatusServiceUnavailable, codeUpstreamUnavailable, "failed to resolve config options manager", map[string]any{
+					"agent":  thread.AgentID,
+					"reason": err.Error(),
+				})
+				return
+			}
+			options, err = manager.ConfigOptions(r.Context())
+			if err != nil {
+				writeError(w, http.StatusServiceUnavailable, codeUpstreamUnavailable, "failed to query thread config options", map[string]any{
+					"threadId": thread.ThreadID,
+					"reason":   err.Error(),
+				})
+				return
+			}
+			options = acpmodel.NormalizeConfigOptions(options)
+			if persistErr := s.persistAgentConfigCatalog(r.Context(), thread.AgentID, thread.AgentOptionsJSON, options); persistErr != nil {
+				s.logger.Warn("config_catalog.persist_failed",
+					"threadId", thread.ThreadID,
+					"agent", thread.AgentID,
+					"reason", persistErr.Error(),
+				)
+			}
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"threadId":      thread.ThreadID,
-			"configOptions": acpmodel.NormalizeConfigOptions(options),
+			"configOptions": options,
 		})
 	case http.MethodPost:
 		if s.turns.IsThreadActive(thread.ThreadID) {
@@ -1145,6 +1172,14 @@ func (s *Server) handleThreadConfigOptions(w http.ResponseWriter, r *http.Reques
 			return
 		}
 
+		manager, err := s.resolveThreadConfigOptionManager(thread)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, codeUpstreamUnavailable, "failed to resolve config options manager", map[string]any{
+				"agent":  thread.AgentID,
+				"reason": err.Error(),
+			})
+			return
+		}
 		options, err := manager.SetConfigOption(r.Context(), req.ConfigID, req.Value)
 		if err != nil {
 			writeError(w, http.StatusServiceUnavailable, codeUpstreamUnavailable, "failed to update thread config option", map[string]any{
@@ -1156,27 +1191,33 @@ func (s *Server) handleThreadConfigOptions(w http.ResponseWriter, r *http.Reques
 		}
 		options = acpmodel.NormalizeConfigOptions(options)
 
-		if strings.EqualFold(req.ConfigID, "model") {
-			currentModel := acpmodel.CurrentValueForConfig(options, "model")
-			if currentModel == "" {
-				currentModel = req.Value
-			}
-			agentOptionsJSON, err := withThreadModelID(thread.AgentOptionsJSON, currentModel)
-			if err != nil {
-				writeError(w, http.StatusInternalServerError, codeInternal, "failed to normalize thread agent options", map[string]any{
-					"threadId": thread.ThreadID,
-					"reason":   err.Error(),
-				})
+		currentModel := acpmodel.CurrentValueForConfig(options, "model")
+		if currentModel == "" && strings.EqualFold(req.ConfigID, "model") {
+			currentModel = req.Value
+		}
+		agentOptionsJSON, err := withThreadConfigState(thread.AgentOptionsJSON, currentModel, options)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, codeInternal, "failed to normalize thread agent options", map[string]any{
+				"threadId": thread.ThreadID,
+				"reason":   err.Error(),
+			})
+			return
+		}
+		if err := s.store.UpdateThreadAgentOptions(r.Context(), thread.ThreadID, agentOptionsJSON); err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				writeError(w, http.StatusNotFound, codeNotFound, "thread not found", map[string]any{})
 				return
 			}
-			if err := s.store.UpdateThreadAgentOptions(r.Context(), thread.ThreadID, agentOptionsJSON); err != nil {
-				if errors.Is(err, storage.ErrNotFound) {
-					writeError(w, http.StatusNotFound, codeNotFound, "thread not found", map[string]any{})
-					return
-				}
-				writeError(w, http.StatusInternalServerError, codeInternal, "failed to update thread", map[string]any{"reason": err.Error()})
-				return
-			}
+			writeError(w, http.StatusInternalServerError, codeInternal, "failed to update thread", map[string]any{"reason": err.Error()})
+			return
+		}
+		if persistErr := s.persistAgentConfigCatalog(r.Context(), thread.AgentID, agentOptionsJSON, options); persistErr != nil {
+			s.logger.Warn("config_catalog.persist_failed",
+				"threadId", thread.ThreadID,
+				"agent", thread.AgentID,
+				"configId", req.ConfigID,
+				"reason", persistErr.Error(),
+			)
 		}
 
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -1817,6 +1858,99 @@ func (s *Server) resolvePermission(permissionID, clientID string, outcome agents
 	return nil
 }
 
+func (s *Server) loadStoredAgentModels(ctx context.Context, agentID string) ([]agents.ModelOption, bool, error) {
+	catalogs, err := s.store.ListAgentConfigCatalogsByAgent(ctx, agentID)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(catalogs) == 0 {
+		return nil, false, nil
+	}
+
+	models := make([]agents.ModelOption, 0)
+	for _, catalog := range catalogs {
+		options, err := decodeStoredConfigOptions(catalog.ConfigOptionsJSON)
+		if err != nil {
+			s.logger.Warn("config_catalog.decode_failed",
+				"agent", agentID,
+				"modelId", catalog.ModelID,
+				"reason", err.Error(),
+			)
+			continue
+		}
+		modelOption, ok := acpmodel.FindModelConfigOption(options)
+		if !ok {
+			continue
+		}
+		for _, value := range modelOption.Options {
+			modelID := strings.TrimSpace(value.Value)
+			if modelID == "" {
+				continue
+			}
+			name := strings.TrimSpace(value.Name)
+			if name == "" {
+				name = modelID
+			}
+			models = append(models, agents.ModelOption{ID: modelID, Name: name})
+		}
+	}
+
+	models = acpmodel.NormalizeModelOptions(models)
+	if len(models) == 0 {
+		return nil, false, nil
+	}
+	return models, true, nil
+}
+
+func (s *Server) loadStoredThreadConfigOptions(ctx context.Context, thread storage.Thread) ([]agents.ConfigOption, bool, error) {
+	modelID, overrides := threadConfigSelections(thread.AgentOptionsJSON)
+
+	lookupModelID := modelID
+	if lookupModelID == "" {
+		lookupModelID = storage.DefaultAgentConfigCatalogModelID
+	}
+
+	catalog, err := s.store.GetAgentConfigCatalog(ctx, thread.AgentID, lookupModelID)
+	if errors.Is(err, storage.ErrNotFound) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+
+	options, err := decodeStoredConfigOptions(catalog.ConfigOptionsJSON)
+	if err != nil {
+		return nil, false, err
+	}
+	return applyThreadConfigSelections(options, modelID, overrides), true, nil
+}
+
+func (s *Server) persistAgentConfigCatalog(
+	ctx context.Context,
+	agentID string,
+	agentOptionsJSON string,
+	options []agents.ConfigOption,
+) error {
+	modelID, _ := threadConfigSelections(agentOptionsJSON)
+	if currentModel := strings.TrimSpace(acpmodel.CurrentValueForConfig(options, "model")); currentModel != "" {
+		modelID = currentModel
+	}
+	if strings.TrimSpace(modelID) == "" {
+		modelID = storage.DefaultAgentConfigCatalogModelID
+	}
+
+	configOptionsJSON, err := encodeStoredConfigOptions(options)
+	if err != nil {
+		return err
+	}
+
+	return s.store.UpsertAgentConfigCatalog(ctx, storage.UpsertAgentConfigCatalogParams{
+		AgentID:           agentID,
+		ModelID:           modelID,
+		ConfigOptionsJSON: configOptionsJSON,
+	})
+}
+
 func normalizeAgentOptions(raw json.RawMessage) (string, error) {
 	if len(strings.TrimSpace(string(raw))) == 0 {
 		return "{}", nil
@@ -1834,7 +1968,7 @@ func normalizeAgentOptions(raw json.RawMessage) (string, error) {
 	return string(normalized), nil
 }
 
-func withThreadModelID(agentOptionsJSON, modelID string) (string, error) {
+func withThreadConfigState(agentOptionsJSON, modelID string, options []agents.ConfigOption) (string, error) {
 	modelID = strings.TrimSpace(modelID)
 
 	objectValue := map[string]any{}
@@ -1851,11 +1985,123 @@ func withThreadModelID(agentOptionsJSON, modelID string) (string, error) {
 		objectValue["modelId"] = modelID
 	}
 
+	configOverrides := configOverridesFromOptions(options)
+	if len(configOverrides) == 0 {
+		delete(objectValue, "configOverrides")
+	} else {
+		objectValue["configOverrides"] = configOverrides
+	}
+
 	normalized, err := json.Marshal(objectValue)
 	if err != nil {
 		return "", err
 	}
 	return string(normalized), nil
+}
+
+func configOverridesFromOptions(options []agents.ConfigOption) map[string]string {
+	overrides := make(map[string]string, len(options))
+	for _, option := range options {
+		configID := strings.TrimSpace(option.ID)
+		if configID == "" || strings.EqualFold(configID, "model") {
+			continue
+		}
+		value := strings.TrimSpace(option.CurrentValue)
+		if value == "" {
+			continue
+		}
+		overrides[configID] = value
+	}
+	if len(overrides) == 0 {
+		return nil
+	}
+	return overrides
+}
+
+func decodeStoredConfigOptions(raw string) ([]agents.ConfigOption, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+
+	var options []agents.ConfigOption
+	if err := json.Unmarshal([]byte(raw), &options); err != nil {
+		return nil, fmt.Errorf("decode stored config options: %w", err)
+	}
+	return acpmodel.NormalizeConfigOptions(options), nil
+}
+
+func encodeStoredConfigOptions(options []agents.ConfigOption) (string, error) {
+	normalized := acpmodel.NormalizeConfigOptions(options)
+	encoded, err := json.Marshal(normalized)
+	if err != nil {
+		return "", fmt.Errorf("encode stored config options: %w", err)
+	}
+	return string(encoded), nil
+}
+
+func threadConfigSelections(agentOptionsJSON string) (string, map[string]string) {
+	var raw struct {
+		ModelID         string         `json:"modelId"`
+		ConfigOverrides map[string]any `json:"configOverrides"`
+	}
+	if strings.TrimSpace(agentOptionsJSON) == "" {
+		return "", nil
+	}
+	if err := json.Unmarshal([]byte(agentOptionsJSON), &raw); err != nil {
+		return "", nil
+	}
+
+	overrides := make(map[string]string, len(raw.ConfigOverrides))
+	for rawID, rawValue := range raw.ConfigOverrides {
+		configID := strings.TrimSpace(rawID)
+		if configID == "" {
+			continue
+		}
+		value, ok := rawValue.(string)
+		if !ok {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		overrides[configID] = value
+	}
+	if len(overrides) == 0 {
+		overrides = nil
+	}
+
+	return strings.TrimSpace(raw.ModelID), overrides
+}
+
+func applyThreadConfigSelections(
+	options []agents.ConfigOption,
+	modelID string,
+	overrides map[string]string,
+) []agents.ConfigOption {
+	cloned := acpmodel.CloneConfigOptions(options)
+	modelID = strings.TrimSpace(modelID)
+
+	for i := range cloned {
+		configID := strings.TrimSpace(cloned[i].ID)
+		if configID == "" {
+			continue
+		}
+		if strings.EqualFold(configID, "model") || strings.EqualFold(strings.TrimSpace(cloned[i].Category), "model") {
+			if modelID != "" {
+				cloned[i].CurrentValue = modelID
+			}
+			continue
+		}
+		if len(overrides) == 0 {
+			continue
+		}
+		if value := strings.TrimSpace(overrides[configID]); value != "" {
+			cloned[i].CurrentValue = value
+		}
+	}
+
+	return acpmodel.NormalizeConfigOptions(cloned)
 }
 
 func isPathAllowed(path string, roots []string) bool {

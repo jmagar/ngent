@@ -16,6 +16,10 @@ var (
 	ErrNotFound = errors.New("storage: not found")
 )
 
+// DefaultAgentConfigCatalogModelID is the synthetic model key used for the
+// agent's default config-options snapshot.
+const DefaultAgentConfigCatalogModelID = "__agent_hub_default__"
+
 // Store wraps SQLite-backed persistence operations.
 type Store struct {
 	path string
@@ -45,6 +49,21 @@ type CreateThreadParams struct {
 	Title            string
 	AgentOptionsJSON string
 	Summary          string
+}
+
+// AgentConfigCatalog stores one persisted agent/model config-options snapshot.
+type AgentConfigCatalog struct {
+	AgentID           string
+	ModelID           string
+	ConfigOptionsJSON string
+	UpdatedAt         time.Time
+}
+
+// UpsertAgentConfigCatalogParams contains input for UpsertAgentConfigCatalog.
+type UpsertAgentConfigCatalogParams struct {
+	AgentID           string
+	ModelID           string
+	ConfigOptionsJSON string
 }
 
 // Turn stores one persisted turn row.
@@ -404,6 +423,159 @@ func (s *Store) UpdateThreadAgentOptions(ctx context.Context, threadID, agentOpt
 		return ErrNotFound
 	}
 	return nil
+}
+
+// UpsertAgentConfigCatalog stores one agent/model config-options snapshot.
+func (s *Store) UpsertAgentConfigCatalog(ctx context.Context, params UpsertAgentConfigCatalogParams) error {
+	if strings.TrimSpace(params.AgentID) == "" {
+		return errors.New("storage: agentID is required")
+	}
+	if strings.TrimSpace(params.ModelID) == "" {
+		return errors.New("storage: modelID is required")
+	}
+	if strings.TrimSpace(params.ConfigOptionsJSON) == "" {
+		params.ConfigOptionsJSON = "[]"
+	}
+
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT INTO agent_config_catalogs (
+			agent_id,
+			model_id,
+			config_options_json,
+			updated_at
+		) VALUES (?, ?, ?, ?)
+		ON CONFLICT(agent_id, model_id) DO UPDATE SET
+			config_options_json = excluded.config_options_json,
+			updated_at = excluded.updated_at;
+	`,
+		params.AgentID,
+		params.ModelID,
+		params.ConfigOptionsJSON,
+		formatTime(s.now()),
+	); err != nil {
+		return fmt.Errorf("storage: upsert agent config catalog: %w", err)
+	}
+
+	return nil
+}
+
+// ReplaceAgentConfigCatalogs atomically replaces all stored catalogs for one agent.
+func (s *Store) ReplaceAgentConfigCatalogs(ctx context.Context, agentID string, params []UpsertAgentConfigCatalogParams) error {
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		return errors.New("storage: agentID is required")
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("storage: begin replace agent config catalogs tx: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM agent_config_catalogs
+		WHERE agent_id = ?;
+	`, agentID); err != nil {
+		return fmt.Errorf("storage: delete agent config catalogs: %w", err)
+	}
+
+	updatedAt := formatTime(s.now())
+	for _, param := range params {
+		if err := upsertAgentConfigCatalogTx(ctx, tx, updatedAt, agentID, param); err != nil {
+			return err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("storage: commit replace agent config catalogs tx: %w", err)
+	}
+	return nil
+}
+
+// GetAgentConfigCatalog returns one persisted config-options snapshot.
+func (s *Store) GetAgentConfigCatalog(ctx context.Context, agentID, modelID string) (AgentConfigCatalog, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT
+			agent_id,
+			model_id,
+			config_options_json,
+			updated_at
+		FROM agent_config_catalogs
+		WHERE agent_id = ? AND model_id = ?;
+	`, agentID, modelID)
+
+	var (
+		catalog     AgentConfigCatalog
+		updatedAtDB string
+	)
+	if err := row.Scan(
+		&catalog.AgentID,
+		&catalog.ModelID,
+		&catalog.ConfigOptionsJSON,
+		&updatedAtDB,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return AgentConfigCatalog{}, ErrNotFound
+		}
+		return AgentConfigCatalog{}, fmt.Errorf("storage: get agent config catalog: %w", err)
+	}
+
+	updatedAt, err := parseTime(updatedAtDB)
+	if err != nil {
+		return AgentConfigCatalog{}, fmt.Errorf("storage: parse agent config catalog.updated_at: %w", err)
+	}
+	catalog.UpdatedAt = updatedAt
+	return catalog, nil
+}
+
+// ListAgentConfigCatalogsByAgent returns all persisted catalogs for one agent.
+func (s *Store) ListAgentConfigCatalogsByAgent(ctx context.Context, agentID string) ([]AgentConfigCatalog, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT
+			agent_id,
+			model_id,
+			config_options_json,
+			updated_at
+		FROM agent_config_catalogs
+		WHERE agent_id = ?
+		ORDER BY
+			CASE WHEN model_id = ? THEN 0 ELSE 1 END,
+			model_id ASC;
+	`, agentID, DefaultAgentConfigCatalogModelID)
+	if err != nil {
+		return nil, fmt.Errorf("storage: list agent config catalogs: %w", err)
+	}
+	defer rows.Close()
+
+	catalogs := make([]AgentConfigCatalog, 0)
+	for rows.Next() {
+		var (
+			catalog     AgentConfigCatalog
+			updatedAtDB string
+		)
+		if err := rows.Scan(
+			&catalog.AgentID,
+			&catalog.ModelID,
+			&catalog.ConfigOptionsJSON,
+			&updatedAtDB,
+		); err != nil {
+			return nil, fmt.Errorf("storage: scan agent config catalog: %w", err)
+		}
+
+		updatedAt, err := parseTime(updatedAtDB)
+		if err != nil {
+			return nil, fmt.Errorf("storage: parse agent config catalog.updated_at: %w", err)
+		}
+		catalog.UpdatedAt = updatedAt
+		catalogs = append(catalogs, catalog)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("storage: list agent config catalogs rows: %w", err)
+	}
+	return catalogs, nil
 }
 
 // ListThreadsByClient returns all threads for one client.
@@ -867,6 +1039,48 @@ func formatTime(t time.Time) string {
 
 func parseTime(raw string) (time.Time, error) {
 	return time.Parse(time.RFC3339Nano, raw)
+}
+
+func upsertAgentConfigCatalogTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	updatedAt string,
+	agentID string,
+	param UpsertAgentConfigCatalogParams,
+) error {
+	if strings.TrimSpace(param.AgentID) == "" {
+		param.AgentID = agentID
+	}
+	if strings.TrimSpace(param.AgentID) != agentID {
+		return fmt.Errorf("storage: replace agent config catalogs mismatched agentID %q", param.AgentID)
+	}
+	if strings.TrimSpace(param.ModelID) == "" {
+		return errors.New("storage: modelID is required")
+	}
+	if strings.TrimSpace(param.ConfigOptionsJSON) == "" {
+		param.ConfigOptionsJSON = "[]"
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO agent_config_catalogs (
+			agent_id,
+			model_id,
+			config_options_json,
+			updated_at
+		) VALUES (?, ?, ?, ?)
+		ON CONFLICT(agent_id, model_id) DO UPDATE SET
+			config_options_json = excluded.config_options_json,
+			updated_at = excluded.updated_at;
+	`,
+		agentID,
+		param.ModelID,
+		param.ConfigOptionsJSON,
+		updatedAt,
+	); err != nil {
+		return fmt.Errorf("storage: replace agent config catalogs upsert model %q: %w", param.ModelID, err)
+	}
+
+	return nil
 }
 
 func boolToSQLiteInt(v bool) int {

@@ -79,4 +79,18 @@ var migrations = []migration{
 			`ALTER TABLE turns ADD COLUMN is_internal INTEGER NOT NULL DEFAULT 0;`,
 		},
 	},
+	{
+		version: 6,
+		name:    "create_agent_config_catalogs",
+		sql: []string{
+			`CREATE TABLE IF NOT EXISTS agent_config_catalogs (
+				agent_id TEXT NOT NULL,
+				model_id TEXT NOT NULL,
+				config_options_json TEXT NOT NULL,
+				updated_at TEXT NOT NULL,
+				PRIMARY KEY (agent_id, model_id)
+			);`,
+			`CREATE INDEX IF NOT EXISTS idx_agent_config_catalogs_agent_id ON agent_config_catalogs(agent_id);`,
+		},
+	},
 }

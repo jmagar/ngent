@@ -435,7 +435,7 @@ body {
   display: inline-flex;
   width: auto;
   min-width: 0;
-  max-width: min(60vw, 360px);
+  max-width: min(36vw, 240px);
   flex: 0 1 auto;
 }
 
@@ -456,6 +456,12 @@ body {
   cursor: pointer;
 }
 
+.thread-model-trigger-copy {
+  min-width: 0;
+  display: block;
+  overflow: hidden;
+}
+
 .thread-model-switch--composer .thread-model-trigger {
   width: auto;
   max-width: 100%;
@@ -473,7 +479,7 @@ body {
   cursor: not-allowed;
 }
 
-.thread-model-trigger-label {
+.thread-model-trigger-value {
   min-width: 0;
   overflow: hidden;
   white-space: nowrap;
@@ -952,6 +958,16 @@ body {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+  flex-wrap: wrap;
+}
+
+.thread-config-switches {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
 }
 
 .message-input {
@@ -1129,6 +1145,7 @@ button:disabled, .btn:disabled {
   padding: 0;
   border-radius: var(--r-full);
   flex-shrink: 0;
+  margin-left: auto;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -1204,15 +1221,20 @@ button:disabled, .btn:disabled {
     width: 100%;
   }
 
+  .thread-config-switches {
+    width: 100%;
+  }
+
   .thread-model-switch {
     width: 150px;
     min-width: 150px;
   }
 
   .thread-model-switch--composer {
-    width: auto;
+    width: calc(50% - 4px);
     min-width: 0;
-    max-width: calc(100vw - 128px);
+    max-width: none;
+    flex: 1 1 calc(50% - 4px);
   }
 
   .thread-model-menu {

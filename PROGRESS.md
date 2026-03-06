@@ -293,17 +293,8 @@ This file is the source of milestone progress, validation commands, and next act
 - Failure 1:
   - command: `go get modernc.org/sqlite`
   - error: `lookup proxy.golang.org: no such host`
-- Attempted GOPROXY fallback 1:
-  - command: `GOPROXY=https://goproxy.cn,direct go get modernc.org/sqlite`
-  - error: `lookup goproxy.cn: no such host`
-- Attempted GOPROXY fallback 2:
-  - command: `GOPROXY=direct go get modernc.org/sqlite`
-  - error: `lookup modernc.org: no such host`
 - Effective workaround:
   - used locally cached module `modernc.org/sqlite@v1.18.2` and offline-capable verification.
-- Failure 4:
-  - command: `go get github.com/beyond5959/acp-adapter@master`
-  - error: `lookup proxy.golang.org: no such host`
 - Effective workaround:
   - reused locally cached `github.com/beyond5959/acp-adapter` pseudo-version already present in module cache and pinned it as direct dependency in `go.mod`.
 
@@ -444,6 +435,26 @@ This file is the source of milestone progress, validation commands, and next act
     - pass: `cd internal/webui/web && npm run build`
     - pass: `go test ./...`
 
+- `Post-F9` thread reasoning selector and config override persistence completed:
+  - backend now persists non-model session config selections under `agentOptions.configOverrides` when `POST /v1/threads/{threadId}/config-options` succeeds.
+  - provider factories now restore persisted config overrides on fresh embedded sessions and per-turn stdio handshakes, so reasoning-style settings survive across future turns and restarts.
+  - Web UI composer footer now renders both `Model` and `Reasoning` controls; reasoning options refresh from the latest thread `configOptions` after model changes.
+  - reasoning control remains model-specific and is disabled/updated in the same active-turn safety envelope as model switching.
+  - added coverage for config override persistence and thread agent-option parsing.
+  - executed validation:
+    - pass: `cd internal/webui/web && npm run build`
+    - pass: `go test ./...`
+
+- `Post-F9` shared agent config catalog caching completed:
+  - Web UI no longer re-fetches thread config options when switching between threads that use the same agent and already have a cached agent config catalog.
+  - frontend now keeps:
+    - thread-scoped current config state cache.
+    - agent-scoped shared config catalog cache for model/reasoning option lists.
+  - same-agent threads reuse the same model/reasoning lists while keeping independent selected current values derived from each thread's persisted `agentOptions`.
+  - composer footer pills now show only the selected model/reasoning names, without leading `MODEL` / `REASONING` labels.
+  - executed validation:
+    - pass: `cd internal/webui/web && npm run build`
+
 - `Post-F9` codex thread-config timeout fix (Playwright real-env regression):
   - reproduced in real browser flow (Playwright MCP + local codex env): opening a codex thread triggered `GET /v1/threads/{threadId}/config-options` `503` caused by embedded startup timeout at 8s.
   - fixed by increasing embedded runtime default startup timeout from `8s` to `30s` for:
@@ -454,6 +465,31 @@ This file is the source of milestone progress, validation commands, and next act
     - model switching calls `POST /v1/threads/{threadId}/config-options` and persists selected model.
     - no frontend console errors during switch flow.
   - executed validation:
+    - pass: `go test ./...`
+
+- `Post-F9` codex model-discovery stability improvement:
+  - replaced per-request codex model discovery runtime startup/shutdown with a shared discovery client in `internal/agents/codex/models.go`.
+  - behavior changes:
+    - repeated `GET /v1/agents/codex/models` now reuses initialized embedded runtime instead of spawning and closing app-server each time.
+    - one automatic retry with fresh discovery client when cached client becomes unhealthy.
+    - explicit cleanup hook added in server shutdown (`codexagent.CloseDiscoveryClient()`).
+  - local validation:
+    - first call `GET /v1/agents/codex/models` took ~16s (initial discovery).
+    - second call returned in ~0ms from shared client (no repeated startup/shutdown).
+  - executed validation:
+    - pass: `cd internal/webui/web && npm run build`
+    - pass: `go test ./...`
+
+- `Post-F9` persisted agent config catalog completed:
+  - added sqlite-backed `agent_config_catalogs` storage keyed by `agent_id + model_id`, with a reserved default snapshot row used when a thread has no explicit model selection yet.
+  - `GET /v1/threads/{threadId}/config-options` and `GET /v1/agents/{agentId}/models` now read persisted catalog data first, so service restart can keep serving model/reasoning metadata without blocking on live provider queries.
+  - `POST /v1/threads/{threadId}/config-options` now writes through both:
+    - thread-local selected values into `threads.agent_options_json`
+    - current model config catalog into sqlite for reuse across threads/restarts
+  - service startup now launches a background catalog refresher that silently re-queries built-in agents and refreshes stored model/reasoning catalogs without delaying frontend availability.
+  - Web UI config cache is now keyed by `agent + selected model`, so different threads on the same agent no longer accidentally reuse the wrong reasoning list for another model.
+  - executed validation:
+    - pass: `cd internal/webui/web && npm run build`
     - pass: `go test ./...`
 
  
