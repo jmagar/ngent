@@ -283,7 +283,6 @@ body {
 
 .thread-item-avatar-icon--contain {
   object-fit: contain;
-  background: #ffffff;
 }
 
 .thread-item-body {
@@ -818,7 +817,6 @@ body {
 
 .message-avatar-icon--contain {
   object-fit: contain;
-  background: #ffffff;
 }
 
 .message-group {

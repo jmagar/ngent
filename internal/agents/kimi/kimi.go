@@ -1,4 +1,4 @@
-package qwen
+package kimi
 
 import (
 	"context"
@@ -25,20 +25,25 @@ const (
 	defaultPermissionTimeout = 15 * time.Second
 )
 
-// Config configures the Qwen CLI ACP stdio provider.
+// Config configures the Kimi CLI ACP stdio provider.
 type Config = agentutil.Config
 
-// Client runs one qwen --acp process per Stream call.
+// Client runs one Kimi ACP process per Stream call.
 type Client struct {
 	*agentutil.State
+}
+
+type commandSpec struct {
+	mode  string
+	label string
 }
 
 var _ agents.Streamer = (*Client)(nil)
 var _ agents.ConfigOptionManager = (*Client)(nil)
 
-// New constructs a Qwen ACP client.
+// New constructs a Kimi ACP client.
 func New(cfg Config) (*Client, error) {
-	state, err := agentutil.NewState("qwen", cfg)
+	state, err := agentutil.NewState("kimi", cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -47,18 +52,18 @@ func New(cfg Config) (*Client, error) {
 	}, nil
 }
 
-// Preflight checks that the qwen binary is available in PATH.
+// Preflight checks that the kimi binary is available in PATH.
 func Preflight() error {
-	return agentutil.PreflightBinary("qwen")
+	return agentutil.PreflightBinary("kimi")
 }
 
 // Name returns the provider identifier.
-func (c *Client) Name() string { return "qwen" }
+func (c *Client) Name() string { return "kimi" }
 
 // ConfigOptions queries ACP session config options.
 func (c *Client) ConfigOptions(ctx context.Context) ([]agents.ConfigOption, error) {
 	if c == nil {
-		return nil, errors.New("qwen: nil client")
+		return nil, errors.New("kimi: nil client")
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -69,15 +74,15 @@ func (c *Client) ConfigOptions(ctx context.Context) ([]agents.ConfigOption, erro
 // SetConfigOption applies one ACP session config option.
 func (c *Client) SetConfigOption(ctx context.Context, configID, value string) ([]agents.ConfigOption, error) {
 	if c == nil {
-		return nil, errors.New("qwen: nil client")
+		return nil, errors.New("kimi: nil client")
 	}
 	configID = strings.TrimSpace(configID)
 	value = strings.TrimSpace(value)
 	if configID == "" {
-		return nil, errors.New("qwen: configID is required")
+		return nil, errors.New("kimi: configID is required")
 	}
 	if value == "" {
-		return nil, errors.New("qwen: value is required")
+		return nil, errors.New("kimi: value is required")
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -91,13 +96,13 @@ func (c *Client) SetConfigOption(ctx context.Context, configID, value string) ([
 	return options, nil
 }
 
-// Stream spawns qwen --acp, runs one turn, and streams deltas via onDelta.
+// Stream spawns Kimi in ACP mode, runs one turn, and streams deltas via onDelta.
 func (c *Client) Stream(ctx context.Context, input string, onDelta func(delta string) error) (agents.StopReason, error) {
 	if c == nil {
-		return agents.StopReasonEndTurn, errors.New("qwen: nil client")
+		return agents.StopReasonEndTurn, errors.New("kimi: nil client")
 	}
 	if onDelta == nil {
-		return agents.StopReasonEndTurn, errors.New("qwen: onDelta callback is required")
+		return agents.StopReasonEndTurn, errors.New("kimi: onDelta callback is required")
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -106,66 +111,24 @@ func (c *Client) Stream(ctx context.Context, input string, onDelta func(delta st
 	modelID := c.CurrentModelID()
 	configOverrides := c.CurrentConfigOverrides()
 
-	cmd := exec.Command("qwen", "--acp")
-	cmd.Dir = c.Dir()
-	cmd.Env = os.Environ()
-
-	stdin, err := cmd.StdinPipe()
+	conn, cleanup, _, err := c.openConn(ctx, modelID)
 	if err != nil {
-		return agents.StopReasonEndTurn, fmt.Errorf("qwen: open stdin pipe: %w", err)
+		return agents.StopReasonEndTurn, err
 	}
-	stdout, err := cmd.StdoutPipe()
+	defer cleanup()
+
+	newResult, err := conn.Call(ctx, "session/new", sessionNewParams(c.Dir(), modelID))
 	if err != nil {
-		return agents.StopReasonEndTurn, fmt.Errorf("qwen: open stdout pipe: %w", err)
-	}
-	// Discard stderr to avoid protocol corruption and pipe blocking.
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return agents.StopReasonEndTurn, fmt.Errorf("qwen: open stderr pipe: %w", err)
-	}
-
-	if err := cmd.Start(); err != nil {
-		return agents.StopReasonEndTurn, fmt.Errorf("qwen: start process: %w", err)
-	}
-
-	errCh := make(chan error, 1)
-	go func() { _, _ = io.Copy(io.Discard, stderr) }()
-	go func() { errCh <- cmd.Wait() }()
-
-	conn := acpstdio.NewConn(stdin, stdout, "qwen")
-	defer conn.Close()
-	defer acpstdio.TerminateProcess(cmd, errCh, 2*time.Second)
-
-	// 1) initialize
-	if _, err := conn.Call(ctx, "initialize", map[string]any{
-		"protocolVersion": 1,
-		"clientCapabilities": map[string]any{
-			"fs": map[string]any{
-				"readTextFile":  false,
-				"writeTextFile": false,
-			},
-		},
-	}); err != nil {
-		return agents.StopReasonEndTurn, fmt.Errorf("qwen: initialize: %w", err)
-	}
-
-	// 2) session/new
-	newResult, err := conn.Call(ctx, "session/new", map[string]any{
-		"cwd":        c.Dir(),
-		"mcpServers": []any{},
-	})
-	if err != nil {
-		return agents.StopReasonEndTurn, fmt.Errorf("qwen: session/new: %w", err)
+		return agents.StopReasonEndTurn, fmt.Errorf("kimi: session/new: %w", err)
 	}
 	sessionID := acpstdio.ParseSessionID(newResult)
 	if sessionID == "" {
-		return agents.StopReasonEndTurn, errors.New("qwen: session/new returned empty sessionId")
+		return agents.StopReasonEndTurn, errors.New("kimi: session/new returned empty sessionId")
 	}
 	if _, err := c.applyConfigOverrides(ctx, conn, sessionID, acpmodel.ExtractConfigOptions(newResult), configOverrides); err != nil {
 		return agents.StopReasonEndTurn, err
 	}
 
-	// 3) wire permission requests with fail-closed default.
 	permHandler, hasPermHandler := agents.PermissionHandlerFromContext(ctx)
 	conn.SetRequestHandler(func(method string, params json.RawMessage) (json.RawMessage, error) {
 		if method != "session/request_permission" {
@@ -184,11 +147,9 @@ func (c *Client) Stream(ctx context.Context, input string, onDelta func(delta st
 			} `json:"options"`
 		}
 		if err := json.Unmarshal(params, &req); err != nil {
-			// Fail-closed: malformed request => decline/cancel.
 			return buildDeclinedPermissionResponse(req.Options)
 		}
 
-		// Default fail-closed when no handler.
 		if !hasPermHandler {
 			return buildDeclinedPermissionResponse(req.Options)
 		}
@@ -202,7 +163,6 @@ func (c *Client) Stream(ctx context.Context, input string, onDelta func(delta st
 			RawParams: map[string]any{"sessionId": req.SessionID},
 		})
 		if err != nil {
-			// Fail-closed: timeout/exception => decline/cancel.
 			return buildDeclinedPermissionResponse(req.Options)
 		}
 
@@ -216,12 +176,8 @@ func (c *Client) Stream(ctx context.Context, input string, onDelta func(delta st
 		}
 	})
 
-	// 4) stream session/update -> agent_message_chunk.content.text
 	conn.SetNotificationHandler(func(msg acpstdio.Message) error {
-		if msg.Method != "session/update" {
-			return nil
-		}
-		if len(msg.Params) == 0 {
+		if msg.Method != "session/update" || len(msg.Params) == 0 {
 			return nil
 		}
 		var payload struct {
@@ -234,7 +190,7 @@ func (c *Client) Stream(ctx context.Context, input string, onDelta func(delta st
 			} `json:"update"`
 		}
 		if err := json.Unmarshal(msg.Params, &payload); err != nil {
-			return nil // Ignore malformed update notifications.
+			return nil
 		}
 		if payload.Update.SessionUpdate != updateTypeMessageChunk {
 			return nil
@@ -246,7 +202,6 @@ func (c *Client) Stream(ctx context.Context, input string, onDelta func(delta st
 		return onDelta(text)
 	})
 
-	// 5) send session/cancel quickly when context is cancelled.
 	stopCancelWatch := make(chan struct{})
 	defer close(stopCancelWatch)
 	go func() {
@@ -257,7 +212,6 @@ func (c *Client) Stream(ctx context.Context, input string, onDelta func(delta st
 		}
 	}()
 
-	// 6) session/prompt
 	promptParams := map[string]any{
 		"sessionId": sessionID,
 		"prompt":    []map[string]any{{"type": "text", "text": input}},
@@ -271,7 +225,7 @@ func (c *Client) Stream(ctx context.Context, input string, onDelta func(delta st
 		if ctx.Err() != nil {
 			return agents.StopReasonCancelled, nil
 		}
-		return agents.StopReasonEndTurn, fmt.Errorf("qwen: session/prompt: %w", err)
+		return agents.StopReasonEndTurn, fmt.Errorf("kimi: session/prompt: %w", err)
 	}
 
 	if acpstdio.ParseStopReason(promptResult) == "cancelled" {
@@ -290,7 +244,6 @@ func buildApprovedPermissionResponse(options []struct {
 }) (json.RawMessage, error) {
 	optionID := pickPermissionOptionID(options, "allow_once", "allow_always")
 	if optionID == "" {
-		// Fail-closed when no allow option is available.
 		return buildDeclinedPermissionResponse(options)
 	}
 	return buildSelectedPermissionResponse(optionID)
@@ -347,61 +300,24 @@ func (c *Client) runConfigSession(
 	configOverrides map[string]string,
 	configID, value string,
 ) ([]agents.ConfigOption, error) {
-	cmd := exec.Command("qwen", "--acp")
-	cmd.Dir = c.Dir()
-	cmd.Env = os.Environ()
+	sessionModelID := modelID
+	if strings.EqualFold(configID, "model") && value != "" {
+		sessionModelID = value
+	}
 
-	stdin, err := cmd.StdinPipe()
+	conn, cleanup, _, err := c.openConn(ctx, sessionModelID)
 	if err != nil {
-		return nil, fmt.Errorf("qwen: config options open stdin pipe: %w", err)
+		return nil, err
 	}
-	stdout, err := cmd.StdoutPipe()
+	defer cleanup()
+
+	newResult, err := conn.Call(ctx, "session/new", sessionNewParams(c.Dir(), sessionModelID))
 	if err != nil {
-		return nil, fmt.Errorf("qwen: config options open stdout pipe: %w", err)
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return nil, fmt.Errorf("qwen: config options open stderr pipe: %w", err)
-	}
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("qwen: config options start process: %w", err)
-	}
-
-	errCh := make(chan error, 1)
-	go func() { _, _ = io.Copy(io.Discard, stderr) }()
-	go func() { errCh <- cmd.Wait() }()
-
-	conn := acpstdio.NewConn(stdin, stdout, "qwen")
-	defer conn.Close()
-	defer acpstdio.TerminateProcess(cmd, errCh, 2*time.Second)
-
-	if _, err := conn.Call(ctx, "initialize", map[string]any{
-		"protocolVersion": 1,
-		"clientCapabilities": map[string]any{
-			"fs": map[string]any{
-				"readTextFile":  false,
-				"writeTextFile": false,
-			},
-		},
-	}); err != nil {
-		return nil, fmt.Errorf("qwen: config options initialize: %w", err)
-	}
-
-	newParams := map[string]any{
-		"cwd":        c.Dir(),
-		"mcpServers": []any{},
-	}
-	if modelID != "" {
-		newParams["model"] = modelID
-		newParams["modelId"] = modelID
-	}
-	newResult, err := conn.Call(ctx, "session/new", newParams)
-	if err != nil {
-		return nil, fmt.Errorf("qwen: config options session/new: %w", err)
+		return nil, fmt.Errorf("kimi: config options session/new: %w", err)
 	}
 	sessionID := acpstdio.ParseSessionID(newResult)
 	if sessionID == "" {
-		return nil, errors.New("qwen: config options session/new returned empty sessionId")
+		return nil, errors.New("kimi: config options session/new returned empty sessionId")
 	}
 
 	options, err := c.applyConfigOverrides(ctx, conn, sessionID, acpmodel.ExtractConfigOptions(newResult), configOverrides)
@@ -411,13 +327,16 @@ func (c *Client) runConfigSession(
 	if configID == "" {
 		return options, nil
 	}
+	if strings.EqualFold(configID, "model") {
+		return options, nil
+	}
 	setResult, err := conn.Call(ctx, methodSessionSetConfigOption, map[string]any{
 		"sessionId": sessionID,
 		"configId":  configID,
 		"value":     value,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("qwen: config options session/set_config_option: %w", err)
+		return nil, fmt.Errorf("kimi: config options session/set_config_option: %w", err)
 	}
 
 	updated := acpmodel.ExtractConfigOptions(setResult)
@@ -456,11 +375,131 @@ func (c *Client) applyConfigOverrides(
 			"value":     value,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("qwen: session/set_config_option(%s): %w", configID, err)
+			return nil, fmt.Errorf("kimi: session/set_config_option(%s): %w", configID, err)
 		}
 		if updated := acpmodel.ExtractConfigOptions(setResult); len(updated) > 0 {
 			current = updated
 		}
 	}
 	return current, nil
+}
+
+func (c *Client) openConn(ctx context.Context, modelID string) (*acpstdio.Conn, func(), string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	specs := commandCandidates()
+	var attemptErrors []string
+	for idx, spec := range specs {
+		conn, cleanup, err := c.openConnWithCommand(ctx, spec, modelID)
+		if err == nil {
+			return conn, cleanup, spec.label, nil
+		}
+		attemptErrors = append(attemptErrors, err.Error())
+		if idx == len(specs)-1 || !shouldRetryACPStartup(err) {
+			break
+		}
+	}
+
+	return nil, nil, "", fmt.Errorf(
+		"kimi: failed to start ACP mode (%s)",
+		strings.Join(attemptErrors, "; "),
+	)
+}
+
+func (c *Client) openConnWithCommand(ctx context.Context, spec commandSpec, modelID string) (*acpstdio.Conn, func(), error) {
+	cmd := exec.Command("kimi", spec.args(modelID)...)
+	cmd.Dir = c.Dir()
+	cmd.Env = os.Environ()
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, nil, fmt.Errorf("kimi: %s open stdin pipe: %w", spec.label, err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, nil, fmt.Errorf("kimi: %s open stdout pipe: %w", spec.label, err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, nil, fmt.Errorf("kimi: %s open stderr pipe: %w", spec.label, err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		return nil, nil, fmt.Errorf("kimi: %s start process: %w", spec.label, err)
+	}
+
+	errCh := make(chan error, 1)
+	go func() { _, _ = io.Copy(io.Discard, stderr) }()
+	go func() { errCh <- cmd.Wait() }()
+
+	conn := acpstdio.NewConn(stdin, stdout, "kimi")
+	cleanup := func() {
+		conn.Close()
+		acpstdio.TerminateProcess(cmd, errCh, 2*time.Second)
+	}
+
+	if _, err := conn.Call(ctx, "initialize", map[string]any{
+		"protocolVersion": 1,
+		"clientCapabilities": map[string]any{
+			"fs": map[string]any{
+				"readTextFile":  false,
+				"writeTextFile": false,
+			},
+		},
+	}); err != nil {
+		cleanup()
+		return nil, nil, fmt.Errorf("kimi: %s initialize: %w", spec.label, err)
+	}
+
+	return conn, cleanup, nil
+}
+
+func commandCandidates() []commandSpec {
+	// Official Kimi docs currently show both `kimi acp` and `kimi --acp`.
+	return []commandSpec{
+		{mode: "subcommand", label: "kimi acp"},
+		{mode: "flag", label: "kimi --acp"},
+	}
+}
+
+func (s commandSpec) args(modelID string) []string {
+	args := make([]string, 0, 3)
+	if strings.TrimSpace(modelID) != "" {
+		args = append(args, "--model", strings.TrimSpace(modelID))
+	}
+	switch s.mode {
+	case "flag":
+		args = append(args, "--acp")
+	default:
+		args = append(args, "acp")
+	}
+	return args
+}
+
+func sessionNewParams(dir, modelID string) map[string]any {
+	params := map[string]any{
+		"cwd":        dir,
+		"mcpServers": []any{},
+	}
+	modelID = strings.TrimSpace(modelID)
+	if modelID != "" {
+		// Kimi's ACP runtime may derive model selection from process startup
+		// flags, but sending both fields keeps handshake responses aligned when
+		// the server also honors session/new model hints.
+		params["model"] = modelID
+		params["modelId"] = modelID
+	}
+	return params
+}
+
+func shouldRetryACPStartup(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "connection closed") ||
+		strings.Contains(message, "start process") ||
+		strings.Contains(message, "initialize")
 }

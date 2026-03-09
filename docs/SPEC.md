@@ -7,7 +7,7 @@ Build a local-first Code Agent Hub Server that:
 - serves HTTP/JSON APIs.
 - streams turn events via SSE (`text/event-stream`).
 - supports multi-client and multi-thread execution.
-- is designed to support ACP-compatible agents (for example Claude Code, Gemini, OpenCode, Codex).
+- is designed to support ACP-compatible agents (for example Claude Code, Gemini, Kimi, OpenCode, Codex).
 - persists interaction state/events in SQLite.
 - forwards runtime permissions to the owning client with fail-closed behavior.
 
@@ -213,10 +213,49 @@ and upstream ACP schema:
 - Applies to all providers:
   - `codex` and `claude` embedded runtimes receive `model` in ACP `session/new`.
   - `gemini` ACP stdio provider receives `model` in `session/new` and `session/prompt`.
+  - `kimi` ACP stdio provider receives `model` in `session/prompt`, and during config/model discovery it sends both `model` and `modelId` in `session/new`.
   - `opencode` passes `modelId` in `session/prompt`.
   - `qwen` passes `model` in `session/prompt`.
 
 ### 12.2 API and Runtime Behavior
+
+## 13. Kimi CLI ACP Integration (2026-03-09)
+
+### 13.1 Objective and Scope
+
+- add `kimi` as a first-class ACP provider using the Kimi CLI ACP mode.
+- preserve existing runtime/security invariants:
+  - one active turn per thread.
+  - fail-closed permission workflow.
+  - allowlisted `agent` and absolute+allowed `cwd` validation.
+  - protocol-only stdout/HTTP payloads, JSON logs on stderr.
+
+### 13.2 Kimi ACP Protocol Profile
+
+- startup command:
+  - official Kimi docs currently show both `kimi acp` and `kimi --acp`.
+  - the hub must try `kimi acp` first and fall back to `kimi --acp` when ACP initialization closes immediately.
+- ACP flow:
+  - `initialize` with `protocolVersion: 1` and `clientCapabilities.fs`.
+  - `session/new` with `cwd` and `mcpServers: []`.
+  - `session/prompt` with ACP prompt blocks (`[{type:"text", text:...}]`).
+- streaming:
+  - consume `session/update` deltas only when `update.sessionUpdate == "agent_message_chunk"`.
+  - delta text is read from `update.content.text`.
+- permissions and cancellation:
+  - handle `session/request_permission` with fail-closed approval mapping.
+  - on context cancellation, send `session/cancel` quickly and converge to `stopReason=cancelled`.
+
+### 13.3 Server Wiring
+
+- add `internal/agents/kimi` provider package with:
+  - `Preflight()` checking `kimi` in PATH.
+  - `DiscoverModels()` from ACP `session/new.models.availableModels`.
+  - `ConfigOptionManager` support via transient ACP sessions and `session/set_config_option`.
+- wire `kimi` into:
+  - startup preflight diagnostics and `/v1/agents`.
+  - thread agent allowlist and `TurnAgentFactory`.
+  - startup config-catalog refresh.
 
 - Added `PATCH /v1/threads/{threadId}` with request body containing optional `title` and `agentOptions`.
 - Added `GET /v1/agents/{agentId}/models`:

@@ -17,6 +17,7 @@ import (
 	"github.com/beyond5959/acp-adapter/pkg/claudeacp"
 	"github.com/beyond5959/ngent/internal/agents"
 	"github.com/beyond5959/ngent/internal/agents/acpmodel"
+	"github.com/beyond5959/ngent/internal/agents/agentutil"
 )
 
 const (
@@ -49,10 +50,9 @@ type Config struct {
 
 // Client streams turn output through one in-process claude-acp runtime.
 type Client struct {
-	name            string
-	dir             string
-	modelID         string
-	configOverrides map[string]string
+	*agentutil.State
+
+	name string
 
 	runtimeConfig  claudeacp.RuntimeConfig
 	startTimeout   time.Duration
@@ -126,14 +126,21 @@ func New(cfg Config) (*Client, error) {
 		requestTimeout = defaultRequestTimeout
 	}
 
+	state, err := agentutil.NewState("claude", agentutil.Config{
+		Dir:             cfg.Dir,
+		ModelID:         cfg.ModelID,
+		ConfigOverrides: cfg.ConfigOverrides,
+	})
+	if err != nil {
+		return nil, err
+	}
+
 	return &Client{
-		name:            name,
-		dir:             strings.TrimSpace(cfg.Dir),
-		modelID:         strings.TrimSpace(cfg.ModelID),
-		configOverrides: normalizeConfigOverrides(cfg.ConfigOverrides),
-		runtimeConfig:   runtimeCfg,
-		startTimeout:    startTimeout,
-		requestTimeout:  requestTimeout,
+		State:          state,
+		name:           name,
+		runtimeConfig:  runtimeCfg,
+		startTimeout:   startTimeout,
+		requestTimeout: requestTimeout,
 	}, nil
 }
 
@@ -198,21 +205,8 @@ func (c *Client) SetConfigOption(ctx context.Context, configID, value string) ([
 	options := acpmodel.ExtractConfigOptions(resp.Result)
 	c.mu.Lock()
 	c.configOptions = acpmodel.CloneConfigOptions(options)
-	if strings.EqualFold(configID, "model") {
-		c.modelID = acpmodel.CurrentValueForConfig(options, "model")
-		if c.modelID == "" {
-			c.modelID = value
-		}
-	} else {
-		if c.configOverrides == nil {
-			c.configOverrides = make(map[string]string)
-		}
-		c.configOverrides[configID] = strings.TrimSpace(acpmodel.CurrentValueForConfig(options, configID))
-		if c.configOverrides[configID] == "" {
-			c.configOverrides[configID] = value
-		}
-	}
 	c.mu.Unlock()
+	c.ApplyConfigOptionResult(configID, value, options)
 	return acpmodel.CloneConfigOptions(options), nil
 }
 
@@ -511,10 +505,10 @@ func (c *Client) ensureInitialized(ctx context.Context) (*claudeacp.EmbeddedRunt
 	}
 
 	newParams := map[string]any{
-		"cwd": c.dir,
+		"cwd": c.Dir(),
 	}
-	if c.modelID != "" {
-		newParams["model"] = c.modelID
+	if modelID := c.CurrentModelID(); modelID != "" {
+		newParams["model"] = modelID
 	}
 	sessionResp, err := c.clientRequest(startCtx, runtime, methodSessionNew, newParams)
 	if err != nil {
@@ -557,9 +551,7 @@ func (c *Client) applyConfigOverrides(
 	sessionID string,
 	options []agents.ConfigOption,
 ) ([]agents.ConfigOption, error) {
-	c.mu.Lock()
-	overrides := cloneConfigOverrides(c.configOverrides)
-	c.mu.Unlock()
+	overrides := c.CurrentConfigOverrides()
 	if len(overrides) == 0 {
 		return options, nil
 	}
@@ -589,36 +581,6 @@ func (c *Client) applyConfigOverrides(
 		}
 	}
 	return current, nil
-}
-
-func normalizeConfigOverrides(input map[string]string) map[string]string {
-	if len(input) == 0 {
-		return nil
-	}
-	normalized := make(map[string]string, len(input))
-	for rawID, rawValue := range input {
-		configID := strings.TrimSpace(rawID)
-		value := strings.TrimSpace(rawValue)
-		if configID == "" || value == "" || strings.EqualFold(configID, "model") {
-			continue
-		}
-		normalized[configID] = value
-	}
-	if len(normalized) == 0 {
-		return nil
-	}
-	return normalized
-}
-
-func cloneConfigOverrides(input map[string]string) map[string]string {
-	if len(input) == 0 {
-		return nil
-	}
-	cloned := make(map[string]string, len(input))
-	for configID, value := range input {
-		cloned[configID] = value
-	}
-	return cloned
 }
 
 func (c *Client) clientRequest(

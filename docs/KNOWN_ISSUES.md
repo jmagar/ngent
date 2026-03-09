@@ -134,7 +134,7 @@
 - Title: Stdio providers apply config in transient ACP sessions
 - Status: Open
 - Severity: Low
-- Affects: `opencode` / `qwen` / `gemini` thread config behavior
+- Affects: `opencode` / `qwen` / `gemini` / `kimi` thread config behavior
 - Symptom: these providers are process-per-turn; config changes are mirrored into persisted thread metadata (`agentOptions.modelId` + `agentOptions.configOverrides`) and reapplied on the next ACP session, but there is still no long-lived runtime session to mutate between turns.
 - Workaround: none required for normal usage; persisted config selections remain effective on future turns through thread metadata replay.
 - Follow-up plan: evaluate persistent per-thread ACP runtime for stdio agents if future product requirements need truly in-session config mutations beyond thread-level replay.
@@ -174,3 +174,18 @@
 - Symptom: adapter now avoids hard `-32000` errors, but for `requestUserInput` it auto-selects first option labels and does not expose full interactive question UI in hub frontend.
 - Workaround: prefer MCP/tool flows that do not require complex interactive follow-up prompts; if needed, run the same operation in an environment with native codex app UI support.
 - Follow-up plan: add first-class user-input request bridge and frontend interaction model for arbitrary question/option responses.
+
+- ID: KI-020
+- Title: Kimi ACP runtime/auth prerequisites and command-form drift
+- Status: Open
+- Severity: Medium
+- Affects: implemented `kimi` provider turns in environments with uninitialized Kimi CLI state
+- Symptom:
+  - Kimi upstream docs currently show both `kimi acp` and `kimi --acp`; the hub retries both, but a local CLI that exits before ACP initialize still surfaces as a provider startup failure.
+  - prompt execution can fail after handshake when local Kimi authentication or upstream network access is not ready.
+- Workaround:
+  - ensure the local `kimi` CLI is installed and already logged in before issuing turns.
+  - inspect startup preflight and turn error logs when ACP mode closes immediately.
+- Follow-up plan:
+  - add richer preflight diagnostics for Kimi auth/runtime readiness beyond PATH existence.
+  - keep validating future Kimi CLI releases and narrow the fallback path once upstream command syntax stabilizes.

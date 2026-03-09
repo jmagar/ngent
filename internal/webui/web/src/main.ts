@@ -43,6 +43,7 @@ const iconCheck = `<svg width="14" height="14" viewBox="0 0 16 16" fill="none" a
 const codexIconURL = '/codex-icon.png'
 const geminiIconURL = '/gemini-icon.png'
 const claudeIconURL = '/claude-icon.png'
+const kimiIconURL = '/kimi-icon.png'
 const opencodeIconURL = '/opencode-icon.png'
 const qwenIconURL = '/qwen-icon.png'
 
@@ -856,6 +857,9 @@ function renderAgentAvatar(agentId: string, variant: 'thread' | 'message'): stri
   }
   if (normalized === 'claude') {
     return `<img src="${claudeIconURL}" alt="Claude Code" class="${cls}" loading="lazy" decoding="async">`
+  }
+  if (normalized === 'kimi') {
+    return `<img src="${kimiIconURL}" alt="Kimi CLI" class="${cls} ${cls}--contain" loading="lazy" decoding="async">`
   }
   if (normalized === 'opencode') {
     return `<img src="${opencodeIconURL}" alt="OpenCode" class="${cls} ${cls}--contain" loading="lazy" decoding="async">`

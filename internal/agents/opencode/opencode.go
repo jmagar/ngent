@@ -10,7 +10,6 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/beyond5959/ngent/internal/agents"
@@ -25,23 +24,11 @@ const (
 )
 
 // Config configures the OpenCode ACP stdio provider.
-type Config struct {
-	// Dir is the working directory passed to opencode acp --cwd.
-	Dir string
-	// ModelID is the optional model identifier (e.g. "anthropic/claude-3-5-haiku-20241022").
-	// When empty, OpenCode uses its configured default model.
-	ModelID string
-	// ConfigOverrides are non-model ACP config values reapplied on new sessions.
-	ConfigOverrides map[string]string
-}
+type Config = agentutil.Config
 
 // Client runs one opencode acp process per Stream call.
 type Client struct {
-	mu sync.RWMutex
-
-	dir             string
-	modelID         string
-	configOverrides map[string]string
+	*agentutil.State
 }
 
 var _ agents.Streamer = (*Client)(nil)
@@ -49,14 +36,12 @@ var _ agents.ConfigOptionManager = (*Client)(nil)
 
 // New constructs an OpenCode ACP client.
 func New(cfg Config) (*Client, error) {
-	dir, err := agentutil.RequireDir("opencode", cfg.Dir)
+	state, err := agentutil.NewState("opencode", cfg)
 	if err != nil {
 		return nil, err
 	}
 	return &Client{
-		dir:             dir,
-		modelID:         strings.TrimSpace(cfg.ModelID),
-		configOverrides: normalizeConfigOverrides(cfg.ConfigOverrides),
+		State: state,
 	}, nil
 }
 
@@ -76,7 +61,7 @@ func (c *Client) ConfigOptions(ctx context.Context) ([]agents.ConfigOption, erro
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return c.runConfigSession(ctx, c.currentModelID(), c.currentConfigOverrides(), "", "")
+	return c.runConfigSession(ctx, c.CurrentModelID(), c.CurrentConfigOverrides(), "", "")
 }
 
 // SetConfigOption applies one ACP session config option.
@@ -96,23 +81,11 @@ func (c *Client) SetConfigOption(ctx context.Context, configID, value string) ([
 		ctx = context.Background()
 	}
 
-	options, err := c.runConfigSession(ctx, c.currentModelID(), c.currentConfigOverrides(), configID, value)
+	options, err := c.runConfigSession(ctx, c.CurrentModelID(), c.CurrentConfigOverrides(), configID, value)
 	if err != nil {
 		return nil, err
 	}
-	if strings.EqualFold(configID, "model") {
-		current := acpmodel.CurrentValueForConfig(options, "model")
-		if current == "" {
-			current = value
-		}
-		c.setModelID(current)
-		return options, nil
-	}
-	current := acpmodel.CurrentValueForConfig(options, configID)
-	if current == "" {
-		current = value
-	}
-	c.setConfigOverride(configID, current)
+	c.ApplyConfigOptionResult(configID, value, options)
 	return options, nil
 }
 
@@ -125,10 +98,10 @@ func (c *Client) Stream(ctx context.Context, input string, onDelta func(delta st
 		return agents.StopReasonEndTurn, errors.New("opencode: onDelta callback is required")
 	}
 
-	modelID := c.currentModelID()
-	configOverrides := c.currentConfigOverrides()
+	modelID := c.CurrentModelID()
+	configOverrides := c.CurrentConfigOverrides()
 
-	cmd := exec.Command("opencode", "acp", "--cwd", c.dir)
+	cmd := exec.Command("opencode", "acp", "--cwd", c.Dir())
 	cmd.Env = os.Environ()
 
 	stdin, err := cmd.StdinPipe()
@@ -170,7 +143,7 @@ func (c *Client) Stream(ctx context.Context, input string, onDelta func(delta st
 
 	// 2. session/new — server assigns sessionId; mcpServers is required.
 	newResult, err := conn.Call(ctx, "session/new", map[string]any{
-		"cwd":        c.dir,
+		"cwd":        c.Dir(),
 		"mcpServers": []any{},
 	})
 	if err != nil {
@@ -241,50 +214,13 @@ func (c *Client) sendCancel(conn *acpstdio.Conn, sessionID string) {
 	_, _ = conn.Call(cancelCtx, "session/cancel", map[string]any{"sessionId": sessionID})
 }
 
-func (c *Client) currentModelID() string {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return strings.TrimSpace(c.modelID)
-}
-
-func (c *Client) setModelID(modelID string) {
-	c.mu.Lock()
-	c.modelID = strings.TrimSpace(modelID)
-	c.mu.Unlock()
-}
-
-func (c *Client) currentConfigOverrides() map[string]string {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return cloneConfigOverrides(c.configOverrides)
-}
-
-func (c *Client) setConfigOverride(configID, value string) {
-	configID = strings.TrimSpace(configID)
-	if configID == "" || strings.EqualFold(configID, "model") {
-		return
-	}
-	value = strings.TrimSpace(value)
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if value == "" {
-		delete(c.configOverrides, configID)
-		return
-	}
-	if c.configOverrides == nil {
-		c.configOverrides = make(map[string]string)
-	}
-	c.configOverrides[configID] = value
-}
-
 func (c *Client) runConfigSession(
 	ctx context.Context,
 	modelID string,
 	configOverrides map[string]string,
 	configID, value string,
 ) ([]agents.ConfigOption, error) {
-	cmd := exec.Command("opencode", "acp", "--cwd", c.dir)
+	cmd := exec.Command("opencode", "acp", "--cwd", c.Dir())
 	cmd.Env = os.Environ()
 
 	stdin, err := cmd.StdinPipe()
@@ -322,7 +258,7 @@ func (c *Client) runConfigSession(
 	}
 
 	newParams := map[string]any{
-		"cwd":        c.dir,
+		"cwd":        c.Dir(),
 		"mcpServers": []any{},
 	}
 	if modelID != "" {
@@ -398,34 +334,4 @@ func (c *Client) applyConfigOverrides(
 		}
 	}
 	return current, nil
-}
-
-func normalizeConfigOverrides(input map[string]string) map[string]string {
-	if len(input) == 0 {
-		return nil
-	}
-	normalized := make(map[string]string, len(input))
-	for rawID, rawValue := range input {
-		configID := strings.TrimSpace(rawID)
-		value := strings.TrimSpace(rawValue)
-		if configID == "" || value == "" || strings.EqualFold(configID, "model") {
-			continue
-		}
-		normalized[configID] = value
-	}
-	if len(normalized) == 0 {
-		return nil
-	}
-	return normalized
-}
-
-func cloneConfigOverrides(input map[string]string) map[string]string {
-	if len(input) == 0 {
-		return nil
-	}
-	cloned := make(map[string]string, len(input))
-	for configID, value := range input {
-		cloned[configID] = value
-	}
-	return cloned
 }

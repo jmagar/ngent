@@ -381,6 +381,30 @@ func TestCreateThreadValidationAgentAllowlistAllowsQwen(t *testing.T) {
 	}
 }
 
+func TestCreateThreadValidationAgentAllowlistAllowsKimi(t *testing.T) {
+	root := t.TempDir()
+	h := newTestServer(t, testServerOptions{
+		allowedRoots: []string{root},
+		agentList: []AgentInfo{
+			{ID: "codex", Name: "Codex", Status: "available"},
+			{ID: "kimi", Name: "Kimi CLI", Status: "available"},
+			{ID: "claude", Name: "Claude Code", Status: "unavailable"},
+		},
+		allowedAgentIDs: []string{"codex", "kimi"},
+	})
+
+	body := map[string]any{"agent": "kimi", "cwd": root}
+	rr := performJSONRequest(t, h, http.MethodPost, "/v1/threads", body, map[string]string{"X-Client-ID": "client-a"})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want %d", rr.Code, http.StatusOK)
+	}
+
+	threadID := extractThreadID(t, rr.Body.Bytes())
+	if strings.TrimSpace(threadID) == "" {
+		t.Fatalf("threadId should not be empty")
+	}
+}
+
 func TestThreadsCreateListGetHappyPath(t *testing.T) {
 	root := t.TempDir()
 	h := newTestServer(t, testServerOptions{allowedRoots: []string{root}})

@@ -68,7 +68,7 @@ func DiscoverModels(ctx context.Context, cfg Config) ([]agents.ModelOption, erro
 	}
 
 	newResult, err := conn.Call(ctx, "session/new", map[string]any{
-		"cwd":        client.dir,
+		"cwd":        client.Dir(),
 		"mcpServers": []any{},
 	})
 	if err != nil {

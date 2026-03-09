@@ -44,7 +44,7 @@ func DiscoverModels(ctx context.Context, cfg Config) ([]agents.ModelOption, erro
 	}
 
 	sessionResp, err := client.clientRequest(requestCtx, runtime, methodSessionNew, map[string]any{
-		"cwd": client.dir,
+		"cwd": client.Dir(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("claude: session/new for model discovery: %w", err)

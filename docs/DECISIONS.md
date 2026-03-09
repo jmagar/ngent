@@ -32,6 +32,8 @@
 - ADR-028: Persist thread config overrides and surface reasoning control in Web UI. (Accepted)
 - ADR-029: Consolidate sidebar thread actions into a drawer and reuse thread patch for rename. (Accepted)
 - ADR-030: Pin local acp-adapter hotfix for codex app-server server-request compatibility. (Accepted)
+- ADR-031: Kimi CLI ACP stdio provider with dual startup syntax fallback. (Accepted)
+- ADR-032: Shared common agent config/state helper without protocol unification. (Accepted)
 
 ## ADR-018: Embedded Web UI via Go embed
 
@@ -77,7 +79,7 @@
   - keep `agentOptions.modelId` as the durable model mirror, and store other current config values by config id in `configOverrides`.
   - update all built-in providers to reapply persisted non-model overrides on new ACP sessions:
     - embedded (`codex`, `claude`) reapply overrides after `session/new` on cached runtime initialization.
-    - stdio (`opencode`, `qwen`, `gemini`) reapply overrides after `session/new` before `session/prompt`.
+    - stdio (`opencode`, `qwen`, `gemini`, `kimi`) reapply overrides after `session/new` before `session/prompt`.
   - extend the Web UI composer footer to show both `Model` and `Reasoning` controls sourced from thread `configOptions`, with reasoning options refreshed after model changes.
   - cache config catalogs in the Web UI by agent id so same-agent threads reuse one shared model/reasoning option list without re-querying on every thread switch.
 - Consequences:
@@ -110,12 +112,12 @@
 
 - Status: Accepted
 - Date: 2026-03-05
-- Context: Web UI hardcoded model lists drift from runtime reality; users need model options sourced directly from each agent's ACP runtime so create/switch flows stay accurate across codex/claude/opencode/gemini/qwen.
+- Context: Web UI hardcoded model lists drift from runtime reality; users need model options sourced directly from each agent's ACP runtime so create/switch flows stay accurate across codex/claude/opencode/gemini/kimi/qwen.
 - Decision:
   - add `GET /v1/agents/{agentId}/models` and wire it to a backend `AgentModelsFactory`.
   - implement per-agent ACP discovery handshake (`initialize` + `session/new`) and parse model options from:
     - `session/new.configOptions` (`id=model`) for embedded codex/claude (acp-adapter latest).
-    - `session/new.models.availableModels` for opencode/gemini/qwen.
+    - `session/new.models.availableModels` for opencode/gemini/kimi/qwen.
   - normalize response shape to `[{id,name}]`, de-duplicate by `id`, and return `503 UPSTREAM_UNAVAILABLE` on discovery failure.
   - replace active-thread free-text model control with dropdown powered by the new endpoint:
     - active-thread header switches via dropdown + `PATCH /v1/threads/{threadId}`.
@@ -529,7 +531,7 @@ Use this template for new decisions.
   - `POST` applies changes through provider `SetConfigOption`, backed by ACP `session/set_config_option`.
   - support `ConfigOptionManager` on all built-in providers:
     - embedded (`codex`, `claude`): mutate cached session in-place.
-    - stdio (`opencode`, `qwen`, `gemini`): perform ACP handshake/apply flow and persist resulting model id for subsequent turns.
+    - stdio (`opencode`, `qwen`, `gemini`, `kimi`): perform ACP handshake/apply flow and persist resulting model id for subsequent turns.
   - keep `agentOptions.modelId` as durable thread metadata mirror when `configId=model` succeeds.
   - Web UI model selector is bound to thread-level `configOptions` model option and applies immediately on `change`.
 - Consequences:
@@ -609,3 +611,54 @@ Use this template for new decisions.
 - Alternatives considered:
   - keep fail-closed `-32000` hard error (rejected: user-facing breakage for MCP flows).
   - fully implement interactive user-input/dynamic tool execution end-to-end in hub UI + protocol bridge in one step (rejected for hotfix scope).
+
+## ADR-031: Kimi CLI ACP stdio provider with dual startup syntax fallback
+
+- Status: Accepted
+- Date: 2026-03-09
+- Context:
+  - Kimi CLI now exposes ACP mode in upstream docs, but current official pages show both `kimi acp` and `kimi --acp` as startup forms.
+  - hub requirements remain unchanged: one active turn per thread, fast cancel, fail-closed permissions, and no user-supplied binary-path flags.
+- Decision:
+  - implement `internal/agents/kimi` as a standalone ACP stdio provider (one process per turn).
+  - startup tries `kimi acp` first, then retries with `kimi --acp` if the first form fails before ACP initialize completes.
+  - keep protocol flow aligned with existing stdio providers:
+    - `initialize -> session/new -> session/prompt`
+    - stream deltas from `session/update` / `agent_message_chunk`
+    - handle `session/request_permission` with fail-closed mapping
+    - send `session/cancel` on context cancellation
+  - wire `kimi` into startup preflight, `/v1/agents`, thread allowlist, turn factory, model discovery, and startup catalog refresh.
+- Consequences:
+  - Kimi becomes a built-in provider without adding new runtime flags or config surface.
+  - startup is resilient to the current upstream command-form drift across Kimi CLI docs/releases.
+  - real Kimi turns still depend on local Kimi authentication and network readiness.
+- Alternatives considered:
+  - hardcode only `kimi acp` (rejected: conflicts with current upstream `--acp` docs).
+  - hardcode only `kimi --acp` (rejected: conflicts with IDE integration docs and user expectation).
+  - add a user-facing command override flag (rejected: unnecessary config surface and contrary to current built-in provider policy).
+
+## ADR-032: Shared common agent config/state helper without protocol unification
+
+- Status: Accepted
+- Date: 2026-03-09
+- Context:
+  - built-in agents duplicated the same common fields and methods repeatedly:
+    - `Dir`
+    - `ModelID`
+    - `ConfigOverrides`
+    - model/config override normalization, cloning, and state updates after `SetConfigOption`
+  - the duplicated code existed across both stdio providers (`gemini`, `opencode`, `qwen`, `kimi`) and embedded providers (`codex`, `claude`).
+  - previous experience in this repo shows that protocol flows diverge materially between providers, so a single generic provider abstraction would be riskier than the duplication it removes.
+- Decision:
+  - extract shared common config/state into `internal/agents/agentutil`:
+    - `agentutil.Config`
+    - `agentutil.State`
+  - move only common constructor validation and mutable model/config-override state management into the shared helper.
+  - keep each provider's transport/runtime/session logic independent.
+- Consequences:
+  - repeated per-provider bookkeeping is reduced without coupling unrelated ACP/runtime flows.
+  - future providers can reuse the same common state helper while still implementing provider-specific protocol behavior.
+  - embedded and stdio providers remain free to evolve independently where their protocol/runtime requirements differ.
+- Alternatives considered:
+  - create one generic ACP provider with pluggable commands and hooks (rejected: protocol differences are too large and already visible across current providers).
+  - leave duplicated `Config`/`Client` state in place (rejected: ongoing maintenance cost and drift risk).

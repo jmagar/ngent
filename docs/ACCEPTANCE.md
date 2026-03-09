@@ -144,6 +144,19 @@ This checklist defines executable acceptance checks for requirements 1-16.
   - `E2E_QWEN=1 go test ./internal/agents/qwen -run TestQwenE2ESmoke -v -timeout 120s` (pass, real prompt returns `PONG`)
   - `go test ./cmd/ngent ./internal/httpapi -count=1` (pass)
 
+## Requirement 16A: Kimi CLI Agent
+
+- Operation: verify kimi provider is listed and can complete a turn over ACP.
+- Expected:
+  - `GET /v1/agents` includes `{"id":"kimi","name":"Kimi CLI","status":"available"}` when `kimi` is in PATH.
+  - thread creation accepts `agent=kimi`.
+  - turn streaming emits `message_delta` and finishes with `turn_completed` (or explicit upstream error envelope).
+  - provider tolerates current upstream ACP startup variants `kimi acp` and `kimi --acp`.
+- Verification commands:
+  - `go test ./internal/agents/kimi -count=1`
+  - `E2E_KIMI=1 go test ./internal/agents/kimi -run TestKimiE2ESmoke -v -timeout 120s`
+  - `go test ./cmd/ngent ./internal/httpapi -count=1`
+
 ## Requirement 17: Thread Delete Lifecycle
 
 - Operation: delete an existing thread from API/UI, verify ownership behavior, conflict behavior, and provider cleanup.

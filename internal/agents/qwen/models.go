@@ -24,7 +24,7 @@ func DiscoverModels(ctx context.Context, cfg Config) ([]agents.ModelOption, erro
 	}
 
 	cmd := exec.Command("qwen", "--acp")
-	cmd.Dir = client.dir
+	cmd.Dir = client.Dir()
 	cmd.Env = os.Environ()
 
 	stdin, err := cmd.StdinPipe()
@@ -65,7 +65,7 @@ func DiscoverModels(ctx context.Context, cfg Config) ([]agents.ModelOption, erro
 	}
 
 	newResult, err := conn.Call(ctx, "session/new", map[string]any{
-		"cwd":        client.dir,
+		"cwd":        client.Dir(),
 		"mcpServers": []any{},
 	})
 	if err != nil {

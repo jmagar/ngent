@@ -4,20 +4,35 @@
 
 Code Agent Hub Server is a Go service that exposes HTTP/JSON APIs and SSE streaming for multi-client, multi-thread agent turns.
 The system targets ACP-compatible agent providers, lazily starts per-thread agents, persists interaction history in SQLite, and bridges runtime permission requests back to clients.
-Current built-in providers are `codex`, `claude`, `opencode`, `gemini`, and `qwen`.
+Current built-in providers are `codex`, `claude`, `opencode`, `gemini`, `kimi`, and `qwen`.
 This file is the source of milestone progress, validation commands, and next actions.
 
 ## Current Milestone
 
 - `Post-M8` ACP multi-agent readiness and maintenance.
 
-## Latest Update (2026-03-08)
+## Latest Update (2026-03-09)
 
-- release pipeline compatibility fix for GoReleaser v2:
-  - removed unsupported CLI argument `--skip=dirty` from `.github/workflows/release.yml` (`release --clean` only).
-  - keeps release workflow behavior unchanged while restoring successful tagged release builds.
+- Kimi CLI ACP integration completed:
+  - implemented `internal/agents/kimi` with one-turn ACP stdio lifecycle and fail-closed permission handling.
+  - wired `kimi` into startup preflight, `/v1/agents`, thread allowlist, turn factory, model discovery, and startup config-catalog refresh.
+  - added dual startup syntax fallback for current upstream docs drift: try `kimi acp`, then `kimi --acp` if ACP initialize closes immediately.
+  - added fake-process provider tests, fallback coverage, and server/httpapi allowlist coverage.
+  - fixed Kimi thread model switching: `POST /v1/threads/{threadId}/config-options` with `configId=model` now selects the target model via Kimi process startup `--model`, instead of assuming ACP `session/set_config_option(model)` is implemented.
+  - Kimi stream/config discovery paths now also pass the selected model through both process startup args and `session/new` hints for compatibility.
+- Shared agent config/state refactor completed:
+  - extracted common built-in agent fields `Dir`, `ModelID`, and `ConfigOverrides` into shared `internal/agents/agentutil.Config`.
+  - extracted shared thread-safe mutable agent state into `internal/agents/agentutil.State`.
+  - migrated `gemini`, `opencode`, `qwen`, `kimi`, `codex`, and `claude` to reuse the shared state helper instead of keeping duplicated per-provider copies of model/config override logic.
+  - kept protocol/runtime behavior provider-specific; only constructor validation and common mutable state handling were unified.
+- Web UI Kimi icon completed:
+  - downloaded the provided Kimi PNG asset into `internal/webui/web/public/kimi-icon.png`.
+  - wired `kimi` avatar rendering in the Web UI to use the new asset with the existing `--contain` image treatment.
+  - fixed the remaining New Thread modal agent-card icon map so Kimi now renders consistently there as well.
+  - removed the forced white background from all `--contain` agent icons in message/thread views and from the modal's Kimi/OpenCode icon markup.
 - validation:
-  - pass: `go test ./...` (in this repository)
+  - pass: `cd internal/webui/web && npm run build`
+  - pass: `go test ./...`
 
 ## Status
 
@@ -99,7 +114,7 @@ This file is the source of milestone progress, validation commands, and next act
   - updated docs and tests to reflect absolute-cwd policy.
 - `Post-M8` docs framing update completed:
   - adjusted README/SPEC/API/ARCHITECTURE wording to emphasize ACP-compatible multi-agent goal.
-  - kept current-state note explicit: built-in providers are `codex`, `claude`, `opencode`, `gemini`, and `qwen`.
+  - kept current-state note explicit: built-in providers are `codex`, `claude`, `opencode`, `gemini`, `kimi`, and `qwen`.
   - simplified README startup path to `agent-hub-server` with explicit `agent-hub-server --help` guidance.
 - `Post-M8` startup log UX simplification completed:
   - replaced startup JSON line with multi-line human-readable stderr summary (QR code + port and URL hint).
@@ -412,10 +427,11 @@ This file is the source of milestone progress, validation commands, and next act
   - successful thread option update closes cached per-thread provider, so next turn re-initializes with new model config.
   - wired runtime model discovery into all providers:
     - `codex`/`claude`: ACP embedded `session/new.configOptions`.
-    - `gemini`/`opencode`/`qwen`: ACP `session/new.models.availableModels`.
+    - `gemini`/`kimi`/`opencode`/`qwen`: ACP `session/new.models.availableModels`.
   - wired `agentOptions.modelId` forwarding into all providers:
     - embedded `codex`/`claude` now pass `model` in ACP `session/new`.
     - `gemini` now passes `model` in `session/new` and `session/prompt`.
+    - `kimi` passes `model` in `session/prompt`, and uses `model` + `modelId` during config/model discovery handshakes.
     - `opencode` passes `modelId` in `session/prompt`; `qwen` passes `model` in `session/prompt`.
   - Web UI updates:
     - new-thread modal model selector removed (create flow keeps agent/cwd/title/advanced JSON only).
@@ -432,7 +448,7 @@ This file is the source of milestone progress, validation commands, and next act
   - `POST` now applies model changes through ACP `session/set_config_option` (no separate apply endpoint/action).
   - provider-side config option support added across all built-in agents:
     - embedded: `codex`, `claude` (in-session `session/set_config_option` on cached runtime).
-    - stdio: `opencode`, `qwen`, `gemini` (ACP handshake + `session/set_config_option` apply path, then persist selected model for next turns).
+    - stdio: `opencode`, `qwen`, `gemini`, `kimi` (ACP handshake + `session/set_config_option` apply path, then persist selected model for next turns).
   - Web UI changes:
     - removed thread header `Apply` button.
     - model dropdown now applies immediately on selection.

@@ -24,6 +24,7 @@ import (
 	claudeagent "github.com/beyond5959/ngent/internal/agents/claude"
 	codexagent "github.com/beyond5959/ngent/internal/agents/codex"
 	geminiagent "github.com/beyond5959/ngent/internal/agents/gemini"
+	kimiagent "github.com/beyond5959/ngent/internal/agents/kimi"
 	opencodeagent "github.com/beyond5959/ngent/internal/agents/opencode"
 	qwenagent "github.com/beyond5959/ngent/internal/agents/qwen"
 	"github.com/beyond5959/ngent/internal/httpapi"
@@ -58,6 +59,7 @@ func main() {
 	codexPreflightErr := codexagent.Preflight(codexRuntimeConfig)
 	opencodePreflightErr := opencodeagent.Preflight()
 	geminiPreflightErr := geminiagent.Preflight()
+	kimiPreflightErr := kimiagent.Preflight()
 	qwenPreflightErr := qwenagent.Preflight()
 	claudePreflightErr := claudeagent.Preflight()
 
@@ -85,6 +87,7 @@ func main() {
 	codexAvailable := codexPreflightErr == nil
 	opencodeAvailable := opencodePreflightErr == nil
 	geminiAvailable := geminiPreflightErr == nil
+	kimiAvailable := kimiPreflightErr == nil
 	qwenAvailable := qwenPreflightErr == nil
 	claudeAvailable := claudePreflightErr == nil
 	if codexPreflightErr != nil {
@@ -96,13 +99,16 @@ func main() {
 	if geminiPreflightErr != nil {
 		logger.Warn("startup.gemini_unavailable", "error", geminiPreflightErr.Error())
 	}
+	if kimiPreflightErr != nil {
+		logger.Warn("startup.kimi_unavailable", "error", kimiPreflightErr.Error())
+	}
 	if qwenPreflightErr != nil {
 		logger.Warn("startup.qwen_unavailable", "error", qwenPreflightErr.Error())
 	}
 	if claudePreflightErr != nil {
 		logger.Warn("startup.claude_unavailable", "error", claudePreflightErr.Error())
 	}
-	agents := supportedAgents(codexAvailable, opencodeAvailable, geminiAvailable, qwenAvailable, claudeAvailable)
+	agents := supportedAgents(codexAvailable, opencodeAvailable, geminiAvailable, kimiAvailable, qwenAvailable, claudeAvailable)
 
 	listenAddr, port, err := validateListenAddr(*listenAddrFlag, *allowPublic)
 	if err != nil {
@@ -136,7 +142,7 @@ func main() {
 	handler := httpapi.New(httpapi.Config{
 		AuthToken:       *authToken,
 		Agents:          agents,
-		AllowedAgentIDs: []string{"codex", "opencode", "gemini", "qwen", "claude"},
+		AllowedAgentIDs: []string{"codex", "opencode", "gemini", "kimi", "qwen", "claude"},
 		AllowedRoots:    allowedRoots,
 		Store:           store,
 		TurnController:  turnController,
@@ -160,6 +166,12 @@ func main() {
 				})
 			case "gemini":
 				return geminiagent.New(geminiagent.Config{
+					Dir:             thread.CWD,
+					ModelID:         modelID,
+					ConfigOverrides: configOverrides,
+				})
+			case "kimi":
+				return kimiagent.New(kimiagent.Config{
 					Dir:             thread.CWD,
 					ModelID:         modelID,
 					ConfigOverrides: configOverrides,
@@ -205,6 +217,11 @@ func main() {
 					return nil, geminiPreflightErr
 				}
 				return geminiagent.DiscoverModels(ctx, geminiagent.Config{Dir: modelDiscoveryDir})
+			case "kimi":
+				if kimiPreflightErr != nil {
+					return nil, kimiPreflightErr
+				}
+				return kimiagent.DiscoverModels(ctx, kimiagent.Config{Dir: modelDiscoveryDir})
 			case "qwen":
 				if qwenPreflightErr != nil {
 					return nil, qwenPreflightErr
@@ -236,6 +253,7 @@ func main() {
 		codexPreflightErr,
 		opencodePreflightErr,
 		geminiPreflightErr,
+		kimiPreflightErr,
 		qwenPreflightErr,
 		claudePreflightErr,
 	))
@@ -315,6 +333,7 @@ func buildAgentConfigCatalogRefresher(
 	codexPreflightErr error,
 	opencodePreflightErr error,
 	geminiPreflightErr error,
+	kimiPreflightErr error,
 	qwenPreflightErr error,
 	claudePreflightErr error,
 ) *agentConfigCatalogRefresher {
@@ -328,7 +347,7 @@ func buildAgentConfigCatalogRefresher(
 	return &agentConfigCatalogRefresher{
 		store:    store,
 		logger:   logger,
-		agentIDs: []string{"codex", "claude", "gemini", "qwen", "opencode"},
+		agentIDs: []string{"codex", "claude", "gemini", "kimi", "qwen", "opencode"},
 		fetchConfigOptions: func(ctx context.Context, agentID, modelID string) ([]agentimpl.ConfigOption, error) {
 			switch agentID {
 			case "codex":
@@ -363,6 +382,18 @@ func buildAgentConfigCatalogRefresher(
 					return nil, geminiPreflightErr
 				}
 				client, err := geminiagent.New(geminiagent.Config{
+					Dir:     modelDiscoveryDir,
+					ModelID: modelID,
+				})
+				if err != nil {
+					return nil, err
+				}
+				return queryAgentConfigOptions(ctx, client)
+			case "kimi":
+				if kimiPreflightErr != nil {
+					return nil, kimiPreflightErr
+				}
+				client, err := kimiagent.New(kimiagent.Config{
 					Dir:     modelDiscoveryDir,
 					ModelID: modelID,
 				})
@@ -426,6 +457,11 @@ func buildAgentConfigCatalogRefresher(
 					return nil, geminiPreflightErr
 				}
 				return geminiagent.DiscoverModels(ctx, geminiagent.Config{Dir: modelDiscoveryDir})
+			case "kimi":
+				if kimiPreflightErr != nil {
+					return nil, kimiPreflightErr
+				}
+				return kimiagent.DiscoverModels(ctx, kimiagent.Config{Dir: modelDiscoveryDir})
 			case "qwen":
 				if qwenPreflightErr != nil {
 					return nil, qwenPreflightErr
@@ -668,7 +704,7 @@ func extractConfigOverrides(agentOptionsJSON string) map[string]string {
 	return normalized
 }
 
-func supportedAgents(codexAvailable, opencodeAvailable, geminiAvailable, qwenAvailable, claudeAvailable bool) []httpapi.AgentInfo {
+func supportedAgents(codexAvailable, opencodeAvailable, geminiAvailable, kimiAvailable, qwenAvailable, claudeAvailable bool) []httpapi.AgentInfo {
 	codexStatus := "unavailable"
 	if codexAvailable {
 		codexStatus = "available"
@@ -680,6 +716,10 @@ func supportedAgents(codexAvailable, opencodeAvailable, geminiAvailable, qwenAva
 	geminiStatus := "unavailable"
 	if geminiAvailable {
 		geminiStatus = "available"
+	}
+	kimiStatus := "unavailable"
+	if kimiAvailable {
+		kimiStatus = "available"
 	}
 	qwenStatus := "unavailable"
 	if qwenAvailable {
@@ -694,6 +734,7 @@ func supportedAgents(codexAvailable, opencodeAvailable, geminiAvailable, qwenAva
 		{ID: "codex", Name: "Codex", Status: codexStatus},
 		{ID: "claude", Name: "Claude Code", Status: claudeStatus},
 		{ID: "gemini", Name: "Gemini CLI", Status: geminiStatus},
+		{ID: "kimi", Name: "Kimi CLI", Status: kimiStatus},
 		{ID: "qwen", Name: "Qwen Code", Status: qwenStatus},
 		{ID: "opencode", Name: "OpenCode", Status: opencodeStatus},
 	}
