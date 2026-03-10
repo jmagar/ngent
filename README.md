@@ -107,24 +107,4 @@ curl -s -H "X-Client-ID: demo" http://127.0.0.1:8686/v1/agents
 
 ## Web UI
 
-Once started, open the URL shown in the startup output:
-
-```
-Agent Hub Server started
-  [QR Code]
-Port: 8686
-URL:  http://192.168.1.10:8686/
-```
-
-Scan the QR code or open the URL in your browser.
-
-**Features:**
-
-- Create threads with any supported agent
-- Chat with streaming responses
-- Approve/deny permission requests inline
-- Browse conversation history
-- Light / dark / system themes
-- Works on desktop and mobile
-
-The Web UI is embedded in the binary — no separate installation needed.
+Open the URL shown in the startup output (e.g., `http://127.0.0.1:8686/`). 
