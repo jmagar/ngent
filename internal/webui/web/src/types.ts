@@ -42,6 +42,20 @@ export interface Thread {
   updatedAt: string
 }
 
+export interface SessionInfo {
+  sessionId: string
+  cwd?: string
+  title?: string
+  updatedAt?: string
+  _meta?: Record<string, unknown>
+}
+
+export interface SessionTranscriptMessage {
+  role: 'user' | 'assistant'
+  content: string
+  timestamp?: string
+}
+
 export interface TurnEvent {
   eventId: number
   seq: number

@@ -5,8 +5,19 @@ import { applyTheme, settingsPanel } from './components/settings-panel.ts'
 import { newThreadModal } from './components/new-thread-modal.ts'
 import { mountPermissionCard, PERMISSION_TIMEOUT_MS } from './components/permission-card.ts'
 import { renderMarkdown, bindMarkdownControls } from './markdown.ts'
-import type { Thread, Message, ConfigOption, ConfigOptionValue, Turn, StreamState, TurnEvent, PlanEntry } from './types.ts'
-import type { TurnStream, PermissionRequiredPayload, PlanUpdatePayload } from './sse.ts'
+import type {
+  Thread,
+  Message,
+  ConfigOption,
+  ConfigOptionValue,
+  Turn,
+  StreamState,
+  TurnEvent,
+  PlanEntry,
+  SessionInfo,
+  SessionTranscriptMessage,
+} from './types.ts'
+import type { TurnStream, PermissionRequiredPayload, PlanUpdatePayload, SessionBoundPayload } from './sse.ts'
 import { escHtml, formatRelativeTime, formatTimestamp, generateUUID } from './utils.ts'
 
 // ── Theme ─────────────────────────────────────────────────────────────────
@@ -52,6 +63,20 @@ const threadConfigCache = new Map<string, ConfigOption[]>()
 const agentConfigCatalogCache = new Map<string, ConfigOption[]>()
 const agentConfigCatalogInFlight = new Map<string, Promise<ConfigOption[]>>()
 const threadConfigSwitching = new Set<string>()
+const sessionSwitchingThreads = new Set<string>()
+
+interface SessionPanelState {
+  supported: boolean | null
+  sessions: SessionInfo[]
+  nextCursor: string
+  loading: boolean
+  loadingMore: boolean
+  error: string
+}
+
+const sessionPanelStateByThread = new Map<string, SessionPanelState>()
+const sessionPanelRequestSeqByThread = new Map<string, number>()
+let sessionPanelRequestSeq = 0
 
 function cloneConfigOptions(options: ConfigOption[]): ConfigOption[] {
   return options.map(option => ({
@@ -201,6 +226,30 @@ function fallbackThreadModelID(thread: Thread): string {
   return typeof model === 'string' ? model.trim() : ''
 }
 
+function threadSessionID(thread: Thread | null | undefined): string {
+  const value = thread?.agentOptions?.sessionId
+  return typeof value === 'string' ? value.trim() : ''
+}
+
+function threadChatScopeKey(thread: Thread | null | undefined): string {
+  if (!thread) return ''
+  return `${thread.threadId}::${threadSessionID(thread)}`
+}
+
+function buildThreadAgentOptionsWithSession(
+  base: Record<string, unknown>,
+  sessionID: string,
+): Record<string, unknown> {
+  const next: Record<string, unknown> = { ...base }
+  sessionID = sessionID.trim()
+  if (sessionID) {
+    next.sessionId = sessionID
+  } else {
+    delete next.sessionId
+  }
+  return next
+}
+
 async function loadThreadConfigOptions(threadId: string): Promise<ConfigOption[]> {
   const thread = store.get().threads.find(item => item.threadId === threadId)
   if (!thread) return []
@@ -245,6 +294,10 @@ const pendingPermissionsByThread = new Map<string, Map<string, PendingPermission
 
 /** Last threadId that triggered a full chat-area re-render. */
 let lastRenderThreadId: string | null = null
+/** Last (threadId, sessionId) scope rendered into the chat pane. */
+let lastRenderChatScopeKey = ''
+/** Last sessionId whose filtered history was loaded for each thread. */
+const loadedHistorySessionIDByThread = new Map<string, string>()
 let openThreadActionMenuId: string | null = null
 let renamingThreadId: string | null = null
 let renamingThreadDraft = ''
@@ -624,6 +677,252 @@ function renderPendingPermissionCards(threadId: string): void {
   const byID = pendingPermissionsByThread.get(threadId)
   if (!byID) return
   byID.forEach(pending => mountPendingPermissionCard(threadId, pending))
+}
+
+function emptySessionPanelState(): SessionPanelState {
+  return {
+    supported: null,
+    sessions: [],
+    nextCursor: '',
+    loading: false,
+    loadingMore: false,
+    error: '',
+  }
+}
+
+function sessionPanelState(threadId: string): SessionPanelState {
+  return sessionPanelStateByThread.get(threadId) ?? emptySessionPanelState()
+}
+
+function setSessionPanelState(threadId: string, next: SessionPanelState): void {
+  sessionPanelStateByThread.set(threadId, {
+    ...next,
+    sessions: dedupeSessionItems(next.sessions),
+    nextCursor: next.nextCursor.trim(),
+    error: next.error.trim(),
+  })
+}
+
+function dedupeSessionItems(items: SessionInfo[]): SessionInfo[] {
+  const deduped: SessionInfo[] = []
+  const seen = new Set<string>()
+  for (const item of items) {
+    const sessionId = item.sessionId?.trim() ?? ''
+    if (!sessionId || seen.has(sessionId)) continue
+    seen.add(sessionId)
+    deduped.push({
+      ...item,
+      sessionId,
+      cwd: item.cwd?.trim() || undefined,
+      title: item.title?.trim() || undefined,
+      updatedAt: item.updatedAt?.trim() || undefined,
+    })
+  }
+  return deduped
+}
+
+function updateThreadSessionID(threadId: string, sessionID: string): void {
+  sessionID = sessionID.trim()
+  const state = store.get()
+  const nextThreads = state.threads.map(thread => {
+    if (thread.threadId !== threadId) return thread
+    return {
+      ...thread,
+      agentOptions: buildThreadAgentOptionsWithSession(thread.agentOptions, sessionID),
+    }
+  })
+  store.set({ threads: nextThreads })
+}
+
+async function loadThreadSessions(threadId: string, append = false): Promise<void> {
+  const thread = store.get().threads.find(item => item.threadId === threadId)
+  if (!thread) return
+
+  const current = sessionPanelState(threadId)
+  if (append) {
+    if (!current.nextCursor || current.loadingMore || current.loading) return
+    setSessionPanelState(threadId, {
+      ...current,
+      loadingMore: true,
+      error: '',
+    })
+  } else {
+    setSessionPanelState(threadId, {
+      ...current,
+      loading: true,
+      loadingMore: false,
+      error: '',
+      nextCursor: '',
+    })
+  }
+  updateSessionPanel()
+
+  const requestSeq = ++sessionPanelRequestSeq
+  sessionPanelRequestSeqByThread.set(threadId, requestSeq)
+  try {
+    const response = await api.getThreadSessions(threadId, append ? current.nextCursor : '')
+    if (sessionPanelRequestSeqByThread.get(threadId) !== requestSeq) return
+
+    const base = append ? sessionPanelState(threadId).sessions : []
+    setSessionPanelState(threadId, {
+      supported: response.supported,
+      sessions: [...base, ...response.sessions],
+      nextCursor: response.nextCursor,
+      loading: false,
+      loadingMore: false,
+      error: '',
+    })
+  } catch (err) {
+    if (sessionPanelRequestSeqByThread.get(threadId) !== requestSeq) return
+    const message = err instanceof Error ? err.message : 'Failed to load sessions.'
+    setSessionPanelState(threadId, {
+      ...sessionPanelState(threadId),
+      loading: false,
+      loadingMore: false,
+      error: message,
+    })
+  }
+
+  if (store.get().activeThreadId === threadId) {
+    updateSessionPanel()
+  }
+}
+
+async function switchThreadSession(thread: Thread, nextSessionID: string): Promise<void> {
+  if (threadSessionID(thread) === nextSessionID.trim()) return
+  if (sessionSwitchingThreads.has(thread.threadId)) return
+
+  sessionSwitchingThreads.add(thread.threadId)
+  updateSessionPanel()
+  try {
+    const updatedThread = await api.updateThread(thread.threadId, {
+      agentOptions: buildThreadAgentOptionsWithSession(thread.agentOptions, nextSessionID),
+    })
+    const state = store.get()
+    store.set({
+      threads: state.threads.map(item => (item.threadId === thread.threadId ? updatedThread : item)),
+    })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Failed to update session.'
+    window.alert(message)
+  } finally {
+    sessionSwitchingThreads.delete(thread.threadId)
+    if (store.get().activeThreadId === thread.threadId) {
+      updateSessionPanel()
+    }
+  }
+}
+
+function renderSessionItem(item: SessionInfo, active: boolean): string {
+  const title = item.title?.trim() || item.sessionId
+  const cwd = item.cwd?.trim() || ''
+  const updatedAt = item.updatedAt?.trim() || ''
+  const relTime = updatedAt ? formatRelativeTime(updatedAt) : ''
+  return `
+    <button
+      class="session-item ${active ? 'session-item--active' : ''}"
+      type="button"
+      data-session-id="${escHtml(item.sessionId)}"
+      aria-pressed="${active ? 'true' : 'false'}"
+    >
+      <div class="session-item-title">${escHtml(title)}</div>
+      <div class="session-item-meta">
+        <span class="session-item-path">${escHtml(cwd || item.sessionId)}</span>
+        <span class="session-item-time">${escHtml(relTime)}</span>
+      </div>
+    </button>`
+}
+
+function renderSessionPanel(): string {
+  const { activeThreadId, threads } = store.get()
+  const thread = activeThreadId ? threads.find(item => item.threadId === activeThreadId) : null
+  if (!thread) {
+    return `
+      <div class="session-panel-header">
+        <h3 class="session-panel-title">Sessions</h3>
+      </div>
+      <div class="session-panel-empty">Select an agent to browse ACP sessions.</div>`
+  }
+
+  const state = sessionPanelState(thread.threadId)
+  const selectedSessionID = threadSessionID(thread)
+  const switching = sessionSwitchingThreads.has(thread.threadId)
+  const streaming = !!getThreadStreamState(thread.threadId)
+  const disabled = switching || streaming
+
+  const knownIDs = new Set(state.sessions.map(item => item.sessionId))
+  const sessions = [...state.sessions]
+  if (selectedSessionID && !knownIDs.has(selectedSessionID)) {
+    sessions.unshift({ sessionId: selectedSessionID, title: selectedSessionID })
+  }
+
+  let bodyHTML = ''
+  if (state.loading && !sessions.length) {
+    bodyHTML = `<div class="session-panel-empty">Loading sessions…</div>`
+  } else if (state.error && !sessions.length) {
+    bodyHTML = `<div class="session-panel-empty session-panel-empty--error">${escHtml(state.error)}</div>`
+  } else if (state.supported === false) {
+    bodyHTML = `<div class="session-panel-empty">This agent does not expose ACP session history.</div>`
+  } else {
+    const itemsHTML = sessions.length
+      ? sessions.map(item => renderSessionItem(item, item.sessionId === selectedSessionID)).join('')
+      : `<div class="session-panel-empty">No previous sessions for this working directory.</div>`
+    const showMoreHTML = state.nextCursor
+      ? `<button class="btn btn-ghost session-show-more-btn" type="button" ${state.loadingMore || disabled ? 'disabled' : ''}>
+          ${state.loadingMore ? 'Loading…' : 'Show more'}
+        </button>`
+      : ''
+    bodyHTML = `
+      <div class="session-list">${itemsHTML}</div>
+      ${showMoreHTML}
+      ${state.error && sessions.length
+        ? `<div class="session-panel-inline-error">${escHtml(state.error)}</div>`
+        : ''}`
+  }
+
+  return `
+    <div class="session-panel-header">
+      <div>
+        <h3 class="session-panel-title">Sessions</h3>
+      </div>
+      <button class="btn btn-ghost session-new-btn" type="button" ${disabled ? 'disabled' : ''}>
+        ${selectedSessionID ? 'New session' : 'Current: new'}
+      </button>
+    </div>
+    <div class="session-panel-body">
+      ${bodyHTML}
+    </div>`
+}
+
+function updateSessionPanel(): void {
+  const el = document.getElementById('session-sidebar')
+  if (!el) return
+
+  el.innerHTML = renderSessionPanel()
+  const { activeThreadId, threads } = store.get()
+  const thread = activeThreadId ? threads.find(item => item.threadId === activeThreadId) : null
+  if (!thread) return
+
+  const state = sessionPanelState(thread.threadId)
+  if (state.supported === null && !state.loading && !state.loadingMore && !state.error) {
+    void loadThreadSessions(thread.threadId)
+  }
+
+  el.querySelector<HTMLButtonElement>('.session-new-btn')?.addEventListener('click', () => {
+    void switchThreadSession(thread, '')
+  })
+
+  el.querySelectorAll<HTMLButtonElement>('.session-item[data-session-id]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const sessionID = btn.dataset.sessionId?.trim() ?? ''
+      if (!sessionID || sessionID === threadSessionID(thread)) return
+      void switchThreadSession(thread, sessionID)
+    })
+  })
+
+  el.querySelector<HTMLButtonElement>('.session-show-more-btn')?.addEventListener('click', () => {
+    void loadThreadSessions(thread.threadId, true)
+  })
 }
 
 // ── Thread list rendering ─────────────────────────────────────────────────
@@ -1129,6 +1428,10 @@ async function handleDeleteThread(threadId: string): Promise<void> {
   clearPendingPermissions(threadId)
   threadConfigCache.delete(threadId)
   threadConfigSwitching.delete(threadId)
+  loadedHistorySessionIDByThread.delete(threadId)
+  sessionPanelStateByThread.delete(threadId)
+  sessionPanelRequestSeqByThread.delete(threadId)
+  sessionSwitchingThreads.delete(threadId)
   let nextThreadCompletionBadges = omitThreadCompletionBadge(state.threadCompletionBadges, threadId)
   if (nextActiveThreadId) {
     nextThreadCompletionBadges = omitThreadCompletionBadge(nextThreadCompletionBadges, nextActiveThreadId)
@@ -1184,18 +1487,140 @@ function turnsToMessages(turns: Turn[]): Message[] {
   return msgs
 }
 
+function extractTurnSessionID(events: TurnEvent[] | undefined): string {
+  let sessionID = ''
+  for (const event of events ?? []) {
+    if (event.type !== 'session_bound') continue
+    const value = event.data?.sessionId
+    if (typeof value !== 'string') continue
+    const nextSessionID = value.trim()
+    if (nextSessionID) sessionID = nextSessionID
+  }
+  return sessionID
+}
+
+function filterTurnsBySession(turns: Turn[], sessionID: string): Turn[] {
+  sessionID = sessionID.trim()
+  const assignments = turns.map(turn => ({
+    turn,
+    sessionID: extractTurnSessionID(turn.events),
+  }))
+  const annotatedSessions = new Set(assignments.map(item => item.sessionID).filter(Boolean))
+
+  // Legacy turns created before session-bound persistence have no per-turn session marker.
+  // If the thread has no annotated turns at all, keep showing the history instead of hiding everything.
+  if (annotatedSessions.size === 0) {
+    return turns
+  }
+
+  if (!sessionID) {
+    return assignments
+      .filter(item => item.sessionID === '')
+      .map(item => item.turn)
+  }
+
+  const hasMatchedAnnotatedTurns = assignments.some(item => item.sessionID === sessionID)
+  if (!hasMatchedAnnotatedTurns) {
+    return []
+  }
+
+  const includeUnannotatedLegacyTurns = annotatedSessions.size === 1 && annotatedSessions.has(sessionID)
+  return assignments
+    .filter(item => item.sessionID === sessionID || (includeUnannotatedLegacyTurns && item.sessionID === ''))
+    .map(item => item.turn)
+}
+
+function sessionTranscriptToMessages(messages: SessionTranscriptMessage[], sessionID: string): Message[] {
+  return messages
+    .filter(message => !!message.content)
+    .map((message, index) => ({
+      id: `session-${sessionID}-${index}`,
+      role: message.role === 'assistant' ? 'agent' : 'user',
+      content: message.content,
+      timestamp: message.timestamp || '',
+      status: 'done',
+    }))
+}
+
+function messageReplayKey(message: Message): string {
+  return `${message.role}\n${message.content}`
+}
+
+function mergeSessionReplayMessages(replayMessages: Message[], localMessages: Message[]): Message[] {
+  if (!replayMessages.length) return localMessages
+  if (!localMessages.length) return replayMessages
+
+  let overlap = 0
+  const maxOverlap = Math.min(replayMessages.length, localMessages.length)
+  for (let size = maxOverlap; size > 0; size -= 1) {
+    let matches = true
+    for (let index = 0; index < size; index += 1) {
+      const replayMessage = replayMessages[replayMessages.length - size + index]
+      const localMessage = localMessages[index]
+      if (messageReplayKey(replayMessage) !== messageReplayKey(localMessage)) {
+        matches = false
+        break
+      }
+    }
+    if (matches) {
+      overlap = size
+      break
+    }
+  }
+
+  return [...replayMessages, ...localMessages.slice(overlap)]
+}
+
 async function loadHistory(threadId: string): Promise<void> {
+  const requestedThread = store.get().threads.find(item => item.threadId === threadId)
+  const requestedSessionID = threadSessionID(requestedThread)
   try {
     const turns = await api.getHistory(threadId)
     const state = store.get()
     if (state.activeThreadId !== threadId) return
+    const activeThread = state.threads.find(item => item.threadId === threadId)
+    if (!activeThread || threadSessionID(activeThread) !== requestedSessionID) return
     // Don't overwrite while a turn is streaming on this thread
     if (getThreadStreamState(threadId)) return
-    store.set({ messages: { ...state.messages, [threadId]: turnsToMessages(turns) } })
+
+    const localMessages = turnsToMessages(filterTurnsBySession(turns, requestedSessionID))
+    let nextMessages = localMessages
+    if (requestedSessionID) {
+      try {
+        const replay = await api.getThreadSessionHistory(threadId, requestedSessionID)
+        const transcriptState = store.get()
+        if (transcriptState.activeThreadId !== threadId) return
+        const transcriptThread = transcriptState.threads.find(item => item.threadId === threadId)
+        if (!transcriptThread || threadSessionID(transcriptThread) !== requestedSessionID) return
+        if (getThreadStreamState(threadId)) return
+
+        if (replay.supported && replay.messages.length) {
+          const replayMessages = sessionTranscriptToMessages(replay.messages, requestedSessionID)
+          nextMessages = mergeSessionReplayMessages(replayMessages, localMessages)
+        }
+      } catch {
+        nextMessages = localMessages
+      }
+    }
+
+    const finalState = store.get()
+    if (finalState.activeThreadId !== threadId) return
+    const finalThread = finalState.threads.find(item => item.threadId === threadId)
+    if (!finalThread || threadSessionID(finalThread) !== requestedSessionID) return
+    if (getThreadStreamState(threadId)) return
+
+    loadedHistorySessionIDByThread.set(threadId, requestedSessionID)
+    store.set({
+      messages: {
+        ...finalState.messages,
+        [threadId]: nextMessages,
+      },
+    })
   } catch {
     if (store.get().activeThreadId !== threadId) return
-    // Show error only if no messages were already rendered (empty thread)
-    if (!store.get().messages[threadId]?.length) {
+    if (threadSessionID(store.get().threads.find(item => item.threadId === threadId)) !== requestedSessionID) return
+    // Show error only if no matching local history was already rendered.
+    if (loadedHistorySessionIDByThread.get(threadId) !== requestedSessionID) {
       const listEl = document.getElementById('message-list')
       if (listEl) {
         listEl.innerHTML = `<div class="thread-list-empty" style="color:var(--error)">Failed to load history.</div>`
@@ -1517,9 +1942,11 @@ function updateChatArea(): void {
   })
 
   // Show locally loaded messages immediately (including empty threads).
-  // Only show spinner when history for this thread has never been loaded.
+  // Show the loading state when the cache belongs to a different selected session.
   const hasLocalHistory = Object.prototype.hasOwnProperty.call(store.get().messages, thread.threadId)
-  if (hasLocalHistory) {
+  const hasMatchingLocalHistory = hasLocalHistory
+    && loadedHistorySessionIDByThread.get(thread.threadId) === threadSessionID(thread)
+  if (hasMatchingLocalHistory) {
     updateMessageList()
   } else {
     const listEl = document.getElementById('message-list')
@@ -1876,6 +2303,10 @@ function handleSend(): void {
       if (atBottom && list) list.scrollTop = list.scrollHeight
     },
 
+    onSessionBound({ sessionId }: SessionBoundPayload) {
+      updateThreadSessionID(capturedThreadID, sessionId)
+    },
+
     onPermissionRequired(event) {
       const pending = upsertPendingPermission(capturedThreadID, event)
       mountPendingPermissionCard(capturedThreadID, pending)
@@ -1888,6 +2319,7 @@ function handleSend(): void {
       clearThreadStreamRuntime(capturedThreadID)
       clearPendingPermissions(capturedThreadID)
       markThreadCompletionBadge(capturedThreadID)
+      void loadThreadSessions(capturedThreadID)
 
       addMessageToStore(capturedThreadID, {
         id:         agentMsgID,
@@ -1905,6 +2337,7 @@ function handleSend(): void {
       const finalPlanEntries = clonePlanEntries(streamPlanByThread.get(capturedThreadID))
       clearThreadStreamRuntime(capturedThreadID)
       clearPendingPermissions(capturedThreadID)
+      void loadThreadSessions(capturedThreadID)
 
       addMessageToStore(capturedThreadID, {
         id:           agentMsgID,
@@ -1923,6 +2356,7 @@ function handleSend(): void {
       const finalPlanEntries = clonePlanEntries(streamPlanByThread.get(capturedThreadID))
       clearThreadStreamRuntime(capturedThreadID)
       clearPendingPermissions(capturedThreadID)
+      void loadThreadSessions(capturedThreadID)
 
       addMessageToStore(capturedThreadID, {
         id:           agentMsgID,
@@ -2009,6 +2443,13 @@ function renderShell(): void {
       <main class="chat" id="chat">
         ${renderChatEmpty()}
       </main>
+
+      <aside class="session-sidebar" id="session-sidebar">
+        <div class="session-panel-header">
+          <h3 class="session-panel-title">Sessions</h3>
+        </div>
+        <div class="session-panel-empty">Select an agent to browse ACP sessions.</div>
+      </aside>
     </div>`
 
   document.getElementById('settings-btn')?.addEventListener('click', () => settingsPanel.open())
@@ -2099,13 +2540,18 @@ async function init(): Promise<void> {
   })
 
   store.subscribe(() => {
-    const { activeThreadId } = store.get()
+    const { activeThreadId, threads } = store.get()
+    const activeThread = activeThreadId ? threads.find(thread => thread.threadId === activeThreadId) ?? null : null
     const threadChanged = activeThreadId !== lastRenderThreadId
+    const chatScopeKey = threadChatScopeKey(activeThread)
+    const chatScopeChanged = chatScopeKey !== lastRenderChatScopeKey
 
     updateThreadList()
+    updateSessionPanel()
 
-    if (threadChanged) {
+    if (threadChanged || (chatScopeChanged && !getThreadStreamState(activeThreadId))) {
       lastRenderThreadId = activeThreadId
+      lastRenderChatScopeKey = chatScopeKey
       updateChatArea()
     } else {
       // activeStreamMsgId is non-null while the streaming bubble is in the DOM.

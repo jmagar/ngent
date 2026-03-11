@@ -714,3 +714,50 @@ Use this template for new decisions.
   - always log ACP payloads at info level (rejected: too noisy and unsafe for normal operation).
   - add per-provider bespoke debug flags (rejected: fragmented UX and duplicated plumbing).
   - expose raw unredacted ACP dumps (rejected: conflicts with repository logging/redaction requirements).
+
+## ADR-036: Persist thread-level ACP session selection and resume through provider sessions
+
+- Status: Accepted
+- Date: 2026-03-11
+- Context:
+  - users need to browse an agent's historical ACP sessions and continue a conversation from an existing provider-owned session.
+  - hub threads already persist local turn history, but blindly injecting that history into prompts duplicates context once ACP `session/load` has restored the provider's own transcript.
+  - the frontend needs paginated session discovery and a lightweight way to switch between "new session" and "existing session" without changing the SQLite schema.
+- Decision:
+  - persist the selected ACP session id in `threads.agent_options_json` as `sessionId`.
+  - expose `GET /v1/threads/{threadId}/sessions` backed by ACP `session/list`, using a fresh provider instance so sidebar discovery does not disturb cached turn runtimes.
+  - extend built-in providers to:
+    - load `sessionId` through ACP `session/load` when present.
+    - create a fresh session through `session/new` otherwise.
+    - report the effective session id back during turn setup so the server can persist it and emit SSE `session_bound`.
+  - once `sessionId` is present on a thread, skip local recent-turn prompt injection and rely on ACP session state for continuation.
+  - keep Web UI session selection as a thread metadata mutation (`PATCH /v1/threads/{threadId}`) and model the "New session" action as clearing `sessionId`.
+- Consequences:
+  - session continuation survives provider restart/server restart when the agent supports ACP `session/load`.
+  - right-sidebar session browsing stays paginated (`nextCursor`/`Show more`) and does not require schema changes.
+  - local SQLite history remains a hub-local view and is no longer the source of truth for resumed ACP context on bound threads.
+  - historical ACP transcript import is deferred and tracked separately as a known limitation.
+- Alternatives considered:
+  - import the full ACP transcript from `session/load` into SQLite immediately (rejected: larger behavioral change, requires reliable transcript reconstruction).
+  - keep relying on hub prompt injection even after binding to an ACP session (rejected: duplicates already-restored conversation context).
+  - add a dedicated sessions table instead of reusing `agentOptions` JSON (rejected: unnecessary schema churn for a single thread-scoped selection value).
+
+## ADR-037: Scope Web UI chat playback to the selected ACP session
+
+- Status: Accepted
+- Date: 2026-03-11
+- Context:
+  - the Web UI session sidebar switches `agentOptions.sessionId` on the active thread without changing `threadId`.
+  - local history remains stored per thread, and each turn's effective ACP session is persisted through the `session_bound` event stream.
+  - refreshing the chat area only on thread changes leaves stale messages visible after choosing a different session from the sidebar.
+- Decision:
+  - treat `(threadId, sessionId)` as the client-side chat render scope.
+  - when the active thread's selected session changes outside an active turn, rebuild the chat area and reload history for that scope.
+  - filter locally persisted turns by their `session_bound` event so the center chat panel renders only turns recorded for the selected session; an empty `sessionId` shows only unbound turns.
+- Consequences:
+  - clicking a session in the sidebar replays that session's ngent-recorded turns instead of keeping the previously rendered session on screen.
+  - session changes reported during a live turn do not wipe the streaming bubble; the full refresh is deferred until the turn finishes.
+  - transcript content that predates ngent participation is still not imported from the provider and remains covered by KI-021.
+- Alternatives considered:
+  - add a session-scoped history endpoint immediately (rejected: larger server contract change while turn events already contain the session discriminator).
+  - keep all thread turns visible regardless of selected session (rejected: does not meet the expected session playback behavior).

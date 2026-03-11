@@ -189,3 +189,12 @@
 - Follow-up plan:
   - add richer preflight diagnostics for Kimi auth/runtime readiness beyond PATH existence.
   - keep validating future Kimi CLI releases and narrow the fallback path once upstream command syntax stabilizes.
+
+- ID: KI-021
+- Title: Resumed ACP sessions do not backfill prior transcript into hub history
+- Status: Open
+- Severity: Medium
+- Affects: threads that select an existing ACP `sessionId` from the Web UI/API
+- Symptom: after choosing an existing session, ngent resumes context through ACP `session/load`, but the center chat/history panel still shows only turns created through ngent itself; earlier provider-owned transcript is not imported into SQLite or rendered in the chat area.
+- Workaround: select the target session before starting new hub turns, and rely on the provider's restored context for continuity even though older messages are not shown locally.
+- Follow-up plan: evaluate reconstructing/importing transcript data from `session/load` replayed `session/update` events into local hub history without duplicating future turns.

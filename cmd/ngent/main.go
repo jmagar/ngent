@@ -159,12 +159,14 @@ func main() {
 		TurnController:  turnController,
 		TurnAgentFactory: func(thread storage.Thread) (agentimpl.Streamer, error) {
 			modelID := extractModelID(thread.AgentOptionsJSON)
+			sessionID := extractSessionID(thread.AgentOptionsJSON)
 			configOverrides := extractConfigOverrides(thread.AgentOptionsJSON)
 			switch thread.AgentID {
 			case "codex":
 				return codexagent.New(codexagent.Config{
 					Dir:             thread.CWD,
 					ModelID:         modelID,
+					SessionID:       sessionID,
 					ConfigOverrides: configOverrides,
 					Name:            "codex-embedded",
 					RuntimeConfig:   codexRuntimeConfig,
@@ -173,30 +175,35 @@ func main() {
 				return opencodeagent.New(opencodeagent.Config{
 					Dir:             thread.CWD,
 					ModelID:         modelID,
+					SessionID:       sessionID,
 					ConfigOverrides: configOverrides,
 				})
 			case "gemini":
 				return geminiagent.New(geminiagent.Config{
 					Dir:             thread.CWD,
 					ModelID:         modelID,
+					SessionID:       sessionID,
 					ConfigOverrides: configOverrides,
 				})
 			case "kimi":
 				return kimiagent.New(kimiagent.Config{
 					Dir:             thread.CWD,
 					ModelID:         modelID,
+					SessionID:       sessionID,
 					ConfigOverrides: configOverrides,
 				})
 			case "qwen":
 				return qwenagent.New(qwenagent.Config{
 					Dir:             thread.CWD,
 					ModelID:         modelID,
+					SessionID:       sessionID,
 					ConfigOverrides: configOverrides,
 				})
 			case "claude":
 				return claudeagent.New(claudeagent.Config{
 					Dir:             thread.CWD,
 					ModelID:         modelID,
+					SessionID:       sessionID,
 					ConfigOverrides: configOverrides,
 					Name:            "claude-embedded",
 				})
@@ -670,6 +677,19 @@ func extractModelID(agentOptionsJSON string) string {
 		return ""
 	}
 	return strings.TrimSpace(opts.ModelID)
+}
+
+func extractSessionID(agentOptionsJSON string) string {
+	var opts struct {
+		SessionID string `json:"sessionId"`
+	}
+	if strings.TrimSpace(agentOptionsJSON) == "" {
+		return ""
+	}
+	if err := json.Unmarshal([]byte(agentOptionsJSON), &opts); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(opts.SessionID)
 }
 
 func extractConfigOverrides(agentOptionsJSON string) map[string]string {

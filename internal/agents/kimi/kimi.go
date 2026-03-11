@@ -14,6 +14,7 @@ import (
 
 	"github.com/beyond5959/ngent/internal/agents"
 	"github.com/beyond5959/ngent/internal/agents/acpmodel"
+	"github.com/beyond5959/ngent/internal/agents/acpsession"
 	"github.com/beyond5959/ngent/internal/agents/acpstdio"
 	"github.com/beyond5959/ngent/internal/agents/agentutil"
 )
@@ -39,6 +40,7 @@ type commandSpec struct {
 
 var _ agents.Streamer = (*Client)(nil)
 var _ agents.ConfigOptionManager = (*Client)(nil)
+var _ agents.SessionLister = (*Client)(nil)
 
 // New constructs a Kimi ACP client.
 func New(cfg Config) (*Client, error) {
@@ -107,6 +109,40 @@ func (c *Client) SetConfigOption(ctx context.Context, configID, value string) ([
 	return options, nil
 }
 
+// ListSessions queries ACP session/list for the current cwd.
+func (c *Client) ListSessions(ctx context.Context, req agents.SessionListRequest) (agents.SessionListResult, error) {
+	if c == nil {
+		return agents.SessionListResult{}, errors.New("kimi: nil client")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	conn, cleanup, _, initResult, err := c.openConn(ctx, c.CurrentModelID(), c.CurrentConfigOverrides())
+	if err != nil {
+		return agents.SessionListResult{}, err
+	}
+	defer cleanup()
+
+	caps := acpsession.ParseInitializeCapabilities(initResult)
+	if !caps.CanList || !caps.CanLoad {
+		return agents.SessionListResult{}, agents.ErrSessionListUnsupported
+	}
+
+	params := map[string]any{
+		"cwd":        kimiSessionCWD(c, req.CWD),
+		"mcpServers": []any{},
+	}
+	if cursor := strings.TrimSpace(req.Cursor); cursor != "" {
+		params["cursor"] = cursor
+	}
+	result, err := conn.Call(ctx, "session/list", params)
+	if err != nil {
+		return agents.SessionListResult{}, fmt.Errorf("kimi: session/list: %w", err)
+	}
+	return acpsession.ParseSessionListResult(result)
+}
+
 // Stream spawns Kimi in ACP mode, runs one turn, and streams deltas via onDelta.
 func (c *Client) Stream(ctx context.Context, input string, onDelta func(delta string) error) (agents.StopReason, error) {
 	if c == nil {
@@ -122,22 +158,41 @@ func (c *Client) Stream(ctx context.Context, input string, onDelta func(delta st
 	modelID := c.CurrentModelID()
 	configOverrides := c.CurrentConfigOverrides()
 
-	conn, cleanup, _, err := c.openConn(ctx, modelID, configOverrides)
+	conn, cleanup, _, initResult, err := c.openConn(ctx, modelID, configOverrides)
 	if err != nil {
 		return agents.StopReasonEndTurn, err
 	}
 	defer cleanup()
+	caps := acpsession.ParseInitializeCapabilities(initResult)
 
-	newResult, err := conn.Call(ctx, "session/new", sessionNewParams(c.Dir(), modelID))
-	if err != nil {
-		return agents.StopReasonEndTurn, fmt.Errorf("kimi: session/new: %w", err)
+	sessionID := c.CurrentSessionID()
+	initialOptions := []agents.ConfigOption(nil)
+	if sessionID != "" {
+		if !caps.CanLoad {
+			return agents.StopReasonEndTurn, agents.ErrSessionLoadUnsupported
+		}
+		if _, err := conn.Call(ctx, "session/load", kimiSessionLoadParams(c, sessionID)); err != nil {
+			return agents.StopReasonEndTurn, fmt.Errorf("kimi: session/load: %w", err)
+		}
+	} else {
+		newResult, err := conn.Call(ctx, "session/new", sessionNewParams(c.Dir(), modelID))
+		if err != nil {
+			return agents.StopReasonEndTurn, fmt.Errorf("kimi: session/new: %w", err)
+		}
+		sessionID = acpstdio.ParseSessionID(newResult)
+		if sessionID == "" {
+			return agents.StopReasonEndTurn, errors.New("kimi: session/new returned empty sessionId")
+		}
+		initialOptions = acpmodel.ExtractConfigOptions(newResult)
 	}
-	sessionID := acpstdio.ParseSessionID(newResult)
-	if sessionID == "" {
-		return agents.StopReasonEndTurn, errors.New("kimi: session/new returned empty sessionId")
-	}
-	if _, err := c.applyConfigOverrides(ctx, conn, sessionID, acpmodel.ExtractConfigOptions(newResult), configOverrides); err != nil {
+	if _, err := c.applyConfigOverrides(ctx, conn, sessionID, initialOptions, configOverrides); err != nil {
 		return agents.StopReasonEndTurn, err
+	}
+	if caps.CanLoad {
+		c.SetSessionID(sessionID)
+		if err := agents.NotifySessionBound(ctx, sessionID); err != nil {
+			return agents.StopReasonEndTurn, fmt.Errorf("kimi: report session bound: %w", err)
+		}
 	}
 
 	permHandler, hasPermHandler := agents.PermissionHandlerFromContext(ctx)
@@ -311,7 +366,7 @@ func (c *Client) runConfigSession(
 		sessionModelID = value
 	}
 
-	conn, cleanup, _, err := c.openConn(ctx, sessionModelID, configOverrides)
+	conn, cleanup, _, _, err := c.openConn(ctx, sessionModelID, configOverrides)
 	if err != nil {
 		return nil, err
 	}
@@ -390,7 +445,11 @@ func (c *Client) applyConfigOverrides(
 	return current, nil
 }
 
-func (c *Client) openConn(ctx context.Context, modelID string, configOverrides map[string]string) (*acpstdio.Conn, func(), string, error) {
+func (c *Client) openConn(
+	ctx context.Context,
+	modelID string,
+	configOverrides map[string]string,
+) (*acpstdio.Conn, func(), string, json.RawMessage, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -398,9 +457,9 @@ func (c *Client) openConn(ctx context.Context, modelID string, configOverrides m
 	specs := commandCandidates()
 	var attemptErrors []string
 	for idx, spec := range specs {
-		conn, cleanup, err := c.openConnWithCommand(ctx, spec, modelID, configOverrides)
+		conn, cleanup, initResult, err := c.openConnWithCommand(ctx, spec, modelID, configOverrides)
 		if err == nil {
-			return conn, cleanup, spec.label, nil
+			return conn, cleanup, spec.label, initResult, nil
 		}
 		attemptErrors = append(attemptErrors, err.Error())
 		if idx == len(specs)-1 || !shouldRetryACPStartup(err) {
@@ -408,7 +467,7 @@ func (c *Client) openConn(ctx context.Context, modelID string, configOverrides m
 		}
 	}
 
-	return nil, nil, "", fmt.Errorf(
+	return nil, nil, "", nil, fmt.Errorf(
 		"kimi: failed to start ACP mode (%s)",
 		strings.Join(attemptErrors, "; "),
 	)
@@ -419,26 +478,26 @@ func (c *Client) openConnWithCommand(
 	spec commandSpec,
 	modelID string,
 	configOverrides map[string]string,
-) (*acpstdio.Conn, func(), error) {
+) (*acpstdio.Conn, func(), json.RawMessage, error) {
 	cmd := exec.Command("kimi", spec.args(modelID, kimiThinkingArg(modelID, configOverrides))...)
 	cmd.Dir = c.Dir()
 	cmd.Env = os.Environ()
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		return nil, nil, fmt.Errorf("kimi: %s open stdin pipe: %w", spec.label, err)
+		return nil, nil, nil, fmt.Errorf("kimi: %s open stdin pipe: %w", spec.label, err)
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, nil, fmt.Errorf("kimi: %s open stdout pipe: %w", spec.label, err)
+		return nil, nil, nil, fmt.Errorf("kimi: %s open stdout pipe: %w", spec.label, err)
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		return nil, nil, fmt.Errorf("kimi: %s open stderr pipe: %w", spec.label, err)
+		return nil, nil, nil, fmt.Errorf("kimi: %s open stderr pipe: %w", spec.label, err)
 	}
 
 	if err := cmd.Start(); err != nil {
-		return nil, nil, fmt.Errorf("kimi: %s start process: %w", spec.label, err)
+		return nil, nil, nil, fmt.Errorf("kimi: %s start process: %w", spec.label, err)
 	}
 
 	errCh := make(chan error, 1)
@@ -451,7 +510,7 @@ func (c *Client) openConnWithCommand(
 		acpstdio.TerminateProcess(cmd, errCh, 2*time.Second)
 	}
 
-	if _, err := conn.Call(ctx, "initialize", map[string]any{
+	initResult, err := conn.Call(ctx, "initialize", map[string]any{
 		"protocolVersion": 1,
 		"clientCapabilities": map[string]any{
 			"fs": map[string]any{
@@ -459,12 +518,13 @@ func (c *Client) openConnWithCommand(
 				"writeTextFile": false,
 			},
 		},
-	}); err != nil {
+	})
+	if err != nil {
 		cleanup()
-		return nil, nil, fmt.Errorf("kimi: %s initialize: %w", spec.label, err)
+		return nil, nil, nil, fmt.Errorf("kimi: %s initialize: %w", spec.label, err)
 	}
 
-	return conn, cleanup, nil
+	return conn, cleanup, initResult, nil
 }
 
 func commandCandidates() []commandSpec {
@@ -548,6 +608,22 @@ func sessionNewParams(dir, modelID string) map[string]any {
 		params["modelId"] = modelID
 	}
 	return params
+}
+
+func kimiSessionCWD(c *Client, cwd string) string {
+	cwd = strings.TrimSpace(cwd)
+	if cwd != "" {
+		return cwd
+	}
+	return c.Dir()
+}
+
+func kimiSessionLoadParams(c *Client, sessionID string) map[string]any {
+	return map[string]any{
+		"sessionId":  strings.TrimSpace(sessionID),
+		"cwd":        c.Dir(),
+		"mcpServers": []any{},
+	}
 }
 
 func shouldRetryACPStartup(err error) bool {

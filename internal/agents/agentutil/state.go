@@ -13,6 +13,7 @@ import (
 type Config struct {
 	Dir             string
 	ModelID         string
+	SessionID       string
 	ConfigOverrides map[string]string
 }
 
@@ -22,6 +23,7 @@ type State struct {
 
 	mu              sync.RWMutex
 	modelID         string
+	sessionID       string
 	configOverrides map[string]string
 }
 
@@ -34,6 +36,7 @@ func NewState(provider string, cfg Config) (*State, error) {
 	return &State{
 		dir:             dir,
 		modelID:         strings.TrimSpace(cfg.ModelID),
+		sessionID:       strings.TrimSpace(cfg.SessionID),
 		configOverrides: normalizeConfigOverrides(cfg.ConfigOverrides),
 	}, nil
 }
@@ -63,6 +66,26 @@ func (s *State) SetModelID(modelID string) {
 	}
 	s.mu.Lock()
 	s.modelID = strings.TrimSpace(modelID)
+	s.mu.Unlock()
+}
+
+// CurrentSessionID returns the current bound ACP session ID.
+func (s *State) CurrentSessionID() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return strings.TrimSpace(s.sessionID)
+}
+
+// SetSessionID updates the bound ACP session ID.
+func (s *State) SetSessionID(sessionID string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.sessionID = strings.TrimSpace(sessionID)
 	s.mu.Unlock()
 }
 

@@ -416,6 +416,10 @@ func (s *Server) handleThreadResource(w http.ResponseWriter, r *http.Request, cl
 		s.handleCompactThread(w, r, clientID, threadID)
 	case "history":
 		s.handleThreadHistory(w, r, clientID, threadID)
+	case "sessions":
+		s.handleThreadSessions(w, r, clientID, threadID)
+	case "session-history":
+		s.handleThreadSessionHistory(w, r, clientID, threadID)
 	case "config-options":
 		s.handleThreadConfigOptions(w, r, clientID, threadID)
 	default:
@@ -766,6 +770,44 @@ func (s *Server) handleCreateTurnStream(w http.ResponseWriter, r *http.Request, 
 			"turnId":  turnID,
 			"entries": payloadEntries,
 		})
+	})
+	turnCtx = agents.WithSessionBoundHandler(turnCtx, func(sessionCtx context.Context, sessionID string) error {
+		_ = sessionCtx
+		sessionID = strings.TrimSpace(sessionID)
+		if sessionID == "" {
+			return nil
+		}
+
+		nextAgentOptionsJSON, changed, err := withThreadSessionID(thread.AgentOptionsJSON, sessionID)
+		if err != nil {
+			s.logger.Warn("thread.session_bind_encode_failed",
+				"threadId", thread.ThreadID,
+				"agent", thread.AgentID,
+				"reason", err.Error(),
+			)
+		} else if changed {
+			if err := s.store.UpdateThreadAgentOptions(persistCtx, thread.ThreadID, nextAgentOptionsJSON); err != nil {
+				s.logger.Warn("thread.session_bind_persist_failed",
+					"threadId", thread.ThreadID,
+					"agent", thread.AgentID,
+					"reason", err.Error(),
+				)
+			} else {
+				thread.AgentOptionsJSON = nextAgentOptionsJSON
+			}
+		}
+
+		if err := emit("session_bound", map[string]any{
+			"threadId":  thread.ThreadID,
+			"sessionId": sessionID,
+		}); err != nil {
+			s.logger.Warn("thread.session_bind_emit_failed",
+				"threadId", thread.ThreadID,
+				"agent", thread.AgentID,
+				"reason", err.Error(),
+			)
+		}
+		return nil
 	})
 
 	if err := emit("turn_started", map[string]any{"turnId": turnID}); err != nil {
@@ -1133,6 +1175,152 @@ func (s *Server) handleThreadHistory(w http.ResponseWriter, r *http.Request, cli
 	writeJSON(w, http.StatusOK, map[string]any{"turns": respTurns})
 }
 
+func (s *Server) handleThreadSessions(w http.ResponseWriter, r *http.Request, clientID, threadID string) {
+	if err := requireMethod(r, http.MethodGet); err != nil {
+		writeMethodNotAllowed(w, r)
+		return
+	}
+
+	thread, ok := s.getOwnedThread(r.Context(), clientID, threadID)
+	if !ok {
+		writeError(w, http.StatusNotFound, codeNotFound, "thread not found", map[string]any{})
+		return
+	}
+
+	provider, err := s.turnAgentFactory(thread)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, codeUpstreamUnavailable, "failed to resolve agent provider", map[string]any{
+			"agent":  thread.AgentID,
+			"reason": err.Error(),
+		})
+		return
+	}
+	if closer, ok := provider.(io.Closer); ok {
+		defer closer.Close()
+	}
+
+	lister, ok := provider.(agents.SessionLister)
+	if !ok {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"threadId":   thread.ThreadID,
+			"supported":  false,
+			"sessions":   []agents.SessionInfo{},
+			"nextCursor": "",
+		})
+		return
+	}
+
+	result, err := lister.ListSessions(r.Context(), agents.SessionListRequest{
+		CWD:    thread.CWD,
+		Cursor: strings.TrimSpace(r.URL.Query().Get("cursor")),
+	})
+	if err != nil {
+		if errors.Is(err, agents.ErrSessionListUnsupported) || errors.Is(err, agents.ErrSessionLoadUnsupported) {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"threadId":   thread.ThreadID,
+				"supported":  false,
+				"sessions":   []agents.SessionInfo{},
+				"nextCursor": "",
+			})
+			return
+		}
+		writeError(w, http.StatusServiceUnavailable, codeUpstreamUnavailable, "failed to query thread sessions", map[string]any{
+			"threadId": thread.ThreadID,
+			"agent":    thread.AgentID,
+			"reason":   err.Error(),
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"threadId":   thread.ThreadID,
+		"supported":  true,
+		"sessions":   result.Sessions,
+		"nextCursor": result.NextCursor,
+	})
+}
+
+func (s *Server) handleThreadSessionHistory(w http.ResponseWriter, r *http.Request, clientID, threadID string) {
+	if err := requireMethod(r, http.MethodGet); err != nil {
+		writeMethodNotAllowed(w, r)
+		return
+	}
+
+	thread, ok := s.getOwnedThread(r.Context(), clientID, threadID)
+	if !ok {
+		writeError(w, http.StatusNotFound, codeNotFound, "thread not found", map[string]any{})
+		return
+	}
+
+	sessionID := strings.TrimSpace(r.URL.Query().Get("sessionId"))
+	if sessionID == "" {
+		writeError(w, http.StatusBadRequest, codeInvalidArgument, "sessionId is required", map[string]any{
+			"field": "sessionId",
+		})
+		return
+	}
+
+	provider, err := s.turnAgentFactory(thread)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, codeUpstreamUnavailable, "failed to resolve agent provider", map[string]any{
+			"agent":  thread.AgentID,
+			"reason": err.Error(),
+		})
+		return
+	}
+	if closer, ok := provider.(io.Closer); ok {
+		defer closer.Close()
+	}
+
+	loader, ok := provider.(agents.SessionTranscriptLoader)
+	if !ok {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"threadId":  thread.ThreadID,
+			"sessionId": sessionID,
+			"supported": false,
+			"messages":  []agents.SessionTranscriptMessage{},
+		})
+		return
+	}
+
+	result, err := loader.LoadSessionTranscript(r.Context(), agents.SessionTranscriptRequest{
+		CWD:       thread.CWD,
+		SessionID: sessionID,
+	})
+	if err != nil {
+		if errors.Is(err, agents.ErrSessionLoadUnsupported) || errors.Is(err, agents.ErrSessionListUnsupported) {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"threadId":  thread.ThreadID,
+				"sessionId": sessionID,
+				"supported": false,
+				"messages":  []agents.SessionTranscriptMessage{},
+			})
+			return
+		}
+		if errors.Is(err, agents.ErrSessionNotFound) {
+			writeError(w, http.StatusNotFound, codeNotFound, "session not found", map[string]any{
+				"threadId":  thread.ThreadID,
+				"sessionId": sessionID,
+			})
+			return
+		}
+		writeError(w, http.StatusServiceUnavailable, codeUpstreamUnavailable, "failed to load session transcript", map[string]any{
+			"threadId":  thread.ThreadID,
+			"sessionId": sessionID,
+			"agent":     thread.AgentID,
+			"reason":    err.Error(),
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"threadId":  thread.ThreadID,
+		"sessionId": sessionID,
+		"supported": true,
+		"messages":  result.Messages,
+	})
+}
+
 func (s *Server) handleThreadConfigOptions(w http.ResponseWriter, r *http.Request, clientID, threadID string) {
 	if r.Method != http.MethodGet && r.Method != http.MethodPost {
 		writeMethodNotAllowed(w, r)
@@ -1465,6 +1653,10 @@ func (s *Server) closeThreadAgent(threadID, reason string) {
 }
 
 func (s *Server) buildInjectedPrompt(ctx context.Context, thread storage.Thread, input string) (string, error) {
+	if threadSessionID(thread.AgentOptionsJSON) != "" {
+		return strings.TrimSpace(input), nil
+	}
+
 	recentTurns, err := s.loadRecentVisibleTurns(ctx, thread.ThreadID)
 	if err != nil {
 		return "", err
@@ -2110,6 +2302,44 @@ func threadConfigSelections(agentOptionsJSON string) (string, map[string]string)
 	}
 
 	return strings.TrimSpace(raw.ModelID), overrides
+}
+
+func threadSessionID(agentOptionsJSON string) string {
+	var raw struct {
+		SessionID string `json:"sessionId"`
+	}
+	if strings.TrimSpace(agentOptionsJSON) == "" {
+		return ""
+	}
+	if err := json.Unmarshal([]byte(agentOptionsJSON), &raw); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(raw.SessionID)
+}
+
+func withThreadSessionID(agentOptionsJSON, sessionID string) (string, bool, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	currentSessionID := threadSessionID(agentOptionsJSON)
+
+	objectValue := map[string]any{}
+	trimmed := strings.TrimSpace(agentOptionsJSON)
+	if trimmed != "" {
+		if err := json.Unmarshal([]byte(trimmed), &objectValue); err != nil {
+			return "", false, err
+		}
+	}
+
+	if sessionID == "" {
+		delete(objectValue, "sessionId")
+	} else {
+		objectValue["sessionId"] = sessionID
+	}
+
+	normalized, err := json.Marshal(objectValue)
+	if err != nil {
+		return "", false, err
+	}
+	return string(normalized), sessionID != currentSessionID, nil
 }
 
 func applyThreadConfigSelections(
