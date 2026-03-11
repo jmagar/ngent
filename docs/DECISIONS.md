@@ -36,6 +36,32 @@
 - ADR-032: Shared common agent config/state helper without protocol unification. (Accepted)
 - ADR-033: Surface ACP plan updates as first-class SSE and Web UI state. (Accepted)
 - ADR-034: Source Kimi config catalogs from local config to avoid empty sessions. (Accepted)
+- ADR-035: Add opt-in ACP debug tracing behind `--debug`. (Accepted)
+- ADR-036: Persist stable Codex session ids and normalize Codex transcript replay. (Accepted)
+
+## ADR-036: Persist Stable Codex Session IDs and Normalize Codex Transcript Replay
+
+- Status: Accepted
+- Date: 2026-03-11
+- Context:
+  - embedded Codex `session/new` can initially return only a provisional runtime-scoped id like `session-1`, while the durable session identity arrives later via `session/list` metadata (`_meta.threadId`).
+  - persisting the provisional id caused fresh `New session` turns to collapse back onto the same thread session binding.
+  - Codex transcript files also include wrapper-generated user messages for bootstrap context (`AGENTS.md`, `environment_context`) and prompt wrappers (`[Current User Input]`, IDE setup metadata), which polluted Web UI session replay.
+- Decision:
+  - treat the durable Codex session id as the canonical thread binding and defer fresh-session `session_bound` persistence/emission when the only known id still matches the provisional raw runtime id.
+  - after the first prompt completes, retry `session/list` briefly to resolve the stable id, then update in-memory client state and persisted thread `agentOptions.sessionId` with that durable id.
+  - normalize Codex session transcript replay on the backend before returning it to the Web UI:
+    - drop bootstrap wrapper messages injected by the desktop environment.
+    - extract the actual user prompt from known wrapper formats such as `[Current User Input]` and `## My request for Codex:`.
+- Consequences:
+  - fresh `New session` flows now bind to durable Codex session identities and no longer merge unrelated turns under one provisional raw id.
+  - Web UI session replay shows user-visible prompts instead of provider/bootstrap scaffolding.
+  - session list titles from provider metadata remain raw for now; only replayed message bodies are normalized.
+- Alternatives considered:
+  - persist the first raw runtime id immediately and rely on later correction.
+  - leave transcript normalization to the frontend merge logic.
+- Follow-up actions:
+  - evaluate normalizing Codex `session/list` titles/previews in the backend so the session sidebar also hides wrapper-generated summary text.
 
 ## ADR-018: Embedded Web UI via Go embed
 
@@ -688,3 +714,75 @@ Use this template for new decisions.
 - Alternatives considered:
   - keep ACP-only config discovery (rejected: side effect creates noisy empty sessions).
   - disable Kimi config/model catalog refresh entirely (rejected: would regress model picker accuracy).
+
+## ADR-035: Add opt-in ACP debug tracing behind `--debug`
+
+- Status: Accepted
+- Date: 2026-03-11
+- Context:
+  - operators need a direct way to inspect the exact ACP methods and payloads exchanged with built-in agents when debugging protocol/runtime issues.
+  - normal production logs must remain concise, protocol-only, and continue redacting sensitive information.
+  - ACP traffic currently flows through three different boundaries:
+    - stdio JSON-RPC transport (`acpstdio`)
+    - legacy stdio ACP client (`internal/agents/acp`)
+    - embedded runtimes (`codex`, `claude`)
+- Decision:
+  - add a startup flag `--debug` that raises the shared `slog` logger to debug level.
+  - when enabled, emit structured stderr log entries `acp.message` for inbound/outbound ACP JSON-RPC messages across all supported transport paths.
+  - include `component`, `direction`, `rpcType`, `method`, `id`, and the sanitized `rpc` payload in each trace log.
+  - keep a redaction pass in front of debug logging so sensitive keys and common token formats are masked before serialization.
+- Consequences:
+  - ACP handshakes, prompts, updates, permission requests, and permission responses are inspectable without changing HTTP/stdout protocol behavior.
+  - debug mode can produce high log volume and should be used only when investigating runtime issues.
+  - the tracing mechanism remains transport-local and does not require changing provider/public API contracts.
+- Alternatives considered:
+  - always log ACP payloads at info level (rejected: too noisy and unsafe for normal operation).
+  - add per-provider bespoke debug flags (rejected: fragmented UX and duplicated plumbing).
+  - expose raw unredacted ACP dumps (rejected: conflicts with repository logging/redaction requirements).
+
+## ADR-036: Persist thread-level ACP session selection and resume through provider sessions
+
+- Status: Accepted
+- Date: 2026-03-11
+- Context:
+  - users need to browse an agent's historical ACP sessions and continue a conversation from an existing provider-owned session.
+  - hub threads already persist local turn history, but blindly injecting that history into prompts duplicates context once ACP `session/load` has restored the provider's own transcript.
+  - the frontend needs paginated session discovery and a lightweight way to switch between "new session" and "existing session" without changing the SQLite schema.
+- Decision:
+  - persist the selected ACP session id in `threads.agent_options_json` as `sessionId`.
+  - expose `GET /v1/threads/{threadId}/sessions` backed by ACP `session/list`, using a fresh provider instance so sidebar discovery does not disturb cached turn runtimes.
+  - extend built-in providers to:
+    - load `sessionId` through ACP `session/load` when present.
+    - create a fresh session through `session/new` otherwise.
+    - report the effective session id back during turn setup so the server can persist it and emit SSE `session_bound`.
+  - once `sessionId` is present on a thread, skip local recent-turn prompt injection and rely on ACP session state for continuation.
+  - keep Web UI session selection as a thread metadata mutation (`PATCH /v1/threads/{threadId}`) and model the "New session" action as clearing `sessionId`.
+- Consequences:
+  - session continuation survives provider restart/server restart when the agent supports ACP `session/load`.
+  - right-sidebar session browsing stays paginated (`nextCursor`/`Show more`) and does not require schema changes.
+  - local SQLite history remains a hub-local view and is no longer the source of truth for resumed ACP context on bound threads.
+  - historical ACP transcript import is deferred and tracked separately as a known limitation.
+- Alternatives considered:
+  - import the full ACP transcript from `session/load` into SQLite immediately (rejected: larger behavioral change, requires reliable transcript reconstruction).
+  - keep relying on hub prompt injection even after binding to an ACP session (rejected: duplicates already-restored conversation context).
+  - add a dedicated sessions table instead of reusing `agentOptions` JSON (rejected: unnecessary schema churn for a single thread-scoped selection value).
+
+## ADR-037: Scope Web UI chat playback to the selected ACP session
+
+- Status: Accepted
+- Date: 2026-03-11
+- Context:
+  - the Web UI session sidebar switches `agentOptions.sessionId` on the active thread without changing `threadId`.
+  - local history remains stored per thread, and each turn's effective ACP session is persisted through the `session_bound` event stream.
+  - refreshing the chat area only on thread changes leaves stale messages visible after choosing a different session from the sidebar.
+- Decision:
+  - treat `(threadId, sessionId)` as the client-side chat render scope.
+  - when the active thread's selected session changes outside an active turn, rebuild the chat area and reload history for that scope.
+  - filter locally persisted turns by their `session_bound` event so the center chat panel renders only turns recorded for the selected session; an empty `sessionId` shows only unbound turns.
+- Consequences:
+  - clicking a session in the sidebar replays that session's ngent-recorded turns instead of keeping the previously rendered session on screen.
+  - session changes reported during a live turn do not wipe the streaming bubble; the full refresh is deferred until the turn finishes.
+  - transcript content that predates ngent participation is still not imported from the provider and remains covered by KI-021.
+- Alternatives considered:
+  - add a session-scoped history endpoint immediately (rejected: larger server contract change while turn events already contain the session discriminator).
+  - keep all thread turns visible regardless of selected session (rejected: does not meet the expected session playback behavior).

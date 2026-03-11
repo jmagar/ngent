@@ -21,7 +21,7 @@ func DiscoverModels(ctx context.Context, cfg Config) ([]agents.ModelOption, erro
 		ctx = context.Background()
 	}
 
-	conn, cleanup, _, err := client.openConn(ctx, client.CurrentModelID(), client.CurrentConfigOverrides())
+	conn, cleanup, _, _, err := client.openConn(ctx, client.CurrentModelID(), client.CurrentConfigOverrides())
 	if err != nil {
 		return nil, err
 	}

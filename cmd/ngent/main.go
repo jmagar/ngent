@@ -46,6 +46,7 @@ func main() {
 
 	portFlag := flag.Int("port", 8686, "server listen port (1-65535)")
 	allowPublic := flag.Bool("allow-public", false, "allow listening on public interfaces (default false for loopback-only)")
+	debugFlag := flag.Bool("debug", false, "enable verbose debug logs, including ACP request/response payloads on stderr")
 	authToken := flag.String("auth-token", "", "optional bearer token for /v1/* endpoints")
 	dbPath := flag.String("db-path", defaultDBPath, "sqlite database path")
 	contextRecentTurns := flag.Int("context-recent-turns", 10, "number of recent user+assistant turns injected into each prompt")
@@ -54,6 +55,13 @@ func main() {
 	agentIdleTTL := flag.Duration("agent-idle-ttl", 5*time.Minute, "idle TTL before closing cached thread agent provider")
 	shutdownGraceTimeout := flag.Duration("shutdown-grace-timeout", 8*time.Second, "graceful shutdown timeout for active turns")
 	flag.Parse()
+
+	logLevel := slog.LevelInfo
+	if *debugFlag {
+		logLevel = slog.LevelDebug
+	}
+	logger = observability.NewJSONLogger(logLevel)
+	observability.ConfigureACPDebug(logger, *debugFlag)
 
 	codexRuntimeConfig := codexagent.DefaultRuntimeConfig()
 	codexPreflightErr := codexagent.Preflight(codexRuntimeConfig)
@@ -108,6 +116,9 @@ func main() {
 	if claudePreflightErr != nil {
 		logger.Warn("startup.claude_unavailable", "error", claudePreflightErr.Error())
 	}
+	if *debugFlag {
+		logger.Info("startup.debug_enabled", "acpTrace", true)
+	}
 	agents := supportedAgents(codexAvailable, opencodeAvailable, geminiAvailable, kimiAvailable, qwenAvailable, claudeAvailable)
 
 	listenAddr, port, err := resolveListenAddr(*portFlag, *allowPublic)
@@ -148,12 +159,14 @@ func main() {
 		TurnController:  turnController,
 		TurnAgentFactory: func(thread storage.Thread) (agentimpl.Streamer, error) {
 			modelID := extractModelID(thread.AgentOptionsJSON)
+			sessionID := extractSessionID(thread.AgentOptionsJSON)
 			configOverrides := extractConfigOverrides(thread.AgentOptionsJSON)
 			switch thread.AgentID {
 			case "codex":
 				return codexagent.New(codexagent.Config{
 					Dir:             thread.CWD,
 					ModelID:         modelID,
+					SessionID:       sessionID,
 					ConfigOverrides: configOverrides,
 					Name:            "codex-embedded",
 					RuntimeConfig:   codexRuntimeConfig,
@@ -162,30 +175,35 @@ func main() {
 				return opencodeagent.New(opencodeagent.Config{
 					Dir:             thread.CWD,
 					ModelID:         modelID,
+					SessionID:       sessionID,
 					ConfigOverrides: configOverrides,
 				})
 			case "gemini":
 				return geminiagent.New(geminiagent.Config{
 					Dir:             thread.CWD,
 					ModelID:         modelID,
+					SessionID:       sessionID,
 					ConfigOverrides: configOverrides,
 				})
 			case "kimi":
 				return kimiagent.New(kimiagent.Config{
 					Dir:             thread.CWD,
 					ModelID:         modelID,
+					SessionID:       sessionID,
 					ConfigOverrides: configOverrides,
 				})
 			case "qwen":
 				return qwenagent.New(qwenagent.Config{
 					Dir:             thread.CWD,
 					ModelID:         modelID,
+					SessionID:       sessionID,
 					ConfigOverrides: configOverrides,
 				})
 			case "claude":
 				return claudeagent.New(claudeagent.Config{
 					Dir:             thread.CWD,
 					ModelID:         modelID,
+					SessionID:       sessionID,
 					ConfigOverrides: configOverrides,
 					Name:            "claude-embedded",
 				})
@@ -659,6 +677,19 @@ func extractModelID(agentOptionsJSON string) string {
 		return ""
 	}
 	return strings.TrimSpace(opts.ModelID)
+}
+
+func extractSessionID(agentOptionsJSON string) string {
+	var opts struct {
+		SessionID string `json:"sessionId"`
+	}
+	if strings.TrimSpace(agentOptionsJSON) == "" {
+		return ""
+	}
+	if err := json.Unmarshal([]byte(agentOptionsJSON), &opts); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(opts.SessionID)
 }
 
 func extractConfigOverrides(agentOptionsJSON string) map[string]string {

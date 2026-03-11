@@ -796,6 +796,227 @@ func TestUpdateThreadClosesCachedAgent(t *testing.T) {
 	}
 }
 
+func TestThreadSessionsListEndpoint(t *testing.T) {
+	root := t.TempDir()
+	streamer := &sessionListStreamer{
+		result: agents.SessionListResult{
+			Sessions: []agents.SessionInfo{{
+				SessionID: "ses_001",
+				CWD:       root,
+				Title:     "Existing session",
+				UpdatedAt: "2026-03-11T08:00:00Z",
+			}},
+			NextCursor: "cursor-2",
+		},
+	}
+
+	h := newTestServer(t, testServerOptions{
+		allowedRoots: []string{root},
+		turnAgentFactory: func(thread storage.Thread) (agents.Streamer, error) {
+			_ = thread
+			return streamer, nil
+		},
+	})
+
+	threadID := createThreadForClient(t, h, "client-a", root)
+	rr := performJSONRequest(t, h, http.MethodGet, "/v1/threads/"+threadID+"/sessions?cursor=cursor-1", nil, map[string]string{
+		"X-Client-ID": "client-a",
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want %d", rr.Code, http.StatusOK)
+	}
+
+	var body struct {
+		ThreadID   string               `json:"threadId"`
+		Supported  bool                 `json:"supported"`
+		Sessions   []agents.SessionInfo `json:"sessions"`
+		NextCursor string               `json:"nextCursor"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if body.ThreadID != threadID {
+		t.Fatalf("threadId = %q, want %q", body.ThreadID, threadID)
+	}
+	if !body.Supported {
+		t.Fatal("supported = false, want true")
+	}
+	if got, want := len(body.Sessions), 1; got != want {
+		t.Fatalf("len(sessions) = %d, want %d", got, want)
+	}
+	if body.Sessions[0].SessionID != "ses_001" {
+		t.Fatalf("sessions[0].sessionId = %q, want %q", body.Sessions[0].SessionID, "ses_001")
+	}
+	if body.NextCursor != "cursor-2" {
+		t.Fatalf("nextCursor = %q, want %q", body.NextCursor, "cursor-2")
+	}
+	if got := streamer.lastCursor.Load(); got != "cursor-1" {
+		t.Fatalf("session list cursor = %q, want %q", got, "cursor-1")
+	}
+}
+
+func TestThreadSessionHistoryEndpoint(t *testing.T) {
+	root := t.TempDir()
+	streamer := &sessionTranscriptStreamer{
+		result: agents.SessionTranscriptResult{
+			Messages: []agents.SessionTranscriptMessage{
+				{Role: "user", Content: "hello", Timestamp: "2026-03-11T10:03:50Z"},
+				{Role: "assistant", Content: "world", Timestamp: "2026-03-11T10:03:51Z"},
+			},
+		},
+	}
+
+	h := newTestServer(t, testServerOptions{
+		allowedRoots: []string{root},
+		turnAgentFactory: func(thread storage.Thread) (agents.Streamer, error) {
+			_ = thread
+			return streamer, nil
+		},
+	})
+
+	threadID := createThreadForClient(t, h, "client-a", root)
+	rr := performJSONRequest(t, h, http.MethodGet, "/v1/threads/"+threadID+"/session-history?sessionId=session-2", nil, map[string]string{
+		"X-Client-ID": "client-a",
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want %d", rr.Code, http.StatusOK)
+	}
+
+	var body struct {
+		ThreadID  string                            `json:"threadId"`
+		SessionID string                            `json:"sessionId"`
+		Supported bool                              `json:"supported"`
+		Messages  []agents.SessionTranscriptMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if body.ThreadID != threadID {
+		t.Fatalf("threadId = %q, want %q", body.ThreadID, threadID)
+	}
+	if body.SessionID != "session-2" {
+		t.Fatalf("sessionId = %q, want %q", body.SessionID, "session-2")
+	}
+	if !body.Supported {
+		t.Fatal("supported = false, want true")
+	}
+	if got, want := len(body.Messages), 2; got != want {
+		t.Fatalf("len(messages) = %d, want %d", got, want)
+	}
+	if got := body.Messages[1].Content; got != "world" {
+		t.Fatalf("messages[1].Content = %q, want %q", got, "world")
+	}
+	if got := streamer.lastSessionID.Load(); got != "session-2" {
+		t.Fatalf("requested sessionId = %q, want %q", got, "session-2")
+	}
+}
+
+func TestThreadSessionHistoryEndpointUnsupported(t *testing.T) {
+	root := t.TempDir()
+	streamer := &sessionListStreamer{}
+
+	h := newTestServer(t, testServerOptions{
+		allowedRoots: []string{root},
+		turnAgentFactory: func(thread storage.Thread) (agents.Streamer, error) {
+			_ = thread
+			return streamer, nil
+		},
+	})
+
+	threadID := createThreadForClient(t, h, "client-a", root)
+	rr := performJSONRequest(t, h, http.MethodGet, "/v1/threads/"+threadID+"/session-history?sessionId=session-2", nil, map[string]string{
+		"X-Client-ID": "client-a",
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want %d", rr.Code, http.StatusOK)
+	}
+
+	var body struct {
+		Supported bool                              `json:"supported"`
+		Messages  []agents.SessionTranscriptMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if body.Supported {
+		t.Fatal("supported = true, want false")
+	}
+	if len(body.Messages) != 0 {
+		t.Fatalf("len(messages) = %d, want 0", len(body.Messages))
+	}
+}
+
+func TestTurnSessionBoundPersistsSessionIDAndSkipsContextInjection(t *testing.T) {
+	root := t.TempDir()
+	streamer := &sessionBoundStreamer{sessionID: "ses_bound_123"}
+
+	h := newTestServer(t, testServerOptions{
+		allowedRoots: []string{root},
+		turnAgentFactory: func(thread storage.Thread) (agents.Streamer, error) {
+			_ = thread
+			return streamer, nil
+		},
+	})
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	threadID := createThreadHTTP(t, ts.URL, "client-a", root)
+
+	first := runTurnStreamRequest(t, ts.URL, "client-a", threadID, "hello one")
+	if first.StatusCode != http.StatusOK {
+		t.Fatalf("first turn status = %d, want %d", first.StatusCode, http.StatusOK)
+	}
+
+	events := parseSSEEvents(t, first.Body)
+	foundSessionBound := false
+	for _, event := range events {
+		if event.Event != "session_bound" {
+			continue
+		}
+		if stringField(event.Data, "sessionId") == "ses_bound_123" {
+			foundSessionBound = true
+		}
+	}
+	if !foundSessionBound {
+		t.Fatalf("missing session_bound event, events=%+v", events)
+	}
+
+	threadStatus, threadBody := doJSON(t, http.MethodGet, ts.URL+"/v1/threads/"+threadID, nil, map[string]string{
+		"X-Client-ID": "client-a",
+	})
+	if threadStatus != http.StatusOK {
+		t.Fatalf("get thread status = %d, want %d, body=%s", threadStatus, http.StatusOK, threadBody)
+	}
+	var threadResp struct {
+		Thread struct {
+			AgentOptions map[string]any `json:"agentOptions"`
+		} `json:"thread"`
+	}
+	if err := json.Unmarshal([]byte(threadBody), &threadResp); err != nil {
+		t.Fatalf("unmarshal thread response: %v", err)
+	}
+	if got := fmt.Sprintf("%v", threadResp.Thread.AgentOptions["sessionId"]); got != "ses_bound_123" {
+		t.Fatalf("thread.agentOptions.sessionId = %q, want %q", got, "ses_bound_123")
+	}
+
+	second := runTurnStreamRequest(t, ts.URL, "client-a", threadID, "hello two")
+	if second.StatusCode != http.StatusOK {
+		t.Fatalf("second turn status = %d, want %d", second.StatusCode, http.StatusOK)
+	}
+
+	history := getHistoryHTTP(t, ts.URL, "client-a", threadID, false)
+	if got, want := len(history.Turns), 2; got != want {
+		t.Fatalf("len(history.turns) = %d, want %d", got, want)
+	}
+	lastResp := history.Turns[len(history.Turns)-1].ResponseText
+	if lastResp != "hello two" {
+		t.Fatalf("second response = %q, want %q", lastResp, "hello two")
+	}
+	if strings.Contains(lastResp, "hello one") {
+		t.Fatalf("second response unexpectedly contains injected history: %q", lastResp)
+	}
+}
+
 func TestThreadConfigOptionsGetAndSetModel(t *testing.T) {
 	root := t.TempDir()
 	streamer := newConfigOptionStreamer("gpt-5.3-codex", []agents.ConfigOptionValue{
@@ -2293,6 +2514,68 @@ func (s *configOptionStreamer) SetConfigCalls() int32 {
 
 func (s *configOptionStreamer) CloseCount() int32 {
 	return s.closeCalls.Load()
+}
+
+type sessionListStreamer struct {
+	result     agents.SessionListResult
+	lastCursor atomic.Value
+}
+
+func (s *sessionListStreamer) Name() string {
+	return "session-list-streamer"
+}
+
+func (s *sessionListStreamer) Stream(ctx context.Context, input string, onDelta func(delta string) error) (agents.StopReason, error) {
+	_ = ctx
+	_ = input
+	_ = onDelta
+	return agents.StopReasonEndTurn, nil
+}
+
+func (s *sessionListStreamer) ListSessions(ctx context.Context, req agents.SessionListRequest) (agents.SessionListResult, error) {
+	_ = ctx
+	s.lastCursor.Store(strings.TrimSpace(req.Cursor))
+	return agents.CloneSessionListResult(s.result), nil
+}
+
+type sessionBoundStreamer struct {
+	sessionID string
+}
+
+func (s *sessionBoundStreamer) Name() string {
+	return "session-bound-streamer"
+}
+
+func (s *sessionBoundStreamer) Stream(ctx context.Context, input string, onDelta func(delta string) error) (agents.StopReason, error) {
+	if err := agents.NotifySessionBound(ctx, s.sessionID); err != nil {
+		return agents.StopReasonEndTurn, err
+	}
+	if err := onDelta(input); err != nil {
+		return agents.StopReasonEndTurn, err
+	}
+	return agents.StopReasonEndTurn, nil
+}
+
+type sessionTranscriptStreamer struct {
+	result        agents.SessionTranscriptResult
+	lastSessionID atomic.Value
+}
+
+func (s *sessionTranscriptStreamer) Name() string {
+	return "session-transcript-streamer"
+}
+
+func (s *sessionTranscriptStreamer) Stream(ctx context.Context, input string, onDelta func(delta string) error) (agents.StopReason, error) {
+	_ = ctx
+	_ = input
+	_ = onDelta
+	return agents.StopReasonEndTurn, nil
+}
+
+func (s *sessionTranscriptStreamer) LoadSessionTranscript(ctx context.Context, req agents.SessionTranscriptRequest) (agents.SessionTranscriptResult, error) {
+	_ = ctx
+	s.lastSessionID.Store(strings.TrimSpace(req.SessionID))
+	return agents.CloneSessionTranscriptResult(s.result), nil
 }
 
 func createThreadHTTP(t *testing.T, baseURL, clientID, root string) string {

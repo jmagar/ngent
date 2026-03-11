@@ -20,6 +20,7 @@ import (
 
 	"github.com/beyond5959/ngent/internal/agents"
 	"github.com/beyond5959/ngent/internal/agents/acpmodel"
+	"github.com/beyond5959/ngent/internal/agents/acpsession"
 	"github.com/beyond5959/ngent/internal/agents/agentutil"
 )
 
@@ -39,6 +40,7 @@ type Client struct {
 
 var _ agents.Streamer = (*Client)(nil)
 var _ agents.ConfigOptionManager = (*Client)(nil)
+var _ agents.SessionLister = (*Client)(nil)
 
 // New constructs a Gemini CLI ACP client.
 func New(cfg Config) (*Client, error) {
@@ -95,6 +97,80 @@ func (c *Client) SetConfigOption(ctx context.Context, configID, value string) ([
 	return options, nil
 }
 
+// ListSessions queries ACP session/list for the current cwd.
+func (c *Client) ListSessions(ctx context.Context, req agents.SessionListRequest) (agents.SessionListResult, error) {
+	if c == nil {
+		return agents.SessionListResult{}, errors.New("gemini: nil client")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	cliHome, err := makeCLIHome()
+	if err != nil {
+		return agents.SessionListResult{}, fmt.Errorf("gemini: session list create CLI home: %w", err)
+	}
+	defer os.RemoveAll(cliHome)
+
+	cmd := exec.Command("gemini", "--experimental-acp")
+	cmd.Env = buildGeminiCLIEnv(cliHome)
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return agents.SessionListResult{}, fmt.Errorf("gemini: session list open stdin pipe: %w", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return agents.SessionListResult{}, fmt.Errorf("gemini: session list open stdout pipe: %w", err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return agents.SessionListResult{}, fmt.Errorf("gemini: session list open stderr pipe: %w", err)
+	}
+	if err := cmd.Start(); err != nil {
+		return agents.SessionListResult{}, fmt.Errorf("gemini: session list start process: %w", err)
+	}
+
+	errCh := make(chan error, 1)
+	go func() { _, _ = io.Copy(io.Discard, stderr) }()
+	go func() { errCh <- cmd.Wait() }()
+
+	conn := newRPCConn(stdin, stdout)
+	defer conn.Close()
+	defer terminateProcess(cmd, errCh)
+
+	initResult, err := conn.Call(ctx, "initialize", map[string]any{
+		"protocolVersion": 1,
+		"clientCapabilities": map[string]any{
+			"fs": map[string]any{
+				"readTextFile":  false,
+				"writeTextFile": false,
+			},
+		},
+	})
+	if err != nil {
+		return agents.SessionListResult{}, fmt.Errorf("gemini: session list initialize: %w", err)
+	}
+
+	caps := acpsession.ParseInitializeCapabilities(initResult)
+	if !caps.CanList || !caps.CanLoad {
+		return agents.SessionListResult{}, agents.ErrSessionListUnsupported
+	}
+
+	params := map[string]any{
+		"cwd":        geminiSessionCWD(c, req.CWD),
+		"mcpServers": []any{},
+	}
+	if cursor := strings.TrimSpace(req.Cursor); cursor != "" {
+		params["cursor"] = cursor
+	}
+	result, err := conn.Call(ctx, "session/list", params)
+	if err != nil {
+		return agents.SessionListResult{}, fmt.Errorf("gemini: session/list: %w", err)
+	}
+	return acpsession.ParseSessionListResult(result)
+}
+
 // Stream spawns gemini --experimental-acp, runs one turn, and streams deltas via onDelta.
 func (c *Client) Stream(ctx context.Context, input string, onDelta func(delta string) error) (agents.StopReason, error) {
 	if c == nil {
@@ -146,7 +222,7 @@ func (c *Client) Stream(ctx context.Context, input string, onDelta func(delta st
 	defer terminateProcess(cmd, errCh)
 
 	// 1. initialize
-	if _, err := conn.Call(ctx, "initialize", map[string]any{
+	initResult, err := conn.Call(ctx, "initialize", map[string]any{
 		"protocolVersion": 1,
 		"clientCapabilities": map[string]any{
 			"fs": map[string]any{
@@ -154,28 +230,41 @@ func (c *Client) Stream(ctx context.Context, input string, onDelta func(delta st
 				"writeTextFile": false,
 			},
 		},
-	}); err != nil {
+	})
+	if err != nil {
 		return agents.StopReasonEndTurn, fmt.Errorf("gemini: initialize: %w", err)
 	}
+	caps := acpsession.ParseInitializeCapabilities(initResult)
 
-	// 2. session/new
-	newParams := map[string]any{
-		"cwd":        c.Dir(),
-		"mcpServers": []any{},
+	// 2. session/load or session/new
+	sessionID := c.CurrentSessionID()
+	initialOptions := []agents.ConfigOption(nil)
+	if sessionID != "" {
+		if !caps.CanLoad {
+			return agents.StopReasonEndTurn, agents.ErrSessionLoadUnsupported
+		}
+		if _, err := conn.Call(ctx, "session/load", geminiSessionLoadParams(c, sessionID)); err != nil {
+			return agents.StopReasonEndTurn, fmt.Errorf("gemini: session/load: %w", err)
+		}
+	} else {
+		newResult, err := conn.Call(ctx, "session/new", geminiSessionNewParams(c, modelID))
+		if err != nil {
+			return agents.StopReasonEndTurn, fmt.Errorf("gemini: session/new: %w", err)
+		}
+		sessionID = parseSessionID(newResult)
+		if sessionID == "" {
+			return agents.StopReasonEndTurn, errors.New("gemini: session/new returned empty sessionId")
+		}
+		initialOptions = acpmodel.ExtractConfigOptions(newResult)
 	}
-	if modelID != "" {
-		newParams["model"] = modelID
-	}
-	newResult, err := conn.Call(ctx, "session/new", newParams)
-	if err != nil {
-		return agents.StopReasonEndTurn, fmt.Errorf("gemini: session/new: %w", err)
-	}
-	sessionID := parseSessionID(newResult)
-	if sessionID == "" {
-		return agents.StopReasonEndTurn, errors.New("gemini: session/new returned empty sessionId")
-	}
-	if _, err := c.applyConfigOverrides(ctx, conn, sessionID, acpmodel.ExtractConfigOptions(newResult), configOverrides); err != nil {
+	if _, err := c.applyConfigOverrides(ctx, conn, sessionID, initialOptions, configOverrides); err != nil {
 		return agents.StopReasonEndTurn, err
+	}
+	if caps.CanLoad {
+		c.SetSessionID(sessionID)
+		if err := agents.NotifySessionBound(ctx, sessionID); err != nil {
+			return agents.StopReasonEndTurn, fmt.Errorf("gemini: report session bound: %w", err)
+		}
 	}
 
 	// 3. Wire streaming: agent_message_chunk updates → onDelta.
@@ -268,6 +357,35 @@ func (c *Client) sendCancel(conn *rpcConn, sessionID string) {
 	cancelCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	conn.Notify(cancelCtx, "session/cancel", map[string]any{"sessionId": sessionID})
+}
+
+func geminiSessionCWD(c *Client, cwd string) string {
+	cwd = strings.TrimSpace(cwd)
+	if cwd != "" {
+		return cwd
+	}
+	return c.Dir()
+}
+
+func geminiSessionNewParams(c *Client, modelID string) map[string]any {
+	params := map[string]any{
+		"cwd":        c.Dir(),
+		"mcpServers": []any{},
+	}
+	modelID = strings.TrimSpace(modelID)
+	if modelID != "" {
+		params["model"] = modelID
+		params["modelId"] = modelID
+	}
+	return params
+}
+
+func geminiSessionLoadParams(c *Client, sessionID string) map[string]any {
+	return map[string]any{
+		"sessionId":  strings.TrimSpace(sessionID),
+		"cwd":        c.Dir(),
+		"mcpServers": []any{},
+	}
 }
 
 func (c *Client) runConfigSession(

@@ -1,5 +1,5 @@
 import { store } from './store.ts'
-import type { AgentInfo, ConfigOption, ModelOption, Thread, Turn } from './types.ts'
+import type { AgentInfo, ConfigOption, ModelOption, SessionInfo, SessionTranscriptMessage, Thread, Turn } from './types.ts'
 import { TurnStream } from './sse.ts'
 import type { TurnStreamCallbacks } from './sse.ts'
 
@@ -45,6 +45,13 @@ interface HistoryResponse       { turns: Turn[] }
 interface CreateThreadResponse  { threadId: string }
 interface UpdateThreadResponse  { thread: Thread }
 interface ThreadConfigOptionsResponse { threadId: string; configOptions: ConfigOption[] }
+interface ThreadSessionsResponse { threadId: string; supported: boolean; sessions: SessionInfo[]; nextCursor?: string }
+interface ThreadSessionHistoryResponse {
+  threadId: string
+  sessionId: string
+  supported: boolean
+  messages: SessionTranscriptMessage[]
+}
 interface CancelTurnResponse    { turnId: string; threadId: string; status: string }
 interface DeleteThreadResponse  { threadId: string; status: string }
 
@@ -134,6 +141,41 @@ class ApiClient {
       `/v1/threads/${encodeURIComponent(threadId)}/config-options`,
     )
     return data.configOptions
+  }
+
+  /** GET /v1/threads/{threadId}/sessions */
+  async getThreadSessions(
+    threadId: string,
+    cursor = '',
+  ): Promise<{ supported: boolean; sessions: SessionInfo[]; nextCursor: string }> {
+    const params = new URLSearchParams()
+    if (cursor.trim()) params.set('cursor', cursor.trim())
+    const suffix = params.toString() ? `?${params.toString()}` : ''
+    const data = await this.request<ThreadSessionsResponse>(
+      'GET',
+      `/v1/threads/${encodeURIComponent(threadId)}/sessions${suffix}`,
+    )
+    return {
+      supported: !!data.supported,
+      sessions: data.sessions ?? [],
+      nextCursor: data.nextCursor ?? '',
+    }
+  }
+
+  /** GET /v1/threads/{threadId}/session-history */
+  async getThreadSessionHistory(
+    threadId: string,
+    sessionId: string,
+  ): Promise<{ supported: boolean; messages: SessionTranscriptMessage[] }> {
+    const params = new URLSearchParams({ sessionId: sessionId.trim() })
+    const data = await this.request<ThreadSessionHistoryResponse>(
+      'GET',
+      `/v1/threads/${encodeURIComponent(threadId)}/session-history?${params.toString()}`,
+    )
+    return {
+      supported: !!data.supported,
+      messages: data.messages ?? [],
+    }
   }
 
   /** POST /v1/threads/{threadId}/config-options */

@@ -265,3 +265,42 @@ This checklist defines executable acceptance checks for requirements 1-16.
 - Verification commands (executed 2026-03-06):
   - `go test ./...`
   - `cd internal/webui/web && npm run build`
+
+## Requirement 22: ACP Debug Trace Logging
+
+- Operation:
+  - start server with `--debug=true`.
+  - execute an ACP-backed request path.
+  - inspect stderr logs.
+- Expected:
+  - logger runs at debug level.
+  - stderr includes `acp.message` entries for outbound and inbound ACP JSON-RPC traffic.
+  - entries include `component`, `direction`, `rpcType`, `method` when present, and sanitized `rpc` payload.
+  - sensitive fields/tokens are redacted before logging.
+- Verification commands (executed 2026-03-11):
+  - `go test ./internal/observability ./internal/agents/acpstdio -count=1`
+  - `go test ./cmd/ngent -count=1`
+  - `cd internal/webui/web && npm run build`
+  - `go test ./...`
+
+## Requirement 23: ACP Session Sidebar and Resume
+
+- Operation:
+  - create a thread/agent in the Web UI or API.
+  - query `GET /v1/threads/{threadId}/sessions` and verify the first page of ACP sessions plus `nextCursor`.
+  - request the next page through the returned cursor.
+  - start a turn on a thread without `sessionId` and observe session binding.
+  - start a follow-up turn on the now-bound thread.
+- Expected:
+  - the backend proxies ACP `session/list` through `GET /v1/threads/{threadId}/sessions`.
+  - response includes `supported`, `sessions`, and `nextCursor`.
+  - the Web UI renders a right-side session sidebar with:
+    - first-page load on active thread selection.
+    - `Show more` pagination when `nextCursor` is present.
+    - `New session` action that clears the selected `sessionId`.
+  - turn SSE emits `session_bound`, and the thread persists `agentOptions.sessionId`.
+  - once a thread is session-bound, subsequent prompt building no longer injects prior local turns into the provider prompt.
+- Verification commands (executed 2026-03-11):
+  - `go test ./internal/httpapi -run 'TestThreadSessionsListEndpoint|TestTurnSessionBoundPersistsSessionIDAndSkipsContextInjection' -count=1`
+  - `cd internal/webui/web && npm run build`
+  - `go test ./...`

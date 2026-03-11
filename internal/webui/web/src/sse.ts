@@ -21,6 +21,11 @@ export interface PlanUpdatePayload {
   entries: PlanEntry[]
 }
 
+export interface SessionBoundPayload {
+  threadId: string
+  sessionId: string
+}
+
 export interface TurnErrorPayload {
   turnId: string
   code: string
@@ -41,6 +46,7 @@ export interface TurnStreamCallbacks {
   onTurnStarted?:        (e: TurnStartedPayload) => void
   onDelta?:              (e: MessageDeltaPayload) => void
   onPlanUpdate?:         (e: PlanUpdatePayload) => void
+  onSessionBound?:       (e: SessionBoundPayload) => void
   onCompleted?:          (e: TurnCompletedPayload) => void
   onError?:              (e: TurnErrorPayload) => void
   onPermissionRequired?: (e: PermissionRequiredPayload) => void
@@ -161,6 +167,9 @@ export class TurnStream {
         break
       case 'plan_update':
         this.callbacks.onPlanUpdate?.(payload as unknown as PlanUpdatePayload)
+        break
+      case 'session_bound':
+        this.callbacks.onSessionBound?.(payload as unknown as SessionBoundPayload)
         break
       case 'turn_completed':
         this.terminated = true

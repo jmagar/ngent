@@ -11,7 +11,24 @@ This file is the source of milestone progress, validation commands, and next act
 
 - `Post-M8` ACP multi-agent readiness and maintenance.
 
-## Latest Update (2026-03-09)
+## Latest Update (2026-03-11)
+
+- `Post-M8` codex session identity and replay normalization completed:
+  - fixed fresh Codex `New session` persistence so ngent no longer stores provisional runtime ids like `session-1` as the thread session binding when a durable `_meta.threadId` is not yet available.
+  - deferred initial `session_bound` persistence/emission for fresh Codex sessions until a stable session id can be resolved after the first prompt, then updated in-memory and persisted thread `agentOptions.sessionId` with the durable id.
+  - normalized Codex transcript replay by filtering bootstrap user messages injected by the desktop wrapper (`AGENTS.md` / `environment_context`) and extracting the actual user request from known wrapper formats:
+    - `[Conversation Summary] ... [Current User Input]`
+    - `# Context from my IDE setup: ... ## My request for Codex:`
+  - verified with real local Codex and Playwright against `http://127.0.0.1:8687/`:
+    - `New session` now produces distinct stable Codex session ids and no longer mixes first-session messages into the second-session chat.
+    - switching between the two replayed sessions in the Web UI now shows only the expected user/assistant pairs.
+    - direct `session-history` API responses for the repro sessions now return cleaned transcript messages.
+  - validation:
+    - pass: `go test ./internal/agents/codex -run 'Test(ParseSessionTranscriptMessage|CodexShouldDeferInitialSessionBinding|NormalizeCodexSessionListResultUsesStableThreadID|CodexSessionMatchesIDAcceptsStableAndRawIDs|CodexStableSessionIDFallsBackToRawSessionID)$' -count=1`
+    - pass: `cd internal/webui/web && npm run build`
+    - pass: `go test ./...`
+
+## Previous Update (2026-03-09)
 
 - Kimi CLI ACP integration completed:
   - implemented `internal/agents/kimi` with one-turn ACP stdio lifecycle and fail-closed permission handling.
@@ -574,3 +591,33 @@ This file is the source of milestone progress, validation commands, and next act
 - 2026-03-09: unified ACP message-chunk constant usage across stdio providers by removing per-provider `updateTypeMessageChunk` definitions and reusing `agents.ACPUpdateTypeMessageChunk`.
 - 2026-03-09: hid the Web UI Reasoning switch when the active agent exposes fewer than two reasoning choices, so agents without switchable reasoning no longer show a dead control.
 - 2026-03-09: switched Kimi model/reasoning catalog queries to local `config.toml` when available, so startup catalog refresh and thread config/model operations no longer create empty Kimi sessions; real prompt turns still use ACP.
+- 2026-03-11: added opt-in `--debug` startup flag; when enabled, stderr now emits sanitized `acp.message` traces for ACP stdio and embedded-runtime request/response traffic, including session prompts, updates, and permission flows.
+- 2026-03-11: added ACP session browsing/resume support across built-in agents:
+  - introduced shared agent session abstractions for `session/list`, bound-session reporting, and initialize capability parsing.
+  - built-in providers now:
+    - list sessions through ACP `session/list` when supported.
+    - load persisted `agentOptions.sessionId` through ACP `session/load` before prompting.
+    - report the effective session id back to HTTP turns so the server can persist it.
+  - added `GET /v1/threads/{threadId}/sessions` with cursor passthrough and graceful `supported=false` fallback for agents without ACP session-history support.
+  - turn SSE now emits `session_bound`, and the server persists the thread session id without closing the active provider.
+  - once a thread is bound to an ACP session, prompt building skips local recent-turn injection to avoid duplicating already-loaded ACP context.
+  - Web UI now renders a right-side session sidebar with first-page load, `Show more`, active-session highlighting, and `New session` reset.
+  - executed validation:
+    - pass: `cd internal/webui/web && npm run build`
+    - pass: `go test ./internal/httpapi -run 'TestThreadSessionsListEndpoint|TestTurnSessionBoundPersistsSessionIDAndSkipsContextInjection' -count=1`
+    - pass: `go test ./...`
+
+- 2026-03-11: fixed Web UI session playback when selecting an existing ACP session from the right sidebar.
+  - the active chat view now treats `(threadId, sessionId)` as its render scope instead of refreshing only on `threadId` changes.
+  - `loadHistory()` now filters locally persisted turns by each turn's `session_bound` event so the center chat panel replays the selected session's ngent-recorded turns instead of leaving the previous session on screen.
+  - session changes reported mid-stream by `session_bound` defer the full chat refresh until the active turn completes, so the live streaming bubble is not destroyed.
+  - executed validation:
+    - pass: `cd internal/webui/web && npm run build`
+    - pass: `go test ./...`
+
+- 2026-03-11: fixed Web UI history replay for legacy session threads whose `/history` data lacks per-turn `session_bound` events.
+  - session-scoped history filtering now falls back to showing all turns when a thread has no annotated session markers at all, instead of rendering an empty chat pane despite non-empty `/history`.
+  - when a thread has exactly one annotated session, the selected session view also keeps older unannotated turns so pre-annotation history is still visible for that same session.
+  - executed validation:
+    - pass: `cd internal/webui/web && npm run build`
+    - pass: `go test ./...`

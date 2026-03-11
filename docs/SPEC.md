@@ -106,6 +106,7 @@ See `docs/API.md` for endpoint and schema contracts.
   - cwd must be absolute.
 - thread option updates are rejected while a turn is active on the same thread.
 - logs are JSON on stderr and redact sensitive data.
+- `--debug=true` raises log verbosity to debug level and emits sanitized ACP JSON-RPC request/response traces on stderr.
 - HTTP payloads contain protocol data only.
 
 ## 10. Error Contract
@@ -373,3 +374,59 @@ and upstream ACP schema:
 - Limitation:
   - this is a compatibility fallback, not full interactive tool-user-input UX.
   - multi-question/multi-select semantics and arbitrary free-text answers are not yet exposed through hub APIs/UI.
+
+## 15. ACP Session Sidebar and Resume (2026-03-11)
+
+### 15.1 Thread Metadata
+
+- `threads.agent_options_json` now may contain:
+  - `modelId`
+  - `configOverrides`
+  - `sessionId`
+- `sessionId` is optional and represents the selected provider-owned ACP session that the thread should resume.
+
+### 15.2 Backend API
+
+- New endpoint: `GET /v1/threads/{threadId}/sessions`
+  - ownership/tenancy matches existing thread endpoints.
+  - query string:
+    - `cursor` (optional): forwarded to ACP `session/list`.
+  - response:
+    - `threadId`
+    - `supported`
+    - `sessions`
+    - `nextCursor`
+- Session selection remains a normal thread metadata update:
+  - `PATCH /v1/threads/{threadId}` with `agentOptions.sessionId="<existing>"` binds an existing ACP session.
+  - `PATCH /v1/threads/{threadId}` with `agentOptions.sessionId` omitted/empty clears the binding and means "create a new session on next turn".
+
+### 15.3 Provider Behavior
+
+- Built-in providers parse ACP initialize capabilities and distinguish:
+  - `session/list` availability for sidebar discovery.
+  - `session/load` availability for actual session resume.
+- Turn setup:
+  - if thread `sessionId` is present, provider calls ACP `session/load`.
+  - otherwise provider calls ACP `session/new`.
+  - provider reports the effective session id back through a thread-scoped callback.
+- HTTP turn handling persists the bound session id back into `threads.agent_options_json` and emits SSE `session_bound`.
+
+### 15.4 Prompt Construction
+
+- For threads without `sessionId`, prompt construction remains unchanged:
+  - inject rolling summary + recent visible turns + current user input.
+- For threads with `sessionId`, prompt construction returns only the current user input.
+  - rationale: ACP `session/load` already restored the provider's own transcript, so reinjecting hub-local turns would duplicate context.
+
+### 15.5 Web UI
+
+- Layout:
+  - left sidebar: thread/agent list.
+  - center: chat.
+  - right sidebar: session list for the active thread.
+- Session sidebar behavior:
+  - loads the first page automatically when a thread becomes active.
+  - shows `Show more` when `nextCursor` is present.
+  - highlights the currently selected `sessionId`.
+  - offers `New session` to clear `sessionId`.
+  - refreshes after turns complete so newly created/bound sessions appear in the list.

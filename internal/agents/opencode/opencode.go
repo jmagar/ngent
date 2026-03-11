@@ -13,6 +13,7 @@ import (
 
 	"github.com/beyond5959/ngent/internal/agents"
 	"github.com/beyond5959/ngent/internal/agents/acpmodel"
+	"github.com/beyond5959/ngent/internal/agents/acpsession"
 	"github.com/beyond5959/ngent/internal/agents/acpstdio"
 	"github.com/beyond5959/ngent/internal/agents/agentutil"
 )
@@ -31,6 +32,7 @@ type Client struct {
 
 var _ agents.Streamer = (*Client)(nil)
 var _ agents.ConfigOptionManager = (*Client)(nil)
+var _ agents.SessionLister = (*Client)(nil)
 
 // New constructs an OpenCode ACP client.
 func New(cfg Config) (*Client, error) {
@@ -87,6 +89,72 @@ func (c *Client) SetConfigOption(ctx context.Context, configID, value string) ([
 	return options, nil
 }
 
+// ListSessions queries ACP session/list for the current cwd.
+func (c *Client) ListSessions(ctx context.Context, req agents.SessionListRequest) (agents.SessionListResult, error) {
+	if c == nil {
+		return agents.SessionListResult{}, errors.New("opencode: nil client")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	cmd := exec.Command("opencode", "acp", "--cwd", c.Dir())
+	cmd.Env = os.Environ()
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return agents.SessionListResult{}, fmt.Errorf("opencode: session list open stdin pipe: %w", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return agents.SessionListResult{}, fmt.Errorf("opencode: session list open stdout pipe: %w", err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return agents.SessionListResult{}, fmt.Errorf("opencode: session list open stderr pipe: %w", err)
+	}
+	if err := cmd.Start(); err != nil {
+		return agents.SessionListResult{}, fmt.Errorf("opencode: session list start process: %w", err)
+	}
+
+	errCh := make(chan error, 1)
+	go func() { _, _ = io.Copy(io.Discard, stderr) }()
+	go func() { errCh <- cmd.Wait() }()
+
+	conn := acpstdio.NewConn(stdin, stdout, "opencode")
+	defer conn.Close()
+	defer acpstdio.TerminateProcess(cmd, errCh, 2*time.Second)
+
+	initResult, err := conn.Call(ctx, "initialize", map[string]any{
+		"clientInfo": map[string]any{
+			"name":    "ngent",
+			"version": "0.1.0",
+		},
+		"protocolVersion": 1,
+	})
+	if err != nil {
+		return agents.SessionListResult{}, fmt.Errorf("opencode: session list initialize: %w", err)
+	}
+
+	caps := acpsession.ParseInitializeCapabilities(initResult)
+	if !caps.CanList || !caps.CanLoad {
+		return agents.SessionListResult{}, agents.ErrSessionListUnsupported
+	}
+
+	params := map[string]any{
+		"cwd":        opencodeSessionCWD(c, req.CWD),
+		"mcpServers": []any{},
+	}
+	if cursor := strings.TrimSpace(req.Cursor); cursor != "" {
+		params["cursor"] = cursor
+	}
+	result, err := conn.Call(ctx, "session/list", params)
+	if err != nil {
+		return agents.SessionListResult{}, fmt.Errorf("opencode: session/list: %w", err)
+	}
+	return acpsession.ParseSessionListResult(result)
+}
+
 // Stream spawns opencode acp, runs one turn, and streams deltas via onDelta.
 func (c *Client) Stream(ctx context.Context, input string, onDelta func(delta string) error) (agents.StopReason, error) {
 	if c == nil {
@@ -129,30 +197,47 @@ func (c *Client) Stream(ctx context.Context, input string, onDelta func(delta st
 	defer acpstdio.TerminateProcess(cmd, errCh, 2*time.Second)
 
 	// 1. initialize — protocolVersion must be an integer.
-	if _, err := conn.Call(ctx, "initialize", map[string]any{
+	initResult, err := conn.Call(ctx, "initialize", map[string]any{
 		"clientInfo": map[string]any{
 			"name":    "ngent",
 			"version": "0.1.0",
 		},
 		"protocolVersion": 1,
-	}); err != nil {
-		return agents.StopReasonEndTurn, fmt.Errorf("opencode: initialize: %w", err)
-	}
-
-	// 2. session/new — server assigns sessionId; mcpServers is required.
-	newResult, err := conn.Call(ctx, "session/new", map[string]any{
-		"cwd":        c.Dir(),
-		"mcpServers": []any{},
 	})
 	if err != nil {
-		return agents.StopReasonEndTurn, fmt.Errorf("opencode: session/new: %w", err)
+		return agents.StopReasonEndTurn, fmt.Errorf("opencode: initialize: %w", err)
 	}
-	sessionID := acpstdio.ParseSessionID(newResult)
-	if sessionID == "" {
-		return agents.StopReasonEndTurn, errors.New("opencode: session/new returned empty sessionId")
+	caps := acpsession.ParseInitializeCapabilities(initResult)
+
+	// 2. session/load or session/new.
+	sessionID := c.CurrentSessionID()
+	initialOptions := []agents.ConfigOption(nil)
+	if sessionID != "" {
+		if !caps.CanLoad {
+			return agents.StopReasonEndTurn, agents.ErrSessionLoadUnsupported
+		}
+		if _, err := conn.Call(ctx, "session/load", opencodeSessionLoadParams(c, sessionID)); err != nil {
+			return agents.StopReasonEndTurn, fmt.Errorf("opencode: session/load: %w", err)
+		}
+	} else {
+		newResult, err := conn.Call(ctx, "session/new", opencodeSessionNewParams(c))
+		if err != nil {
+			return agents.StopReasonEndTurn, fmt.Errorf("opencode: session/new: %w", err)
+		}
+		sessionID = acpstdio.ParseSessionID(newResult)
+		if sessionID == "" {
+			return agents.StopReasonEndTurn, errors.New("opencode: session/new returned empty sessionId")
+		}
+		initialOptions = acpmodel.ExtractConfigOptions(newResult)
 	}
-	if _, err := c.applyConfigOverrides(ctx, conn, sessionID, acpmodel.ExtractConfigOptions(newResult), configOverrides); err != nil {
+	if _, err := c.applyConfigOverrides(ctx, conn, sessionID, initialOptions, configOverrides); err != nil {
 		return agents.StopReasonEndTurn, err
+	}
+	if caps.CanLoad {
+		c.SetSessionID(sessionID)
+		if err := agents.NotifySessionBound(ctx, sessionID); err != nil {
+			return agents.StopReasonEndTurn, fmt.Errorf("opencode: report session bound: %w", err)
+		}
 	}
 
 	// 3. Wire streaming: agent_message_chunk -> onDelta.
@@ -208,6 +293,29 @@ func (c *Client) sendCancel(conn *acpstdio.Conn, sessionID string) {
 	cancelCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	_, _ = conn.Call(cancelCtx, "session/cancel", map[string]any{"sessionId": sessionID})
+}
+
+func opencodeSessionCWD(c *Client, cwd string) string {
+	cwd = strings.TrimSpace(cwd)
+	if cwd != "" {
+		return cwd
+	}
+	return c.Dir()
+}
+
+func opencodeSessionNewParams(c *Client) map[string]any {
+	return map[string]any{
+		"cwd":        c.Dir(),
+		"mcpServers": []any{},
+	}
+}
+
+func opencodeSessionLoadParams(c *Client, sessionID string) map[string]any {
+	return map[string]any{
+		"sessionId":  strings.TrimSpace(sessionID),
+		"cwd":        c.Dir(),
+		"mcpServers": []any{},
+	}
 }
 
 func (c *Client) runConfigSession(

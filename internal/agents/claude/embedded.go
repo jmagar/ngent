@@ -17,7 +17,9 @@ import (
 	"github.com/beyond5959/acp-adapter/pkg/claudeacp"
 	"github.com/beyond5959/ngent/internal/agents"
 	"github.com/beyond5959/ngent/internal/agents/acpmodel"
+	"github.com/beyond5959/ngent/internal/agents/acpsession"
 	"github.com/beyond5959/ngent/internal/agents/agentutil"
+	"github.com/beyond5959/ngent/internal/observability"
 )
 
 const (
@@ -41,6 +43,7 @@ const (
 type Config struct {
 	Dir             string
 	ModelID         string
+	SessionID       string
 	ConfigOverrides map[string]string
 	Name            string
 	RuntimeConfig   claudeacp.RuntimeConfig
@@ -65,13 +68,15 @@ type Client struct {
 	runtime   *claudeacp.EmbeddedRuntime
 	sessionID string
 
-	configOptions []agents.ConfigOption
+	configOptions  []agents.ConfigOption
+	canLoadSession bool
 
 	requestSeq uint64
 }
 
 var _ agents.Streamer = (*Client)(nil)
 var _ agents.ConfigOptionManager = (*Client)(nil)
+var _ agents.SessionLister = (*Client)(nil)
 var _ io.Closer = (*Client)(nil)
 
 // DefaultRuntimeConfig returns the default embedded Claude runtime configuration.
@@ -129,6 +134,7 @@ func New(cfg Config) (*Client, error) {
 	state, err := agentutil.NewState("claude", agentutil.Config{
 		Dir:             cfg.Dir,
 		ModelID:         cfg.ModelID,
+		SessionID:       cfg.SessionID,
 		ConfigOverrides: cfg.ConfigOverrides,
 	})
 	if err != nil {
@@ -167,6 +173,43 @@ func (c *Client) ConfigOptions(ctx context.Context) ([]agents.ConfigOption, erro
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return acpmodel.CloneConfigOptions(c.configOptions), nil
+}
+
+// ListSessions queries ACP session/list for the current cwd.
+func (c *Client) ListSessions(ctx context.Context, req agents.SessionListRequest) (agents.SessionListResult, error) {
+	if c == nil {
+		return agents.SessionListResult{}, errors.New("claude: nil client")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	startCtx, cancel := context.WithTimeout(ctx, c.startTimeout)
+	defer cancel()
+
+	runtime, caps, err := c.startRuntime(startCtx)
+	if err != nil {
+		return agents.SessionListResult{}, err
+	}
+	defer runtime.Close()
+
+	if !caps.CanList || !caps.CanLoad {
+		return agents.SessionListResult{}, agents.ErrSessionListUnsupported
+	}
+
+	params := map[string]any{
+		"cwd":        claudeSessionCWD(c, req.CWD),
+		"mcpServers": []any{},
+	}
+	if cursor := strings.TrimSpace(req.Cursor); cursor != "" {
+		params["cursor"] = cursor
+	}
+
+	result, err := c.clientRequest(startCtx, runtime, "session/list", params)
+	if err != nil {
+		return agents.SessionListResult{}, fmt.Errorf("claude: session/list: %w", err)
+	}
+	return acpsession.ParseSessionListResult(result.Result)
 }
 
 // SetConfigOption applies one ACP session config option and returns latest options.
@@ -226,6 +269,7 @@ func (c *Client) Close() error {
 	c.runtime = nil
 	c.sessionID = ""
 	c.configOptions = nil
+	c.canLoadSession = false
 	c.mu.Unlock()
 
 	if runtime != nil {
@@ -254,6 +298,11 @@ func (c *Client) Stream(ctx context.Context, input string, onDelta func(delta st
 				return agents.StopReasonCancelled, nil
 			}
 			return agents.StopReasonEndTurn, fmt.Errorf("claude: initialize runtime: %w", err)
+		}
+		if c.supportsLoadSession() {
+			if err := agents.NotifySessionBound(ctx, sessionID); err != nil {
+				return agents.StopReasonEndTurn, fmt.Errorf("claude: report session bound: %w", err)
+			}
 		}
 
 		stopReason, streamErr := c.streamOnce(ctx, runtime, sessionID, input, onDelta)
@@ -379,6 +428,8 @@ func (c *Client) handleUpdate(
 	msg claudeacp.RPCMessage,
 	onDelta func(delta string) error,
 ) error {
+	observability.LogACPMessage(c.Name(), "inbound", msg)
+
 	if msg.Method == methodSessionUpdate {
 		update, err := agents.ParseACPUpdate(msg.Params)
 		if err != nil {
@@ -461,6 +512,13 @@ func (c *Client) handlePermissionRequest(
 	); err != nil {
 		return fmt.Errorf("claude: respond permission outcome: %w", err)
 	}
+	observability.LogACPMessage(c.Name(), "outbound", map[string]any{
+		"jsonrpc": jsonRPCVersion,
+		"id":      *msg.ID,
+		"result": map[string]any{
+			"outcome": string(outcome),
+		},
+	})
 	return nil
 }
 
@@ -479,6 +537,12 @@ func (c *Client) currentSessionID() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.sessionID
+}
+
+func (c *Client) supportsLoadSession() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.canLoadSession
 }
 
 func (c *Client) ensureInitialized(ctx context.Context) (*claudeacp.EmbeddedRuntime, string, error) {
@@ -501,41 +565,47 @@ func (c *Client) ensureInitialized(ctx context.Context) (*claudeacp.EmbeddedRunt
 	startCtx, cancel := context.WithTimeout(ctx, c.startTimeout)
 	defer cancel()
 
-	runtime := claudeacp.NewEmbeddedRuntime(c.runtimeConfig)
-	// Runtime lifecycle is controlled by client Close/reset, not startup timeout context.
-	if err := runtime.Start(context.Background()); err != nil {
-		_ = runtime.Close()
-		return nil, "", err
-	}
-
-	if _, err := c.clientRequest(startCtx, runtime, methodInitialize, map[string]any{
-		"client": map[string]any{
-			"name": "ngent",
-		},
-	}); err != nil {
-		_ = runtime.Close()
-		return nil, "", err
-	}
-
-	newParams := map[string]any{
-		"cwd": c.Dir(),
-	}
-	if modelID := c.CurrentModelID(); modelID != "" {
-		newParams["model"] = modelID
-	}
-	sessionResp, err := c.clientRequest(startCtx, runtime, methodSessionNew, newParams)
+	runtime, caps, err := c.startRuntime(startCtx)
 	if err != nil {
-		_ = runtime.Close()
 		return nil, "", err
 	}
 
-	sessionID, err := parseSessionID(sessionResp.Result)
-	if err != nil {
-		_ = runtime.Close()
-		return nil, "", err
+	sessionID := c.CurrentSessionID()
+	configOptions := []agents.ConfigOption(nil)
+	if sessionID != "" {
+		if !caps.CanLoad {
+			_ = runtime.Close()
+			return nil, "", agents.ErrSessionLoadUnsupported
+		}
+		if _, err := c.clientRequest(startCtx, runtime, "session/load", map[string]any{
+			"sessionId":  sessionID,
+			"cwd":        c.Dir(),
+			"mcpServers": []any{},
+		}); err != nil {
+			_ = runtime.Close()
+			return nil, "", fmt.Errorf("claude: session/load failed: %w", err)
+		}
+	} else {
+		newParams := map[string]any{
+			"cwd": c.Dir(),
+		}
+		if modelID := c.CurrentModelID(); modelID != "" {
+			newParams["model"] = modelID
+		}
+		sessionResp, err := c.clientRequest(startCtx, runtime, methodSessionNew, newParams)
+		if err != nil {
+			_ = runtime.Close()
+			return nil, "", err
+		}
+
+		sessionID, err = parseSessionID(sessionResp.Result)
+		if err != nil {
+			_ = runtime.Close()
+			return nil, "", err
+		}
+		configOptions = acpmodel.ExtractConfigOptions(sessionResp.Result)
 	}
-	configOptions := acpmodel.ExtractConfigOptions(sessionResp.Result)
-	configOptions, err = c.applyConfigOverrides(startCtx, runtime, sessionID, configOptions)
+	configOptions, err = c.applySessionSelections(startCtx, runtime, sessionID, configOptions)
 	if err != nil {
 		_ = runtime.Close()
 		return nil, "", err
@@ -555,18 +625,36 @@ func (c *Client) ensureInitialized(ctx context.Context) (*claudeacp.EmbeddedRunt
 	c.runtime = runtime
 	c.sessionID = sessionID
 	c.configOptions = acpmodel.CloneConfigOptions(configOptions)
+	c.canLoadSession = caps.CanLoad
 	return c.runtime, c.sessionID, nil
 }
 
-func (c *Client) applyConfigOverrides(
+func (c *Client) applySessionSelections(
 	ctx context.Context,
 	runtime *claudeacp.EmbeddedRuntime,
 	sessionID string,
 	options []agents.ConfigOption,
 ) ([]agents.ConfigOption, error) {
+	current := options
+
+	if modelID := strings.TrimSpace(c.CurrentModelID()); modelID != "" &&
+		strings.TrimSpace(acpmodel.CurrentValueForConfig(current, "model")) != modelID {
+		resp, err := c.clientRequest(ctx, runtime, methodSessionSetConfigOption, map[string]any{
+			"sessionId": sessionID,
+			"configId":  "model",
+			"value":     modelID,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("claude: session/set_config_option(model) failed: %w", err)
+		}
+		if updated := acpmodel.ExtractConfigOptions(resp.Result); len(updated) > 0 {
+			current = updated
+		}
+	}
+
 	overrides := c.CurrentConfigOverrides()
 	if len(overrides) == 0 {
-		return options, nil
+		return current, nil
 	}
 
 	configIDs := make([]string, 0, len(overrides))
@@ -575,7 +663,6 @@ func (c *Client) applyConfigOverrides(
 	}
 	sort.Strings(configIDs)
 
-	current := options
 	for _, configID := range configIDs {
 		value := strings.TrimSpace(overrides[configID])
 		if value == "" {
@@ -594,6 +681,35 @@ func (c *Client) applyConfigOverrides(
 		}
 	}
 	return current, nil
+}
+
+func (c *Client) startRuntime(
+	ctx context.Context,
+) (*claudeacp.EmbeddedRuntime, acpsession.Capabilities, error) {
+	runtime := claudeacp.NewEmbeddedRuntime(c.runtimeConfig)
+	if err := runtime.Start(context.Background()); err != nil {
+		_ = runtime.Close()
+		return nil, acpsession.Capabilities{}, err
+	}
+
+	initResp, err := c.clientRequest(ctx, runtime, methodInitialize, map[string]any{
+		"client": map[string]any{
+			"name": "ngent",
+		},
+	})
+	if err != nil {
+		_ = runtime.Close()
+		return nil, acpsession.Capabilities{}, err
+	}
+	return runtime, acpsession.ParseInitializeCapabilities(initResp.Result), nil
+}
+
+func claudeSessionCWD(c *Client, cwd string) string {
+	cwd = strings.TrimSpace(cwd)
+	if cwd != "" {
+		return cwd
+	}
+	return c.Dir()
 }
 
 func (c *Client) clientRequest(
@@ -623,11 +739,13 @@ func (c *Client) clientRequest(
 		}
 		msg.Params = paramsJSON
 	}
+	observability.LogACPMessage(c.Name(), "outbound", msg)
 
 	response, err := runtime.ClientRequest(ctx, msg)
 	if err != nil {
 		return claudeacp.RPCMessage{}, err
 	}
+	observability.LogACPMessage(c.Name(), "inbound", response)
 	if response.Error != nil {
 		return claudeacp.RPCMessage{}, fmt.Errorf(
 			"claude: %s rpc error code=%d message=%s",
