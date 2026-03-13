@@ -91,3 +91,63 @@ func TestParseACPUpdatePlanKeepsEmptyReplacement(t *testing.T) {
 		t.Fatalf("update.PlanEntries = %#v, want nil empty replacement", update.PlanEntries)
 	}
 }
+
+func TestParseACPUpdateUserMessageChunk(t *testing.T) {
+	t.Parallel()
+
+	raw := json.RawMessage(`{
+		"timestamp": "2026-03-12T08:00:00Z",
+		"_meta": {"messageId": "msg-user-1"},
+		"update": {
+			"sessionUpdate": "user_message_chunk",
+			"content": {
+				"type": "text",
+				"text": "hello from user"
+			}
+		}
+	}`)
+
+	update, err := ParseACPUpdate(raw)
+	if err != nil {
+		t.Fatalf("ParseACPUpdate() error = %v", err)
+	}
+	if update.Type != ACPUpdateTypeUserMessageChunk {
+		t.Fatalf("update.Type = %q, want %q", update.Type, ACPUpdateTypeUserMessageChunk)
+	}
+	if update.Role != "user" {
+		t.Fatalf("update.Role = %q, want %q", update.Role, "user")
+	}
+	if update.Delta != "hello from user" {
+		t.Fatalf("update.Delta = %q, want %q", update.Delta, "hello from user")
+	}
+	if update.MessageID != "msg-user-1" {
+		t.Fatalf("update.MessageID = %q, want %q", update.MessageID, "msg-user-1")
+	}
+	if update.Timestamp != "2026-03-12T08:00:00Z" {
+		t.Fatalf("update.Timestamp = %q, want %q", update.Timestamp, "2026-03-12T08:00:00Z")
+	}
+}
+
+func TestParseACPUpdateIgnoresNonTextToolCallPayload(t *testing.T) {
+	t.Parallel()
+
+	raw := json.RawMessage(`{
+		"update": {
+			"sessionUpdate": "tool_call_update",
+			"content": [
+				{"type": "content", "content": {"type": "text", "text": "tool output"}}
+			]
+		}
+	}`)
+
+	update, err := ParseACPUpdate(raw)
+	if err != nil {
+		t.Fatalf("ParseACPUpdate() error = %v", err)
+	}
+	if update.Type != "tool_call_update" {
+		t.Fatalf("update.Type = %q, want %q", update.Type, "tool_call_update")
+	}
+	if update.Delta != "" {
+		t.Fatalf("update.Delta = %q, want empty", update.Delta)
+	}
+}

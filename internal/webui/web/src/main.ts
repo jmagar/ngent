@@ -18,7 +18,7 @@ import type {
   SessionTranscriptMessage,
 } from './types.ts'
 import type { TurnStream, PermissionRequiredPayload, PlanUpdatePayload, SessionBoundPayload } from './sse.ts'
-import { escHtml, formatRelativeTime, formatTimestamp, generateUUID } from './utils.ts'
+import { copyText, escHtml, formatRelativeTime, formatTimestamp, generateUUID } from './utils.ts'
 
 // ── Theme ─────────────────────────────────────────────────────────────────
 
@@ -51,6 +51,22 @@ const iconCheck = `<svg width="14" height="14" viewBox="0 0 16 16" fill="none" a
   <path d="M3.5 8.5l3 3 6-7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>`
 
+const iconCopy = `<svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+  <rect x="6" y="3" width="7" height="10" rx="1.5" stroke="currentColor" stroke-width="1.4"/>
+  <path d="M4.5 11H4A1.5 1.5 0 0 1 2.5 9.5V4A1.5 1.5 0 0 1 4 2.5h5.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+</svg>`
+
+const iconInfo = `<svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+  <circle cx="8" cy="8" r="6.25" stroke="currentColor" stroke-width="1.5"/>
+  <path d="M8 7v3.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+  <circle cx="8" cy="4.5" r="0.8" fill="currentColor"/>
+</svg>`
+
+const iconRefresh = `<svg width="15" height="15" viewBox="0 0 15 15" fill="none" aria-hidden="true">
+  <path d="M12.5 7.5a5 5 0 1 1-1.47-3.53" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+  <path d="M12.5 2.5v3h-3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>`
+
 const codexIconURL = '/codex-icon.png'
 const geminiIconURL = '/gemini-icon.png'
 const claudeIconURL = '/claude-icon.png'
@@ -76,6 +92,7 @@ interface SessionPanelState {
 
 const sessionPanelStateByThread = new Map<string, SessionPanelState>()
 const sessionPanelRequestSeqByThread = new Map<string, number>()
+const sessionPanelScrollTopByThread = new Map<string, number>()
 let sessionPanelRequestSeq = 0
 
 function cloneConfigOptions(options: ConfigOption[]): ConfigOption[] {
@@ -231,9 +248,13 @@ function threadSessionID(thread: Thread | null | undefined): string {
   return typeof value === 'string' ? value.trim() : ''
 }
 
+function threadSessionScopeKey(threadId: string, sessionID = ''): string {
+  return `${threadId}::${sessionID.trim()}`
+}
+
 function threadChatScopeKey(thread: Thread | null | undefined): string {
   if (!thread) return ''
-  return `${thread.threadId}::${threadSessionID(thread)}`
+  return threadSessionScopeKey(thread.threadId, threadSessionID(thread))
 }
 
 function buildThreadAgentOptionsWithSession(
@@ -278,26 +299,27 @@ async function loadThreadConfigOptions(threadId: string): Promise<ConfigOption[]
   return task
 }
 
-// ── Active stream state (DOM-managed, per thread) ──────────────────────────
+// ── Active stream state (DOM-managed, per chat scope) ──────────────────────
 
 /**
  * Non-null while a streaming bubble is live in the DOM.
  * We use this to prevent updateMessageList() from wiping the in-progress bubble.
  */
 let activeStreamMsgId: string | null = null
-const streamsByThread = new Map<string, TurnStream>()
-const streamBufferByThread = new Map<string, string>()
-const streamPlanByThread = new Map<string, PlanEntry[]>()
-const streamStartedAtByThread = new Map<string, string>()
+let activeStreamScopeKey = ''
+const streamsByScope = new Map<string, TurnStream>()
+const streamBufferByScope = new Map<string, string>()
+const streamPlanByScope = new Map<string, PlanEntry[]>()
+const streamStartedAtByScope = new Map<string, string>()
 type PendingPermission = PermissionRequiredPayload & { deadlineMs: number }
-const pendingPermissionsByThread = new Map<string, Map<string, PendingPermission>>()
+const pendingPermissionsByScope = new Map<string, Map<string, PendingPermission>>()
 
 /** Last threadId that triggered a full chat-area re-render. */
 let lastRenderThreadId: string | null = null
 /** Last (threadId, sessionId) scope rendered into the chat pane. */
 let lastRenderChatScopeKey = ''
-/** Last sessionId whose filtered history was loaded for each thread. */
-const loadedHistorySessionIDByThread = new Map<string, string>()
+/** Chat scope keys whose filtered history was loaded. */
+const loadedHistoryScopeKeys = new Set<string>()
 let openThreadActionMenuId: string | null = null
 let renamingThreadId: string | null = null
 let renamingThreadDraft = ''
@@ -311,9 +333,9 @@ function isNearBottom(el: HTMLElement): boolean {
 
 // ── Message store helpers ─────────────────────────────────────────────────
 
-function addMessageToStore(threadId: string, msg: Message): void {
+function addMessageToStore(scopeKey: string, msg: Message): void {
   const { messages } = store.get()
-  store.set({ messages: { ...messages, [threadId]: [...(messages[threadId] ?? []), msg] } })
+  store.set({ messages: { ...messages, [scopeKey]: [...(messages[scopeKey] ?? []), msg] } })
 }
 
 function omitThreadCompletionBadge(
@@ -562,24 +584,45 @@ function renderThreadActionLayer(): void {
   })
 }
 
-function getThreadStreamState(threadId: string | null): StreamState | null {
-  if (!threadId) return null
-  return store.get().streamStates[threadId] ?? null
+function activeChatScopeKey(): string {
+  const { activeThreadId, threads } = store.get()
+  if (!activeThreadId) return ''
+  const thread = threads.find(item => item.threadId === activeThreadId)
+  return threadChatScopeKey(thread)
 }
 
-function setThreadStreamState(threadId: string, next: StreamState | null): void {
+function getScopeStreamState(scopeKey: string): StreamState | null {
+  if (!scopeKey) return null
+  return store.get().streamStates[scopeKey] ?? null
+}
+
+function getActiveChatStreamState(): StreamState | null {
+  return getScopeStreamState(activeChatScopeKey())
+}
+
+function hasMountedActiveStream(scopeKey: string): boolean {
+  return !!scopeKey && activeStreamMsgId !== null && activeStreamScopeKey === scopeKey
+}
+
+function hasThreadStream(threadId: string | null): boolean {
+  if (!threadId) return false
+  return Object.values(store.get().streamStates).some(streamState => streamState.threadId === threadId)
+}
+
+function setScopeStreamState(scopeKey: string, next: StreamState | null): void {
   const { streamStates } = store.get()
   const updated = { ...streamStates }
   if (next) {
-    updated[threadId] = next
+    updated[scopeKey] = next
   } else {
-    delete updated[threadId]
+    delete updated[scopeKey]
   }
   store.set({ streamStates: updated })
 }
 
 function appendOrRestoreStreamingBubble(thread: Thread): void {
-  const streamState = getThreadStreamState(thread.threadId)
+  const scopeKey = threadChatScopeKey(thread)
+  const streamState = getScopeStreamState(scopeKey)
   if (!streamState) return
 
   const listEl = document.getElementById('message-list')
@@ -588,17 +631,18 @@ function appendOrRestoreStreamingBubble(thread: Thread): void {
   const bubbleID = `bubble-${streamState.messageId}`
   if (document.getElementById(bubbleID)) {
     activeStreamMsgId = streamState.messageId
+    activeStreamScopeKey = scopeKey
     return
   }
 
   listEl.querySelector('.empty-state')?.remove()
   listEl.querySelector('.message-list-loading')?.remove()
-  const startedAt = streamStartedAtByThread.get(thread.threadId) ?? new Date().toISOString()
+  const startedAt = streamStartedAtByScope.get(scopeKey) ?? new Date().toISOString()
   const avatar = renderAgentAvatar(thread.agent ?? '', 'message')
   const div = document.createElement('div')
   div.className = 'message message--agent'
   div.dataset.msgId = streamState.messageId
-  const livePlanEntries = streamPlanByThread.get(thread.threadId)
+  const livePlanEntries = streamPlanByScope.get(scopeKey)
   div.innerHTML = `
     <div class="message-avatar">${avatar}</div>
     <div class="message-group">
@@ -610,8 +654,9 @@ function appendOrRestoreStreamingBubble(thread: Thread): void {
 
   listEl.appendChild(div)
   activeStreamMsgId = streamState.messageId
+  activeStreamScopeKey = scopeKey
 
-  const buffered = streamBufferByThread.get(thread.threadId) ?? ''
+  const buffered = streamBufferByScope.get(scopeKey) ?? ''
   if (buffered) {
     updateStreamingBubbleContent(streamState.messageId, buffered)
   }
@@ -619,22 +664,85 @@ function appendOrRestoreStreamingBubble(thread: Thread): void {
   listEl.scrollTop = listEl.scrollHeight
 }
 
-function clearThreadStreamRuntime(threadId: string): void {
-  streamsByThread.delete(threadId)
-  streamBufferByThread.delete(threadId)
-  streamPlanByThread.delete(threadId)
-  streamStartedAtByThread.delete(threadId)
-  setThreadStreamState(threadId, null)
-  if (store.get().activeThreadId === threadId) {
+function clearScopeStreamRuntime(scopeKey: string): void {
+  streamsByScope.delete(scopeKey)
+  streamBufferByScope.delete(scopeKey)
+  streamPlanByScope.delete(scopeKey)
+  streamStartedAtByScope.delete(scopeKey)
+  setScopeStreamState(scopeKey, null)
+  if (activeChatScopeKey() === scopeKey) {
     activeStreamMsgId = null
+    activeStreamScopeKey = ''
   }
 }
 
-function upsertPendingPermission(threadId: string, event: PermissionRequiredPayload): PendingPermission {
-  let byID = pendingPermissionsByThread.get(threadId)
+function rebindScopeRuntime(oldScopeKey: string, nextScopeKey: string, nextSessionID: string): void {
+  oldScopeKey = oldScopeKey.trim()
+  nextScopeKey = nextScopeKey.trim()
+  nextSessionID = nextSessionID.trim()
+  if (!oldScopeKey || !nextScopeKey || oldScopeKey === nextScopeKey) return
+
+  if (streamsByScope.has(oldScopeKey)) {
+    const stream = streamsByScope.get(oldScopeKey)
+    streamsByScope.delete(oldScopeKey)
+    if (stream) streamsByScope.set(nextScopeKey, stream)
+  }
+  if (streamBufferByScope.has(oldScopeKey)) {
+    const buffered = streamBufferByScope.get(oldScopeKey) ?? ''
+    streamBufferByScope.delete(oldScopeKey)
+    streamBufferByScope.set(nextScopeKey, buffered)
+  }
+  if (streamPlanByScope.has(oldScopeKey)) {
+    const plans = streamPlanByScope.get(oldScopeKey) ?? []
+    streamPlanByScope.delete(oldScopeKey)
+    streamPlanByScope.set(nextScopeKey, plans)
+  }
+  if (streamStartedAtByScope.has(oldScopeKey)) {
+    const startedAt = streamStartedAtByScope.get(oldScopeKey) ?? ''
+    streamStartedAtByScope.delete(oldScopeKey)
+    streamStartedAtByScope.set(nextScopeKey, startedAt)
+  }
+  if (pendingPermissionsByScope.has(oldScopeKey)) {
+    const pending = pendingPermissionsByScope.get(oldScopeKey)
+    pendingPermissionsByScope.delete(oldScopeKey)
+    if (pending) pendingPermissionsByScope.set(nextScopeKey, pending)
+  }
+  if (loadedHistoryScopeKeys.has(oldScopeKey)) {
+    loadedHistoryScopeKeys.delete(oldScopeKey)
+    loadedHistoryScopeKeys.add(nextScopeKey)
+  }
+  if (activeStreamScopeKey === oldScopeKey) {
+    activeStreamScopeKey = nextScopeKey
+  }
+
+  const state = store.get()
+  const nextMessages = { ...state.messages }
+  const oldMessages = nextMessages[oldScopeKey] ?? []
+  if (oldMessages.length) {
+    nextMessages[nextScopeKey] = nextMessages[nextScopeKey]?.length
+      ? [...nextMessages[nextScopeKey], ...oldMessages]
+      : oldMessages
+  }
+  delete nextMessages[oldScopeKey]
+
+  const nextStreamStates = { ...state.streamStates }
+  const streamState = nextStreamStates[oldScopeKey]
+  if (streamState) {
+    nextStreamStates[nextScopeKey] = { ...streamState, sessionId: nextSessionID }
+    delete nextStreamStates[oldScopeKey]
+  }
+
+  store.set({
+    messages: nextMessages,
+    streamStates: nextStreamStates,
+  })
+}
+
+function upsertPendingPermission(scopeKey: string, event: PermissionRequiredPayload): PendingPermission {
+  let byID = pendingPermissionsByScope.get(scopeKey)
   if (!byID) {
     byID = new Map<string, PendingPermission>()
-    pendingPermissionsByThread.set(threadId, byID)
+    pendingPermissionsByScope.set(scopeKey, byID)
   }
   const existing = byID.get(event.permissionId)
   if (existing) return existing
@@ -647,21 +755,21 @@ function upsertPendingPermission(threadId: string, event: PermissionRequiredPayl
   return pending
 }
 
-function removePendingPermission(threadId: string, permissionId: string): void {
-  const byID = pendingPermissionsByThread.get(threadId)
+function removePendingPermission(scopeKey: string, permissionId: string): void {
+  const byID = pendingPermissionsByScope.get(scopeKey)
   if (!byID) return
   byID.delete(permissionId)
   if (byID.size === 0) {
-    pendingPermissionsByThread.delete(threadId)
+    pendingPermissionsByScope.delete(scopeKey)
   }
 }
 
-function clearPendingPermissions(threadId: string): void {
-  pendingPermissionsByThread.delete(threadId)
+function clearPendingPermissions(scopeKey: string): void {
+  pendingPermissionsByScope.delete(scopeKey)
 }
 
-function mountPendingPermissionCard(threadId: string, pending: PendingPermission): void {
-  if (store.get().activeThreadId !== threadId) return
+function mountPendingPermissionCard(scopeKey: string, pending: PendingPermission): void {
+  if (activeChatScopeKey() !== scopeKey) return
   if (document.getElementById(`perm-card-${pending.permissionId}`)) return
 
   const listEl = document.getElementById('message-list')
@@ -669,14 +777,14 @@ function mountPendingPermissionCard(threadId: string, pending: PendingPermission
 
   mountPermissionCard(listEl, pending, {
     deadlineMs: pending.deadlineMs,
-    onResolved: () => removePendingPermission(threadId, pending.permissionId),
+    onResolved: () => removePendingPermission(scopeKey, pending.permissionId),
   })
 }
 
-function renderPendingPermissionCards(threadId: string): void {
-  const byID = pendingPermissionsByThread.get(threadId)
+function renderPendingPermissionCards(scopeKey: string): void {
+  const byID = pendingPermissionsByScope.get(scopeKey)
   if (!byID) return
-  byID.forEach(pending => mountPendingPermissionCard(threadId, pending))
+  byID.forEach(pending => mountPendingPermissionCard(scopeKey, pending))
 }
 
 function emptySessionPanelState(): SessionPanelState {
@@ -794,6 +902,9 @@ async function switchThreadSession(thread: Thread, nextSessionID: string): Promi
 
   sessionSwitchingThreads.add(thread.threadId)
   updateSessionPanel()
+  if (store.get().activeThreadId === thread.threadId) {
+    updateInputState()
+  }
   try {
     const updatedThread = await api.updateThread(thread.threadId, {
       agentOptions: buildThreadAgentOptionsWithSession(thread.agentOptions, nextSessionID),
@@ -808,16 +919,14 @@ async function switchThreadSession(thread: Thread, nextSessionID: string): Promi
   } finally {
     sessionSwitchingThreads.delete(thread.threadId)
     if (store.get().activeThreadId === thread.threadId) {
+      updateInputState()
       updateSessionPanel()
     }
   }
 }
 
-function renderSessionItem(item: SessionInfo, active: boolean): string {
+function renderSessionItem(item: SessionInfo, active: boolean, loading: boolean): string {
   const title = item.title?.trim() || item.sessionId
-  const cwd = item.cwd?.trim() || ''
-  const updatedAt = item.updatedAt?.trim() || ''
-  const relTime = updatedAt ? formatRelativeTime(updatedAt) : ''
   return `
     <button
       class="session-item ${active ? 'session-item--active' : ''}"
@@ -825,16 +934,15 @@ function renderSessionItem(item: SessionInfo, active: boolean): string {
       data-session-id="${escHtml(item.sessionId)}"
       aria-pressed="${active ? 'true' : 'false'}"
     >
-      <div class="session-item-title">${escHtml(title)}</div>
-      <div class="session-item-meta">
-        <span class="session-item-path">${escHtml(cwd || item.sessionId)}</span>
-        <span class="session-item-time">${escHtml(relTime)}</span>
+      <div class="session-item-title-row">
+        ${renderSessionStatusIndicator(loading)}
+        <div class="session-item-title">${escHtml(title)}</div>
       </div>
     </button>`
 }
 
 function renderSessionPanel(): string {
-  const { activeThreadId, threads } = store.get()
+  const { activeThreadId, threads, streamStates } = store.get()
   const thread = activeThreadId ? threads.find(item => item.threadId === activeThreadId) : null
   if (!thread) {
     return `
@@ -847,14 +955,19 @@ function renderSessionPanel(): string {
   const state = sessionPanelState(thread.threadId)
   const selectedSessionID = threadSessionID(thread)
   const switching = sessionSwitchingThreads.has(thread.threadId)
-  const streaming = !!getThreadStreamState(thread.threadId)
-  const disabled = switching || streaming
+  const disabled = switching
+  const refreshDisabled = disabled || state.loading || state.loadingMore
 
   const knownIDs = new Set(state.sessions.map(item => item.sessionId))
   const sessions = [...state.sessions]
   if (selectedSessionID && !knownIDs.has(selectedSessionID)) {
     sessions.unshift({ sessionId: selectedSessionID, title: selectedSessionID })
   }
+  const loadingSessionIDs = new Set(
+    Object.values(streamStates)
+      .filter(streamState => streamState.threadId === thread.threadId && !!streamState.sessionId)
+      .map(streamState => streamState.sessionId),
+  )
 
   let bodyHTML = ''
   if (state.loading && !sessions.length) {
@@ -865,7 +978,11 @@ function renderSessionPanel(): string {
     bodyHTML = `<div class="session-panel-empty">This agent does not expose ACP session history.</div>`
   } else {
     const itemsHTML = sessions.length
-      ? sessions.map(item => renderSessionItem(item, item.sessionId === selectedSessionID)).join('')
+      ? sessions.map(item => renderSessionItem(
+          item,
+          item.sessionId === selectedSessionID,
+          loadingSessionIDs.has(item.sessionId),
+        )).join('')
       : `<div class="session-panel-empty">No previous sessions for this working directory.</div>`
     const showMoreHTML = state.nextCursor
       ? `<button class="btn btn-ghost session-show-more-btn" type="button" ${state.loadingMore || disabled ? 'disabled' : ''}>
@@ -885,14 +1002,24 @@ function renderSessionPanel(): string {
       <div>
         <h3 class="session-panel-title">Sessions</h3>
       </div>
-      <button
-        class="btn btn-icon session-new-btn"
-        type="button"
-        title="New session"
-        aria-label="New session"
-        ${disabled ? 'disabled' : ''}>
-        ${iconPlus}
-      </button>
+      <div class="session-panel-actions">
+        <button
+          class="btn btn-icon session-refresh-btn ${state.loading ? 'session-refresh-btn--loading' : ''}"
+          type="button"
+          title="${state.loading ? 'Refreshing sessions' : 'Refresh sessions'}"
+          aria-label="${state.loading ? 'Refreshing sessions' : 'Refresh sessions'}"
+          ${refreshDisabled ? 'disabled' : ''}>
+          ${iconRefresh}
+        </button>
+        <button
+          class="btn btn-icon session-new-btn"
+          type="button"
+          title="New session"
+          aria-label="New session"
+          ${disabled ? 'disabled' : ''}>
+          ${iconPlus}
+        </button>
+      </div>
     </div>
     <div class="session-panel-body">
       ${bodyHTML}
@@ -903,15 +1030,34 @@ function updateSessionPanel(): void {
   const el = document.getElementById('session-sidebar')
   if (!el) return
 
+  const renderedThreadID = el.dataset.threadId?.trim() ?? ''
+  const previousBody = el.querySelector<HTMLElement>('.session-panel-body')
+  if (renderedThreadID && previousBody) {
+    sessionPanelScrollTopByThread.set(renderedThreadID, previousBody.scrollTop)
+  }
+
   el.innerHTML = renderSessionPanel()
   const { activeThreadId, threads } = store.get()
   const thread = activeThreadId ? threads.find(item => item.threadId === activeThreadId) : null
-  if (!thread) return
+  if (!thread) {
+    delete el.dataset.threadId
+    return
+  }
+
+  el.dataset.threadId = thread.threadId
+  const nextBody = el.querySelector<HTMLElement>('.session-panel-body')
+  if (nextBody) {
+    nextBody.scrollTop = sessionPanelScrollTopByThread.get(thread.threadId) ?? 0
+  }
 
   const state = sessionPanelState(thread.threadId)
   if (state.supported === null && !state.loading && !state.loadingMore && !state.error) {
     void loadThreadSessions(thread.threadId)
   }
+
+  el.querySelector<HTMLButtonElement>('.session-refresh-btn')?.addEventListener('click', () => {
+    void loadThreadSessions(thread.threadId)
+  })
 
   el.querySelector<HTMLButtonElement>('.session-new-btn')?.addEventListener('click', () => {
     void switchThreadSession(thread, '')
@@ -1264,6 +1410,19 @@ function renderThreadStatusIndicator(status: ThreadActivityIndicator): string {
   return ''
 }
 
+function renderSessionStatusIndicator(loading: boolean): string {
+  if (!loading) return ''
+  return `
+      <span
+        class="thread-status-indicator session-status-indicator thread-status-indicator--loading"
+        role="status"
+        aria-label="Session is working"
+        title="Session is working"
+      >
+        <span class="thread-status-spinner" aria-hidden="true"></span>
+      </span>`
+}
+
 function renderThreadItem(
   t: Thread,
   activeId: string | null,
@@ -1334,7 +1493,7 @@ function updateThreadList(): void {
   el.innerHTML = filtered
     .map(t => {
       const isActive = t.threadId === activeThreadId
-      const activityIndicator: ThreadActivityIndicator = streamStates[t.threadId]
+      const activityIndicator: ThreadActivityIndicator = Object.values(streamStates).some(streamState => streamState.threadId === t.threadId)
         ? 'loading'
         : (!isActive && threadCompletionBadges[t.threadId] ? 'done' : null)
       return renderThreadItem(t, activeThreadId, q, activityIndicator)
@@ -1420,22 +1579,35 @@ async function handleDeleteThread(threadId: string): Promise<void> {
   const state = store.get()
   const nextThreads = state.threads.filter(t => t.threadId !== threadId)
   const nextMessages = { ...state.messages }
-  delete nextMessages[threadId]
+  const threadScopePrefix = `${threadId}::`
+  Object.keys(nextMessages).forEach(scopeKey => {
+    if (scopeKey.startsWith(threadScopePrefix)) {
+      delete nextMessages[scopeKey]
+    }
+  })
 
   const deletingActive = state.activeThreadId === threadId
   const nextActiveThreadId = deletingActive ? (nextThreads[0]?.threadId ?? null) : state.activeThreadId
-  const deletingStream = !!streamsByThread.get(threadId)
-
-  if (deletingStream) {
-    streamsByThread.get(threadId)?.abort()
-    clearThreadStreamRuntime(threadId)
-  }
-  clearPendingPermissions(threadId)
+  Array.from(streamsByScope.entries()).forEach(([scopeKey, stream]) => {
+    if (!scopeKey.startsWith(threadScopePrefix)) return
+    stream.abort()
+    clearScopeStreamRuntime(scopeKey)
+  })
+  Array.from(pendingPermissionsByScope.keys()).forEach(scopeKey => {
+    if (scopeKey.startsWith(threadScopePrefix)) {
+      clearPendingPermissions(scopeKey)
+    }
+  })
   threadConfigCache.delete(threadId)
   threadConfigSwitching.delete(threadId)
-  loadedHistorySessionIDByThread.delete(threadId)
+  Array.from(loadedHistoryScopeKeys).forEach(scopeKey => {
+    if (scopeKey.startsWith(threadScopePrefix)) {
+      loadedHistoryScopeKeys.delete(scopeKey)
+    }
+  })
   sessionPanelStateByThread.delete(threadId)
   sessionPanelRequestSeqByThread.delete(threadId)
+  sessionPanelScrollTopByThread.delete(threadId)
   sessionSwitchingThreads.delete(threadId)
   let nextThreadCompletionBadges = omitThreadCompletionBadge(state.threadCompletionBadges, threadId)
   if (nextActiveThreadId) {
@@ -1579,41 +1751,40 @@ function mergeSessionReplayMessages(replayMessages: Message[], localMessages: Me
 async function loadHistory(threadId: string): Promise<void> {
   const requestedThread = store.get().threads.find(item => item.threadId === threadId)
   const requestedSessionID = threadSessionID(requestedThread)
+  const requestedScopeKey = threadSessionScopeKey(threadId, requestedSessionID)
   try {
     const turns = await api.getHistory(threadId)
     const state = store.get()
     if (state.activeThreadId !== threadId) return
     const activeThread = state.threads.find(item => item.threadId === threadId)
     if (!activeThread || threadSessionID(activeThread) !== requestedSessionID) return
-    // Don't overwrite while a turn is streaming on this thread
-    if (getThreadStreamState(threadId)) return
+    if (getScopeStreamState(requestedScopeKey)) return
 
     const localMessages = turnsToMessages(filterTurnsBySession(turns, requestedSessionID))
-    const previousLoadedSessionID = loadedHistorySessionIDByThread.get(threadId) ?? ''
-    const cachedMessages = state.messages[threadId] ?? []
+    const cachedMessages = state.messages[requestedScopeKey] ?? []
     let nextMessages = localMessages
     if (requestedSessionID) {
       // When a fresh ACP session is created from "Current: new", Codex transcripts
       // include the injected context prompt. Reuse the in-memory turn messages in
       // that transition instead of replaying transcript noise back into the chat.
-      if (previousLoadedSessionID === '' && localMessages.length && cachedMessages.length) {
+      if (!loadedHistoryScopeKeys.has(requestedScopeKey) && loadedHistoryScopeKeys.has(threadSessionScopeKey(threadId, '')) && localMessages.length && cachedMessages.length) {
         nextMessages = mergeSessionReplayMessages(cachedMessages, localMessages)
       } else {
-      try {
-        const replay = await api.getThreadSessionHistory(threadId, requestedSessionID)
-        const transcriptState = store.get()
-        if (transcriptState.activeThreadId !== threadId) return
-        const transcriptThread = transcriptState.threads.find(item => item.threadId === threadId)
-        if (!transcriptThread || threadSessionID(transcriptThread) !== requestedSessionID) return
-        if (getThreadStreamState(threadId)) return
+        try {
+          const replay = await api.getThreadSessionHistory(threadId, requestedSessionID)
+          const transcriptState = store.get()
+          if (transcriptState.activeThreadId !== threadId) return
+          const transcriptThread = transcriptState.threads.find(item => item.threadId === threadId)
+          if (!transcriptThread || threadSessionID(transcriptThread) !== requestedSessionID) return
+          if (getScopeStreamState(requestedScopeKey)) return
 
-        if (replay.supported && replay.messages.length) {
-          const replayMessages = sessionTranscriptToMessages(replay.messages, requestedSessionID)
-          nextMessages = mergeSessionReplayMessages(replayMessages, localMessages)
+          if (replay.supported && replay.messages.length) {
+            const replayMessages = sessionTranscriptToMessages(replay.messages, requestedSessionID)
+            nextMessages = mergeSessionReplayMessages(replayMessages, localMessages)
+          }
+        } catch {
+          nextMessages = localMessages
         }
-      } catch {
-        nextMessages = localMessages
-      }
       }
     }
 
@@ -1621,20 +1792,20 @@ async function loadHistory(threadId: string): Promise<void> {
     if (finalState.activeThreadId !== threadId) return
     const finalThread = finalState.threads.find(item => item.threadId === threadId)
     if (!finalThread || threadSessionID(finalThread) !== requestedSessionID) return
-    if (getThreadStreamState(threadId)) return
+    if (getScopeStreamState(requestedScopeKey)) return
 
-    loadedHistorySessionIDByThread.set(threadId, requestedSessionID)
+    loadedHistoryScopeKeys.add(requestedScopeKey)
     store.set({
       messages: {
         ...finalState.messages,
-        [threadId]: nextMessages,
+        [requestedScopeKey]: nextMessages,
       },
     })
   } catch {
     if (store.get().activeThreadId !== threadId) return
     if (threadSessionID(store.get().threads.find(item => item.threadId === threadId)) !== requestedSessionID) return
     // Show error only if no matching local history was already rendered.
-    if (loadedHistorySessionIDByThread.get(threadId) !== requestedSessionID) {
+    if (!loadedHistoryScopeKeys.has(requestedScopeKey)) {
       const listEl = document.getElementById('message-list')
       if (listEl) {
         listEl.innerHTML = `<div class="thread-list-empty" style="color:var(--error)">Failed to load history.</div>`
@@ -1790,7 +1961,8 @@ function updateMessageList(): void {
   if (!activeThreadId) return
 
   const thread   = threads.find(t => t.threadId === activeThreadId)
-  const msgs     = messages[activeThreadId] ?? []
+  const scopeKey = threadChatScopeKey(thread)
+  const msgs     = messages[scopeKey] ?? []
   const agentAvatar = renderAgentAvatar(thread?.agent ?? '', 'message')
 
   if (!msgs.length) {
@@ -1815,7 +1987,7 @@ function updateMessageList(): void {
 
 function updateInputState(): void {
   const { activeThreadId } = store.get()
-  const streamState = getThreadStreamState(activeThreadId)
+  const streamState = getActiveChatStreamState()
   const isStreaming   = !!streamState
   const isCancelling  = streamState?.status === 'cancelling'
 
@@ -1823,14 +1995,16 @@ function updateInputState(): void {
   const cancelBtn = document.getElementById('cancel-btn') as HTMLButtonElement   | null
   const inputEl  = document.getElementById('message-input') as HTMLTextAreaElement | null
   const isSwitchingConfig = !!activeThreadId && threadConfigSwitching.has(activeThreadId)
+  const isSwitchingSession = !!activeThreadId && sessionSwitchingThreads.has(activeThreadId)
+  const hasThreadStreaming = hasThreadStream(activeThreadId)
 
-  if (sendBtn)  sendBtn.disabled  = isStreaming || isSwitchingConfig
-  if (inputEl)  inputEl.disabled  = isStreaming || isSwitchingConfig
+  if (sendBtn)  sendBtn.disabled  = isStreaming || isSwitchingConfig || isSwitchingSession
+  if (inputEl)  inputEl.disabled  = isStreaming || isSwitchingConfig || isSwitchingSession
   document.querySelectorAll<HTMLButtonElement>('.thread-model-trigger').forEach(triggerEl => {
     const pickerState = triggerEl.dataset.state ?? 'empty'
     const configID = triggerEl.dataset.configId?.trim() ?? ''
     const noSelectableValue = pickerState !== 'ready' || !configID
-    const disabled = isStreaming || isSwitchingConfig || noSelectableValue
+    const disabled = hasThreadStreaming || isSwitchingConfig || isSwitchingSession || noSelectableValue
     triggerEl.disabled = disabled
     if (disabled) {
       triggerEl.setAttribute('aria-expanded', 'false')
@@ -1858,6 +2032,50 @@ function renderChatEmpty(): string {
       <button class="btn btn-primary" id="new-thread-empty-btn">
         ${iconPlus} New Agent
       </button>
+    </div>`
+}
+
+function renderSessionInfoField(label: string, value: string, copyLabel: string): string {
+  return `
+    <div class="session-info-field">
+      <div class="session-info-label">${label}</div>
+      <div class="session-info-row">
+        <div class="session-info-value" title="${escHtml(value)}">${escHtml(value)}</div>
+        <button
+          class="btn btn-icon session-info-copy-btn"
+          type="button"
+          data-copy-value="${escHtml(encodeURIComponent(value))}"
+          aria-label="${copyLabel}"
+          title="${copyLabel}"
+        >
+          ${iconCopy}
+        </button>
+      </div>
+    </div>`
+}
+
+function renderSessionInfoPopover(thread: Thread): string {
+  const sessionID = threadSessionID(thread)
+  if (!sessionID) return ''
+
+  return `
+    <div class="session-info" id="session-info">
+      <button
+        class="btn btn-icon session-info-trigger"
+        id="session-info-trigger"
+        type="button"
+        aria-label="Session info"
+        aria-expanded="false"
+        aria-controls="session-info-panel"
+        title="Session info"
+      >
+        ${iconInfo}
+      </button>
+      <div class="session-info-popover" id="session-info-panel" role="dialog" aria-label="Session Info" hidden>
+        <div class="session-info-heading">Session Info</div>
+        ${renderSessionInfoField('Session ID', sessionID, 'Copy session ID')}
+        ${renderSessionInfoField('Working Directory', thread.cwd, 'Copy working directory')}
+      </div>
     </div>`
 }
 
@@ -1890,13 +2108,17 @@ function renderChatThread(t: Thread): string {
     <div class="chat-header">
       <div class="chat-header-left">
         <button class="btn btn-icon mobile-menu-btn" aria-label="Open menu">${iconMenu}</button>
-        <h2 class="chat-title" title="${escHtml(titleLabel)}">${escHtml(titleLabel)}</h2>
-        <span class="badge badge--agent">${escHtml(t.agent ?? '')}</span>
-        <span class="chat-cwd" title="${escHtml(t.cwd)}">${escHtml(t.cwd)}</span>
+        <div class="chat-header-main">
+          <div class="chat-header-title-row">
+            <h2 class="chat-title" title="${escHtml(titleLabel)}">${escHtml(titleLabel)}</h2>
+            <span class="badge badge--agent">${escHtml(t.agent ?? '')}</span>
+          </div>
+        </div>
       </div>
       <div class="chat-header-right">
         <button class="btn btn-sm btn-danger" id="cancel-btn" style="display:none" aria-label="Cancel turn">Cancel</button>
         <span class="chat-header-meta">${escHtml(createdLabel)}</span>
+        ${renderSessionInfoPopover(t)}
       </div>
     </div>
 
@@ -1938,8 +2160,9 @@ function updateChatArea(): void {
   const { threads, activeThreadId } = store.get()
   const thread = activeThreadId ? threads.find(t => t.threadId === activeThreadId) : null
 
-  // The streaming bubble is tied to the current chat DOM; reset sentinel on thread switch.
+  // The streaming bubble is tied to the current chat DOM; reset sentinel on chat-scope switch.
   activeStreamMsgId = null
+  activeStreamScopeKey = ''
 
   if (!thread) {
     chat.innerHTML = renderChatEmpty()
@@ -1957,9 +2180,9 @@ function updateChatArea(): void {
 
   // Show locally loaded messages immediately (including empty threads).
   // Show the loading state when the cache belongs to a different selected session.
-  const hasLocalHistory = Object.prototype.hasOwnProperty.call(store.get().messages, thread.threadId)
-  const hasMatchingLocalHistory = hasLocalHistory
-    && loadedHistorySessionIDByThread.get(thread.threadId) === threadSessionID(thread)
+  const scopeKey = threadChatScopeKey(thread)
+  const hasLocalHistory = Object.prototype.hasOwnProperty.call(store.get().messages, scopeKey)
+  const hasMatchingLocalHistory = hasLocalHistory && loadedHistoryScopeKeys.has(scopeKey)
   if (hasMatchingLocalHistory) {
     updateMessageList()
   } else {
@@ -1970,9 +2193,10 @@ function updateChatArea(): void {
   }
 
   appendOrRestoreStreamingBubble(thread)
-  renderPendingPermissionCards(thread.threadId)
+  renderPendingPermissionCards(scopeKey)
 
   updateInputState()
+  bindSessionInfoPopover()
   bindInputResize()
   bindSendHandler()
   bindCancelHandler()
@@ -2072,7 +2296,7 @@ function bindThreadConfigSwitches(thread: Thread): void {
   const switchConfig = async (configId: string, nextValue: string): Promise<void> => {
     const activeThreadID = store.get().activeThreadId
     if (!activeThreadID || activeThreadID !== thread.threadId) return
-    if (getThreadStreamState(activeThreadID)) return
+    if (hasThreadStream(activeThreadID)) return
 
     const latest = store.get().threads.find(item => item.threadId === activeThreadID)
     if (!latest) return
@@ -2181,6 +2405,59 @@ function bindThreadConfigSwitches(thread: Thread): void {
   })
 }
 
+function closeSessionInfoPopover(): void {
+  const root = document.getElementById('session-info')
+  const trigger = document.getElementById('session-info-trigger') as HTMLButtonElement | null
+  const panel = document.getElementById('session-info-panel') as HTMLDivElement | null
+  if (!root || !trigger || !panel) return
+
+  root.classList.remove('session-info--open')
+  trigger.setAttribute('aria-expanded', 'false')
+  panel.hidden = true
+}
+
+function bindSessionInfoPopover(): void {
+  const root = document.getElementById('session-info')
+  const trigger = document.getElementById('session-info-trigger') as HTMLButtonElement | null
+  const panel = document.getElementById('session-info-panel') as HTMLDivElement | null
+  if (!root || !trigger || !panel) return
+
+  const setOpen = (open: boolean): void => {
+    root.classList.toggle('session-info--open', open)
+    trigger.setAttribute('aria-expanded', open ? 'true' : 'false')
+    panel.hidden = !open
+  }
+
+  trigger.addEventListener('click', e => {
+    e.preventDefault()
+    e.stopPropagation()
+    setOpen(panel.hidden)
+  })
+
+  panel.addEventListener('click', e => e.stopPropagation())
+
+  root.querySelectorAll<HTMLButtonElement>('.session-info-copy-btn').forEach(btn => {
+    btn.addEventListener('click', e => {
+      e.preventDefault()
+      e.stopPropagation()
+
+      const encoded = btn.dataset.copyValue ?? ''
+      const value = encoded ? decodeURIComponent(encoded) : ''
+      if (!value) return
+
+      void copyText(value).then(copied => {
+        if (!copied) return
+        btn.innerHTML = iconCheck
+        btn.classList.add('session-info-copy-btn--copied')
+        setTimeout(() => {
+          btn.innerHTML = iconCopy
+          btn.classList.remove('session-info-copy-btn--copied')
+        }, 1_500)
+      })
+    })
+  })
+}
+
 // ── Scroll-to-bottom button ───────────────────────────────────────────────
 
 function bindScrollBottom(): void {
@@ -2230,11 +2507,16 @@ function handleSend(): void {
   if (!text) return
 
   const { activeThreadId, threads } = store.get()
-  if (!activeThreadId || getThreadStreamState(activeThreadId)) return
+  if (!activeThreadId) return
 
-  const thread       = threads.find(t => t.threadId === activeThreadId)
-  const agentAvatar  = renderAgentAvatar(thread?.agent ?? '', 'message')
+  const thread = threads.find(t => t.threadId === activeThreadId)
+  if (!thread || sessionSwitchingThreads.has(thread.threadId)) return
   const capturedThreadID = activeThreadId
+  let capturedSessionID = threadSessionID(thread)
+  let capturedScopeKey = threadSessionScopeKey(capturedThreadID, capturedSessionID)
+  if (getScopeStreamState(capturedScopeKey)) return
+
+  const agentAvatar  = renderAgentAvatar(thread?.agent ?? '', 'message')
 
   // Clear input immediately
   inputEl.value = ''
@@ -2250,18 +2532,20 @@ function handleSend(): void {
     timestamp: now,
     status:    'done',
   }
-  addMessageToStore(capturedThreadID, userMsg)
+  addMessageToStore(capturedScopeKey, userMsg)
 
   // ── 2. Reserve streaming message ID before touching stream state ───────────
   //    This prevents subscribe → updateMessageList from wiping the bubble.
   const agentMsgID = generateUUID()
   activeStreamMsgId = agentMsgID
-  streamBufferByThread.set(capturedThreadID, '')
-  streamPlanByThread.delete(capturedThreadID)
-  streamStartedAtByThread.set(capturedThreadID, now)
-  setThreadStreamState(capturedThreadID, {
+  activeStreamScopeKey = capturedScopeKey
+  streamBufferByScope.set(capturedScopeKey, '')
+  streamPlanByScope.delete(capturedScopeKey)
+  streamStartedAtByScope.set(capturedScopeKey, now)
+  setScopeStreamState(capturedScopeKey, {
     turnId: '',
     threadId: capturedThreadID,
+    sessionId: capturedSessionID,
     messageId: agentMsgID,
     status: 'streaming',
   })
@@ -2289,17 +2573,17 @@ function handleSend(): void {
   const stream = api.startTurn(capturedThreadID, text, {
 
     onTurnStarted({ turnId }) {
-      const state = getThreadStreamState(capturedThreadID)
+      const state = getScopeStreamState(capturedScopeKey)
       if (!state) return
-      setThreadStreamState(capturedThreadID, { ...state, turnId })
+      setScopeStreamState(capturedScopeKey, { ...state, turnId })
     },
 
     onDelta({ delta }) {
-      const previous = streamBufferByThread.get(capturedThreadID) ?? ''
+      const previous = streamBufferByScope.get(capturedScopeKey) ?? ''
       const next = previous + delta
-      streamBufferByThread.set(capturedThreadID, next)
+      streamBufferByScope.set(capturedScopeKey, next)
 
-      if (store.get().activeThreadId !== capturedThreadID) return
+      if (activeChatScopeKey() !== capturedScopeKey) return
       const list      = document.getElementById('message-list')
       const atBottom  = !list || isNearBottom(list)
       updateStreamingBubbleContent(agentMsgID, next)
@@ -2308,9 +2592,9 @@ function handleSend(): void {
 
     onPlanUpdate({ entries }: PlanUpdatePayload) {
       const nextPlanEntries = clonePlanEntries(entries) ?? []
-      streamPlanByThread.set(capturedThreadID, nextPlanEntries)
+      streamPlanByScope.set(capturedScopeKey, nextPlanEntries)
 
-      if (store.get().activeThreadId !== capturedThreadID) return
+      if (activeChatScopeKey() !== capturedScopeKey) return
       const list = document.getElementById('message-list')
       const atBottom = !list || isNearBottom(list)
       updateStreamingBubblePlan(agentMsgID, nextPlanEntries)
@@ -2318,24 +2602,30 @@ function handleSend(): void {
     },
 
     onSessionBound({ sessionId }: SessionBoundPayload) {
+      const nextSessionID = sessionId.trim()
+      if (!nextSessionID || nextSessionID === capturedSessionID) return
+      const previousScopeKey = capturedScopeKey
+      capturedSessionID = nextSessionID
+      capturedScopeKey = threadSessionScopeKey(capturedThreadID, capturedSessionID)
+      rebindScopeRuntime(previousScopeKey, capturedScopeKey, capturedSessionID)
       updateThreadSessionID(capturedThreadID, sessionId)
     },
 
     onPermissionRequired(event) {
-      const pending = upsertPendingPermission(capturedThreadID, event)
-      mountPendingPermissionCard(capturedThreadID, pending)
+      const pending = upsertPendingPermission(capturedScopeKey, event)
+      mountPendingPermissionCard(capturedScopeKey, pending)
     },
 
     onCompleted({ stopReason }) {
       // Clear stream tracking BEFORE addMessageToStore (so subscribe calls updateMessageList)
-      const finalContent = streamBufferByThread.get(capturedThreadID) ?? ''
-      const finalPlanEntries = clonePlanEntries(streamPlanByThread.get(capturedThreadID))
-      clearThreadStreamRuntime(capturedThreadID)
-      clearPendingPermissions(capturedThreadID)
+      const finalContent = streamBufferByScope.get(capturedScopeKey) ?? ''
+      const finalPlanEntries = clonePlanEntries(streamPlanByScope.get(capturedScopeKey))
+      clearScopeStreamRuntime(capturedScopeKey)
+      clearPendingPermissions(capturedScopeKey)
       markThreadCompletionBadge(capturedThreadID)
       void loadThreadSessions(capturedThreadID)
 
-      addMessageToStore(capturedThreadID, {
+      addMessageToStore(capturedScopeKey, {
         id:         agentMsgID,
         role:       'agent',
         content:    finalContent,
@@ -2347,13 +2637,13 @@ function handleSend(): void {
     },
 
     onError({ code, message: msg }) {
-      const partialContent = streamBufferByThread.get(capturedThreadID) ?? ''
-      const finalPlanEntries = clonePlanEntries(streamPlanByThread.get(capturedThreadID))
-      clearThreadStreamRuntime(capturedThreadID)
-      clearPendingPermissions(capturedThreadID)
+      const partialContent = streamBufferByScope.get(capturedScopeKey) ?? ''
+      const finalPlanEntries = clonePlanEntries(streamPlanByScope.get(capturedScopeKey))
+      clearScopeStreamRuntime(capturedScopeKey)
+      clearPendingPermissions(capturedScopeKey)
       void loadThreadSessions(capturedThreadID)
 
-      addMessageToStore(capturedThreadID, {
+      addMessageToStore(capturedScopeKey, {
         id:           agentMsgID,
         role:         'agent',
         content:      partialContent,
@@ -2366,13 +2656,13 @@ function handleSend(): void {
     },
 
     onDisconnect() {
-      const partialContent = streamBufferByThread.get(capturedThreadID) ?? ''
-      const finalPlanEntries = clonePlanEntries(streamPlanByThread.get(capturedThreadID))
-      clearThreadStreamRuntime(capturedThreadID)
-      clearPendingPermissions(capturedThreadID)
+      const partialContent = streamBufferByScope.get(capturedScopeKey) ?? ''
+      const finalPlanEntries = clonePlanEntries(streamPlanByScope.get(capturedScopeKey))
+      clearScopeStreamRuntime(capturedScopeKey)
+      clearPendingPermissions(capturedScopeKey)
       void loadThreadSessions(capturedThreadID)
 
-      addMessageToStore(capturedThreadID, {
+      addMessageToStore(capturedScopeKey, {
         id:           agentMsgID,
         role:         'agent',
         content:      partialContent,
@@ -2384,7 +2674,7 @@ function handleSend(): void {
     },
   })
 
-  streamsByThread.set(capturedThreadID, stream)
+  streamsByScope.set(capturedScopeKey, stream)
 }
 
 // ── Cancel ────────────────────────────────────────────────────────────────
@@ -2394,11 +2684,11 @@ function bindCancelHandler(): void {
 }
 
 async function handleCancel(): Promise<void> {
-  const { activeThreadId } = store.get()
-  const streamState = getThreadStreamState(activeThreadId)
-  if (!activeThreadId || !streamState?.turnId) return
+  const scopeKey = activeChatScopeKey()
+  const streamState = getActiveChatStreamState()
+  if (!scopeKey || !streamState?.turnId) return
 
-  setThreadStreamState(activeThreadId, { ...streamState, status: 'cancelling' })
+  setScopeStreamState(scopeKey, { ...streamState, status: 'cancelling' })
   try {
     await api.cancelTurn(streamState.turnId)
   } catch {
@@ -2516,7 +2806,14 @@ function bindGlobalShortcuts(): void {
         updateThreadList()
         return
       }
-      // (3) clear search if focused
+      // (3) close session info popover if open
+      const sessionInfoPanel = document.getElementById('session-info-panel')
+      if (sessionInfoPanel && !sessionInfoPanel.hidden) {
+        e.preventDefault()
+        closeSessionInfoPopover()
+        return
+      }
+      // (4) clear search if focused
       const searchEl = document.getElementById('search-input') as HTMLInputElement | null
       if (searchEl && document.activeElement === searchEl) {
         searchEl.value = ''
@@ -2524,9 +2821,8 @@ function bindGlobalShortcuts(): void {
         searchEl.blur()
         return
       }
-      // (4) cancel active stream
-      const { activeThreadId } = store.get()
-      const streamState = getThreadStreamState(activeThreadId)
+      // (5) cancel active stream
+      const streamState = getActiveChatStreamState()
       if (streamState?.turnId) {
         void handleCancel()
       }
@@ -2546,8 +2842,12 @@ async function init(): Promise<void> {
   document.getElementById('thread-list')?.addEventListener('scroll', repositionThreadActionLayer, { passive: true })
   window.addEventListener('resize', repositionThreadActionLayer)
   document.addEventListener('click', e => {
-    if (!openThreadActionMenuId) return
     const target = e.target as HTMLElement | null
+    if (!target?.closest('.session-info')) {
+      closeSessionInfoPopover()
+    }
+
+    if (!openThreadActionMenuId) return
     if (target?.closest('.thread-item-menu-trigger') || target?.closest('.thread-action-popover')) return
     resetThreadActionMenuState()
     updateThreadList()
@@ -2559,11 +2859,13 @@ async function init(): Promise<void> {
     const threadChanged = activeThreadId !== lastRenderThreadId
     const chatScopeKey = threadChatScopeKey(activeThread)
     const chatScopeChanged = chatScopeKey !== lastRenderChatScopeKey
+    const chatScopeStreamState = getScopeStreamState(chatScopeKey)
+    const shouldRefreshForScopeChange = chatScopeChanged && (!chatScopeStreamState || !hasMountedActiveStream(chatScopeKey))
 
     updateThreadList()
     updateSessionPanel()
 
-    if (threadChanged || (chatScopeChanged && !getThreadStreamState(activeThreadId))) {
+    if (threadChanged || shouldRefreshForScopeChange) {
       lastRenderThreadId = activeThreadId
       lastRenderChatScopeKey = chatScopeKey
       updateChatArea()

@@ -34,7 +34,7 @@ go build ./...     # compile check
   - `cwd` must be an absolute path.
 - Codex provider runs in **embedded mode** (`github.com/beyond5959/acp-adapter/pkg/codexacp`). Do not add user-facing binary path flags.
 - Concurrency model:
-  - one active turn per thread at a time (`409 CONFLICT` on conflict).
+  - one active turn per `(thread, session)` scope at a time (`409 CONFLICT` on same-scope conflict).
   - cancel must take effect quickly.
   - permission workflow is **fail-closed** by default (timeout/disconnect → `declined`).
 - stdout and HTTP response bodies carry **protocol data only**.

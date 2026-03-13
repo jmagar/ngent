@@ -911,6 +911,78 @@ func TestThreadSessionHistoryEndpoint(t *testing.T) {
 	}
 }
 
+func TestThreadSessionHistoryEndpointUsesSQLiteCacheAcrossRestart(t *testing.T) {
+	root := t.TempDir()
+	dbPath := filepath.Join(t.TempDir(), "session-cache.db")
+
+	streamerOne := &sessionTranscriptStreamer{
+		result: agents.SessionTranscriptResult{
+			Messages: []agents.SessionTranscriptMessage{
+				{Role: "user", Content: "cached hello", Timestamp: "2026-03-13T03:00:00Z"},
+				{Role: "assistant", Content: "cached world", Timestamp: "2026-03-13T03:00:01Z"},
+			},
+		},
+	}
+	serverOne, closeOne := newTestServerWithDBPath(t, dbPath, testServerOptions{
+		allowedRoots: []string{root},
+		turnAgentFactory: func(thread storage.Thread) (agents.Streamer, error) {
+			_ = thread
+			return streamerOne, nil
+		},
+	})
+	threadID := createThreadForClient(t, serverOne, "client-a", root)
+
+	first := performJSONRequest(t, serverOne, http.MethodGet, "/v1/threads/"+threadID+"/session-history?sessionId=session-2", nil, map[string]string{
+		"X-Client-ID": "client-a",
+	})
+	if first.Code != http.StatusOK {
+		t.Fatalf("first session-history status code = %d, want %d", first.Code, http.StatusOK)
+	}
+	if got := streamerOne.LoadCalls(); got != 1 {
+		t.Fatalf("first server load calls = %d, want 1", got)
+	}
+	closeOne()
+
+	streamerTwo := &sessionTranscriptStreamer{
+		err: errors.New("provider should not be called after cache warmup"),
+	}
+	serverTwo, closeTwo := newTestServerWithDBPath(t, dbPath, testServerOptions{
+		allowedRoots: []string{root},
+		turnAgentFactory: func(thread storage.Thread) (agents.Streamer, error) {
+			_ = thread
+			return streamerTwo, nil
+		},
+	})
+	defer closeTwo()
+
+	second := performJSONRequest(t, serverTwo, http.MethodGet, "/v1/threads/"+threadID+"/session-history?sessionId=session-2", nil, map[string]string{
+		"X-Client-ID": "client-a",
+	})
+	if second.Code != http.StatusOK {
+		t.Fatalf("second session-history status code = %d, want %d, body=%s", second.Code, http.StatusOK, second.Body.String())
+	}
+	if got := streamerTwo.LoadCalls(); got != 0 {
+		t.Fatalf("second server load calls = %d, want 0", got)
+	}
+
+	var body struct {
+		Supported bool                              `json:"supported"`
+		Messages  []agents.SessionTranscriptMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(second.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal cached session-history response: %v", err)
+	}
+	if !body.Supported {
+		t.Fatal("supported = false, want true")
+	}
+	if got, want := len(body.Messages), 2; got != want {
+		t.Fatalf("len(messages) = %d, want %d", got, want)
+	}
+	if got := body.Messages[1].Content; got != "cached world" {
+		t.Fatalf("messages[1].content = %q, want %q", got, "cached world")
+	}
+}
+
 func TestThreadSessionHistoryEndpointUnsupported(t *testing.T) {
 	root := t.TempDir()
 	streamer := &sessionListStreamer{}
@@ -1017,6 +1089,98 @@ func TestTurnSessionBoundPersistsSessionIDAndSkipsContextInjection(t *testing.T)
 	}
 }
 
+func TestNewSessionResetSkipsContextInjection(t *testing.T) {
+	root := t.TempDir()
+	var factoryCalls atomic.Int32
+
+	h := newTestServer(t, testServerOptions{
+		allowedRoots: []string{root},
+		turnAgentFactory: func(thread storage.Thread) (agents.Streamer, error) {
+			_ = thread
+			sessionID := fmt.Sprintf("ses_bound_%d", factoryCalls.Add(1))
+			return &sessionBoundStreamer{sessionID: sessionID}, nil
+		},
+	})
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	threadID := createThreadHTTP(t, ts.URL, "client-a", root)
+
+	first := runTurnStreamRequest(t, ts.URL, "client-a", threadID, "hello one")
+	if first.StatusCode != http.StatusOK {
+		t.Fatalf("first turn status = %d, want %d", first.StatusCode, http.StatusOK)
+	}
+
+	resetStatus, resetBody := doJSON(
+		t,
+		http.MethodPatch,
+		ts.URL+"/v1/threads/"+threadID,
+		map[string]any{"agentOptions": map[string]any{}},
+		map[string]string{"X-Client-ID": "client-a"},
+	)
+	if resetStatus != http.StatusOK {
+		t.Fatalf("reset session status = %d, want %d, body=%s", resetStatus, http.StatusOK, resetBody)
+	}
+
+	var resetResp struct {
+		Thread struct {
+			AgentOptions map[string]any `json:"agentOptions"`
+		} `json:"thread"`
+	}
+	if err := json.Unmarshal([]byte(resetBody), &resetResp); err != nil {
+		t.Fatalf("unmarshal reset response: %v", err)
+	}
+	if got := len(resetResp.Thread.AgentOptions); got != 0 {
+		t.Fatalf("len(reset thread.agentOptions) = %d, want %d", got, 0)
+	}
+
+	second := runTurnStreamRequest(t, ts.URL, "client-a", threadID, "hello two")
+	if second.StatusCode != http.StatusOK {
+		t.Fatalf("second turn status = %d, want %d", second.StatusCode, http.StatusOK)
+	}
+
+	if got := factoryCalls.Load(); got != 2 {
+		t.Fatalf("turn agent factory calls = %d, want %d", got, 2)
+	}
+
+	history := getHistoryHTTP(t, ts.URL, "client-a", threadID, false)
+	if got, want := len(history.Turns), 2; got != want {
+		t.Fatalf("len(history.turns) = %d, want %d", got, want)
+	}
+
+	lastResp := history.Turns[len(history.Turns)-1].ResponseText
+	if got, want := lastResp, "hello two"; got != want {
+		t.Fatalf("second response = %q, want %q", got, want)
+	}
+	if strings.Contains(lastResp, "[Conversation Summary]") {
+		t.Fatalf("second response unexpectedly contains injected summary: %q", lastResp)
+	}
+	if strings.Contains(lastResp, "hello one") {
+		t.Fatalf("second response unexpectedly contains prior turn text: %q", lastResp)
+	}
+
+	threadStatus, threadBody := doJSON(t, http.MethodGet, ts.URL+"/v1/threads/"+threadID, nil, map[string]string{
+		"X-Client-ID": "client-a",
+	})
+	if threadStatus != http.StatusOK {
+		t.Fatalf("get thread status = %d, want %d, body=%s", threadStatus, http.StatusOK, threadBody)
+	}
+	var threadResp struct {
+		Thread struct {
+			AgentOptions map[string]any `json:"agentOptions"`
+		} `json:"thread"`
+	}
+	if err := json.Unmarshal([]byte(threadBody), &threadResp); err != nil {
+		t.Fatalf("unmarshal thread response: %v", err)
+	}
+	if got := fmt.Sprintf("%v", threadResp.Thread.AgentOptions["sessionId"]); got != "ses_bound_2" {
+		t.Fatalf("thread.agentOptions.sessionId = %q, want %q", got, "ses_bound_2")
+	}
+	if _, exists := threadResp.Thread.AgentOptions[threadAgentOptionFreshSessionKey]; exists {
+		t.Fatalf("thread response unexpectedly exposes %q", threadAgentOptionFreshSessionKey)
+	}
+}
+
 func TestThreadConfigOptionsGetAndSetModel(t *testing.T) {
 	root := t.TempDir()
 	streamer := newConfigOptionStreamer("gpt-5.3-codex", []agents.ConfigOptionValue{
@@ -1086,8 +1250,8 @@ func TestThreadConfigOptionsGetAndSetModel(t *testing.T) {
 	if got := streamer.SetConfigCalls(); got != 1 {
 		t.Fatalf("set config call count = %d, want %d", got, 1)
 	}
-	if got := streamer.CloseCount(); got != 0 {
-		t.Fatalf("provider close count = %d, want %d", got, 0)
+	if got := streamer.CloseCount(); got != 1 {
+		t.Fatalf("provider close count = %d, want %d", got, 1)
 	}
 
 	threadStatus, threadBody := doJSON(
@@ -1596,7 +1760,7 @@ func TestTurnCancel(t *testing.T) {
 	}
 }
 
-func TestTurnConflictSingleActiveTurnPerThread(t *testing.T) {
+func TestTurnConflictSingleActiveTurnPerSession(t *testing.T) {
 	root := t.TempDir()
 	h := newTestServer(t, testServerOptions{allowedRoots: []string{root}})
 	ts := httptest.NewServer(h)
@@ -1628,6 +1792,185 @@ func TestTurnConflictSingleActiveTurnPerThread(t *testing.T) {
 	streamResult := <-streamResultCh
 	if streamResult.StatusCode != http.StatusOK {
 		t.Fatalf("first turn status = %d, want %d", streamResult.StatusCode, http.StatusOK)
+	}
+}
+
+func TestTurnAllowsConcurrentSessionsOnSameThread(t *testing.T) {
+	root := t.TempDir()
+	releaseSessionA := make(chan struct{})
+	h := newTestServer(t, testServerOptions{
+		allowedRoots: []string{root},
+		turnAgentFactory: func(thread storage.Thread) (agents.Streamer, error) {
+			sessionID := threadSessionID(thread.AgentOptionsJSON)
+			return &sessionScopedStreamer{
+				sessionID: sessionID,
+				release:   releaseSessionA,
+				block:     sessionID == "ses-a",
+			}, nil
+		},
+	})
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	threadID := createThreadHTTP(t, ts.URL, "client-a", root)
+
+	updateStatus, updateBody := doJSON(
+		t,
+		http.MethodPatch,
+		ts.URL+"/v1/threads/"+threadID,
+		map[string]any{"agentOptions": map[string]any{"sessionId": "ses-a"}},
+		map[string]string{"X-Client-ID": "client-a"},
+	)
+	if updateStatus != http.StatusOK {
+		t.Fatalf("set session a status = %d, want %d, body=%s", updateStatus, http.StatusOK, updateBody)
+	}
+
+	streamResultCh := make(chan httpTurnStreamResult, 1)
+	go func() {
+		streamResultCh <- runTurnStreamRequest(t, ts.URL, "client-a", threadID, "from-session-a")
+	}()
+
+	turnID := waitForTurnID(t, ts.URL, "client-a", threadID, 4*time.Second)
+	if turnID == "" {
+		t.Fatalf("failed to observe running session-a turn before timeout")
+	}
+
+	switchStatus, switchBody := doJSON(
+		t,
+		http.MethodPatch,
+		ts.URL+"/v1/threads/"+threadID,
+		map[string]any{"agentOptions": map[string]any{"sessionId": "ses-b"}},
+		map[string]string{"X-Client-ID": "client-a"},
+	)
+	if switchStatus != http.StatusOK {
+		t.Fatalf("switch session status = %d, want %d, body=%s", switchStatus, http.StatusOK, switchBody)
+	}
+
+	secondResultCh := make(chan httpTurnStreamResult, 1)
+	go func() {
+		secondResultCh <- runTurnStreamRequest(t, ts.URL, "client-a", threadID, "from-session-b")
+	}()
+
+	select {
+	case secondResult := <-secondResultCh:
+		if secondResult.StatusCode != http.StatusOK {
+			t.Fatalf("second turn status = %d, want %d, body=%s", secondResult.StatusCode, http.StatusOK, secondResult.Body)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("second session turn did not complete while first session was active")
+	}
+
+	history := getHistoryHTTP(t, ts.URL, "client-a", threadID, false)
+	if got, want := len(history.Turns), 2; got != want {
+		t.Fatalf("len(history.turns) = %d, want %d", got, want)
+	}
+	if got, want := history.Turns[len(history.Turns)-1].ResponseText, "ses-b:from-session-b"; got != want {
+		t.Fatalf("second response = %q, want %q", got, want)
+	}
+
+	cancelStatus, cancelBody := postCancel(t, ts.URL, "client-a", turnID)
+	if cancelStatus != http.StatusOK {
+		t.Fatalf("cancel status = %d, want %d, body=%s", cancelStatus, http.StatusOK, cancelBody)
+	}
+
+	select {
+	case streamResult := <-streamResultCh:
+		if streamResult.StatusCode != http.StatusOK {
+			t.Fatalf("first turn status = %d, want %d", streamResult.StatusCode, http.StatusOK)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("first session turn did not stop after cancel")
+	}
+}
+
+func TestUpdateThreadClearingSessionDropsStaleUnboundProvider(t *testing.T) {
+	root := t.TempDir()
+	var freshFactoryCalls atomic.Int32
+	freshProvider := &closableSessionBoundStreamer{
+		prefix:    "fresh:",
+		sessionID: "ses-new",
+	}
+	server := newTestServer(t, testServerOptions{
+		allowedRoots: []string{root},
+		turnAgentFactory: func(thread storage.Thread) (agents.Streamer, error) {
+			freshFactoryCalls.Add(1)
+			return freshProvider, nil
+		},
+	})
+	ts := httptest.NewServer(server)
+	defer ts.Close()
+
+	threadID := createThreadHTTP(t, ts.URL, "client-a", root)
+
+	setSessionStatus, setSessionBody := doJSON(
+		t,
+		http.MethodPatch,
+		ts.URL+"/v1/threads/"+threadID,
+		map[string]any{"agentOptions": map[string]any{"sessionId": "ses-old"}},
+		map[string]string{"X-Client-ID": "client-a"},
+	)
+	if setSessionStatus != http.StatusOK {
+		t.Fatalf("set session status = %d, want %d, body=%s", setSessionStatus, http.StatusOK, setSessionBody)
+	}
+
+	staleProvider := &closableSessionBoundStreamer{
+		prefix:    "stale:",
+		sessionID: "ses-stale",
+	}
+	staleScopeKey := threadAgentScopeKeyFromOptions(threadID, "{}")
+	server.agentMu.Lock()
+	server.agentsByScope[staleScopeKey] = &managedAgent{
+		scopeKey: staleScopeKey,
+		threadID: threadID,
+		provider: staleProvider,
+		closer:   staleProvider,
+		lastUsed: time.Now().UTC(),
+	}
+	server.agentMu.Unlock()
+
+	resetSessionStatus, resetSessionBody := doJSON(
+		t,
+		http.MethodPatch,
+		ts.URL+"/v1/threads/"+threadID,
+		map[string]any{"agentOptions": map[string]any{}},
+		map[string]string{"X-Client-ID": "client-a"},
+	)
+	if resetSessionStatus != http.StatusOK {
+		t.Fatalf("reset session status = %d, want %d, body=%s", resetSessionStatus, http.StatusOK, resetSessionBody)
+	}
+	if got := staleProvider.CloseCount(); got != 1 {
+		t.Fatalf("stale provider close count = %d, want %d", got, 1)
+	}
+
+	streamResult := runTurnStreamRequest(t, ts.URL, "client-a", threadID, "hello after reset")
+	if streamResult.StatusCode != http.StatusOK {
+		t.Fatalf("turn stream status = %d, want %d, body=%s", streamResult.StatusCode, http.StatusOK, streamResult.Body)
+	}
+	if got := freshFactoryCalls.Load(); got != 1 {
+		t.Fatalf("fresh provider factory calls = %d, want %d", got, 1)
+	}
+
+	history := getHistoryHTTP(t, ts.URL, "client-a", threadID, false)
+	if got, want := history.Turns[len(history.Turns)-1].ResponseText, "fresh:hello after reset"; got != want {
+		t.Fatalf("response after reset = %q, want %q", got, want)
+	}
+
+	threadStatus, threadBody := doJSON(t, http.MethodGet, ts.URL+"/v1/threads/"+threadID, nil, map[string]string{
+		"X-Client-ID": "client-a",
+	})
+	if threadStatus != http.StatusOK {
+		t.Fatalf("get thread status = %d, want %d, body=%s", threadStatus, http.StatusOK, threadBody)
+	}
+	var threadResp struct {
+		Thread struct {
+			AgentOptions map[string]any `json:"agentOptions"`
+		} `json:"thread"`
+	}
+	if err := json.Unmarshal([]byte(threadBody), &threadResp); err != nil {
+		t.Fatalf("unmarshal thread response: %v", err)
+	}
+	if got := fmt.Sprintf("%v", threadResp.Thread.AgentOptions["sessionId"]); got != "ses-new" {
+		t.Fatalf("thread.agentOptions.sessionId = %q, want %q", got, "ses-new")
 	}
 }
 
@@ -2429,6 +2772,35 @@ func (s *countingClosableStreamer) CloseCount() int32 {
 	return s.closeCalls.Load()
 }
 
+type closableSessionBoundStreamer struct {
+	prefix     string
+	sessionID  string
+	closeCalls atomic.Int32
+}
+
+func (s *closableSessionBoundStreamer) Name() string {
+	return "closable-session-bound-streamer"
+}
+
+func (s *closableSessionBoundStreamer) Stream(ctx context.Context, input string, onDelta func(delta string) error) (agents.StopReason, error) {
+	if err := agents.NotifySessionBound(ctx, s.sessionID); err != nil {
+		return agents.StopReasonEndTurn, err
+	}
+	if err := onDelta(s.prefix + input); err != nil {
+		return agents.StopReasonEndTurn, err
+	}
+	return agents.StopReasonEndTurn, nil
+}
+
+func (s *closableSessionBoundStreamer) Close() error {
+	s.closeCalls.Add(1)
+	return nil
+}
+
+func (s *closableSessionBoundStreamer) CloseCount() int32 {
+	return s.closeCalls.Load()
+}
+
 type errorStreamer struct {
 	err error
 }
@@ -2556,9 +2928,35 @@ func (s *sessionBoundStreamer) Stream(ctx context.Context, input string, onDelta
 	return agents.StopReasonEndTurn, nil
 }
 
+type sessionScopedStreamer struct {
+	sessionID string
+	release   <-chan struct{}
+	block     bool
+}
+
+func (s *sessionScopedStreamer) Name() string {
+	return "session-scoped-streamer"
+}
+
+func (s *sessionScopedStreamer) Stream(ctx context.Context, input string, onDelta func(delta string) error) (agents.StopReason, error) {
+	if s.block {
+		select {
+		case <-ctx.Done():
+			return agents.StopReasonCancelled, ctx.Err()
+		case <-s.release:
+		}
+	}
+	if err := onDelta(strings.TrimSpace(s.sessionID) + ":" + input); err != nil {
+		return agents.StopReasonEndTurn, err
+	}
+	return agents.StopReasonEndTurn, nil
+}
+
 type sessionTranscriptStreamer struct {
 	result        agents.SessionTranscriptResult
 	lastSessionID atomic.Value
+	loadCalls     atomic.Int32
+	err           error
 }
 
 func (s *sessionTranscriptStreamer) Name() string {
@@ -2574,8 +2972,16 @@ func (s *sessionTranscriptStreamer) Stream(ctx context.Context, input string, on
 
 func (s *sessionTranscriptStreamer) LoadSessionTranscript(ctx context.Context, req agents.SessionTranscriptRequest) (agents.SessionTranscriptResult, error) {
 	_ = ctx
+	s.loadCalls.Add(1)
 	s.lastSessionID.Store(strings.TrimSpace(req.SessionID))
+	if s.err != nil {
+		return agents.SessionTranscriptResult{}, s.err
+	}
 	return agents.CloneSessionTranscriptResult(s.result), nil
+}
+
+func (s *sessionTranscriptStreamer) LoadCalls() int32 {
+	return s.loadCalls.Load()
 }
 
 func createThreadHTTP(t *testing.T, baseURL, clientID, root string) string {

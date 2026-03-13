@@ -3,63 +3,164 @@ package runtime
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"time"
 )
 
 var (
-	// ErrActiveTurnExists means another turn is currently running on the thread.
-	ErrActiveTurnExists = errors.New("runtime: active turn already exists for thread")
+	// ErrActiveTurnExists means another turn is currently running on the scope.
+	ErrActiveTurnExists = errors.New("runtime: active turn already exists for scope")
 	// ErrTurnNotActive means the turn is not tracked as active.
 	ErrTurnNotActive = errors.New("runtime: turn is not active")
 )
 
 type activeTurn struct {
-	threadID string
-	turnID   string
-	cancel   context.CancelFunc
+	threadID        string
+	sessionID       string
+	scopeKey        string
+	turnID          string
+	cancel          context.CancelFunc
+	threadExclusive bool
 }
 
 // TurnController manages active turn lifecycle and cancellation.
 type TurnController struct {
-	mu       sync.Mutex
-	cond     *sync.Cond
-	byThread map[string]activeTurn
-	byTurn   map[string]activeTurn
+	mu           sync.Mutex
+	cond         *sync.Cond
+	byScope      map[string]activeTurn
+	byTurn       map[string]activeTurn
+	threadActive map[string]int
+	threadGuards map[string]activeTurn
 }
 
 // NewTurnController constructs a new active-turn controller.
 func NewTurnController() *TurnController {
 	controller := &TurnController{
-		byThread: make(map[string]activeTurn),
-		byTurn:   make(map[string]activeTurn),
+		byScope:      make(map[string]activeTurn),
+		byTurn:       make(map[string]activeTurn),
+		threadActive: make(map[string]int),
+		threadGuards: make(map[string]activeTurn),
 	}
 	controller.cond = sync.NewCond(&controller.mu)
 	return controller
 }
 
-// Activate registers a running turn; one active turn is allowed per thread.
-func (c *TurnController) Activate(threadID, turnID string, cancel context.CancelFunc) error {
+func turnScopeKey(threadID, sessionID string) string {
+	return threadID + "\x00" + strings.TrimSpace(sessionID)
+}
+
+// Activate registers a running turn; one active turn is allowed per thread/session scope.
+func (c *TurnController) Activate(threadID, sessionID, turnID string, cancel context.CancelFunc) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if _, exists := c.byThread[threadID]; exists {
+	if _, exists := c.threadGuards[threadID]; exists {
+		return ErrActiveTurnExists
+	}
+	scopeKey := turnScopeKey(threadID, sessionID)
+	if _, exists := c.byScope[scopeKey]; exists {
 		return ErrActiveTurnExists
 	}
 
-	entry := activeTurn{threadID: threadID, turnID: turnID, cancel: cancel}
-	c.byThread[threadID] = entry
+	entry := activeTurn{
+		threadID:  threadID,
+		sessionID: strings.TrimSpace(sessionID),
+		scopeKey:  scopeKey,
+		turnID:    turnID,
+		cancel:    cancel,
+	}
+	c.byScope[scopeKey] = entry
+	c.byTurn[turnID] = entry
+	c.threadActive[threadID]++
+	return nil
+}
+
+// ActivateThreadExclusive blocks all scopes on the thread until ReleaseThreadExclusive.
+func (c *TurnController) ActivateThreadExclusive(threadID, turnID string, cancel context.CancelFunc) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if _, exists := c.threadGuards[threadID]; exists {
+		return ErrActiveTurnExists
+	}
+	if c.threadActive[threadID] > 0 {
+		return ErrActiveTurnExists
+	}
+
+	entry := activeTurn{
+		threadID:        threadID,
+		turnID:          turnID,
+		cancel:          cancel,
+		threadExclusive: true,
+	}
+	c.threadGuards[threadID] = entry
 	c.byTurn[turnID] = entry
 	return nil
 }
 
-// Release removes the running turn from controller maps.
-func (c *TurnController) Release(threadID, turnID string) {
+// BindTurnSession updates the active session scope for one running turn.
+func (c *TurnController) BindTurnSession(turnID, sessionID string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	entry, ok := c.byTurn[turnID]
 	if !ok {
+		return ErrTurnNotActive
+	}
+	if entry.threadExclusive {
+		return nil
+	}
+
+	nextScopeKey := turnScopeKey(entry.threadID, sessionID)
+	if nextScopeKey == entry.scopeKey {
+		return nil
+	}
+	if _, exists := c.byScope[nextScopeKey]; exists {
+		return ErrActiveTurnExists
+	}
+
+	delete(c.byScope, entry.scopeKey)
+	entry.sessionID = strings.TrimSpace(sessionID)
+	entry.scopeKey = nextScopeKey
+	c.byScope[nextScopeKey] = entry
+	c.byTurn[turnID] = entry
+	return nil
+}
+
+// Release removes the running turn from controller maps.
+func (c *TurnController) Release(threadID, sessionID, turnID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	entry, ok := c.byTurn[turnID]
+	if !ok || entry.threadExclusive {
+		return
+	}
+	if entry.threadID != threadID {
+		return
+	}
+	if entry.scopeKey != turnScopeKey(threadID, sessionID) {
+		return
+	}
+
+	delete(c.byTurn, turnID)
+	delete(c.byScope, entry.scopeKey)
+	if remaining := c.threadActive[threadID] - 1; remaining > 0 {
+		c.threadActive[threadID] = remaining
+	} else {
+		delete(c.threadActive, threadID)
+	}
+	c.cond.Broadcast()
+}
+
+// ReleaseThreadExclusive removes the thread-wide exclusive guard.
+func (c *TurnController) ReleaseThreadExclusive(threadID, turnID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	entry, ok := c.byTurn[turnID]
+	if !ok || !entry.threadExclusive {
 		return
 	}
 	if entry.threadID != threadID {
@@ -67,7 +168,7 @@ func (c *TurnController) Release(threadID, turnID string) {
 	}
 
 	delete(c.byTurn, turnID)
-	delete(c.byThread, threadID)
+	delete(c.threadGuards, threadID)
 	c.cond.Broadcast()
 }
 
@@ -90,7 +191,20 @@ func (c *TurnController) Cancel(turnID string) error {
 func (c *TurnController) IsThreadActive(threadID string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	_, ok := c.byThread[threadID]
+	if _, ok := c.threadGuards[threadID]; ok {
+		return true
+	}
+	return c.threadActive[threadID] > 0
+}
+
+// IsSessionActive reports whether one thread/session scope has an active turn.
+func (c *TurnController) IsSessionActive(threadID, sessionID string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.threadGuards[threadID]; ok {
+		return true
+	}
+	_, ok := c.byScope[turnScopeKey(threadID, sessionID)]
 	return ok
 }
 

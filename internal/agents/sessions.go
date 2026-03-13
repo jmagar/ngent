@@ -64,6 +64,44 @@ type SessionTranscriptLoader interface {
 	LoadSessionTranscript(ctx context.Context, req SessionTranscriptRequest) (SessionTranscriptResult, error)
 }
 
+// FindSessionByID pages one SessionLister until the requested session is found.
+func FindSessionByID(
+	ctx context.Context,
+	lister SessionLister,
+	cwd, sessionID string,
+) (SessionInfo, error) {
+	if lister == nil {
+		return SessionInfo{}, ErrSessionListUnsupported
+	}
+
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return SessionInfo{}, ErrSessionNotFound
+	}
+
+	cursor := ""
+	for {
+		result, err := lister.ListSessions(ctx, SessionListRequest{
+			CWD:    cwd,
+			Cursor: cursor,
+		})
+		if err != nil {
+			return SessionInfo{}, err
+		}
+		for _, session := range result.Sessions {
+			if strings.TrimSpace(session.SessionID) != sessionID {
+				continue
+			}
+			return CloneSessionInfo(session), nil
+		}
+		cursor = strings.TrimSpace(result.NextCursor)
+		if cursor == "" {
+			break
+		}
+	}
+	return SessionInfo{}, ErrSessionNotFound
+}
+
 // SessionBoundHandler receives the session ID bound to the active turn.
 type SessionBoundHandler func(ctx context.Context, sessionID string) error
 

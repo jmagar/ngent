@@ -45,6 +45,8 @@ type ThreadStore interface {
 	UpsertAgentConfigCatalog(ctx context.Context, params storage.UpsertAgentConfigCatalogParams) error
 	GetAgentConfigCatalog(ctx context.Context, agentID, modelID string) (storage.AgentConfigCatalog, error)
 	ListAgentConfigCatalogsByAgent(ctx context.Context, agentID string) ([]storage.AgentConfigCatalog, error)
+	GetSessionTranscriptCache(ctx context.Context, agentID, cwd, sessionID string) (storage.SessionTranscriptCache, error)
+	UpsertSessionTranscriptCache(ctx context.Context, params storage.UpsertSessionTranscriptCacheParams) error
 	ListThreadsByClient(ctx context.Context, clientID string) ([]storage.Thread, error)
 	CreateTurn(ctx context.Context, params storage.CreateTurnParams) (storage.Turn, error)
 	GetTurn(ctx context.Context, turnID string) (storage.Turn, error)
@@ -104,10 +106,10 @@ type Server struct {
 	permissions   map[string]*pendingPermission
 	permissionSeq uint64
 
-	agentMu        sync.Mutex
-	agentsByThread map[string]*managedAgent
-	janitorStop    chan struct{}
-	janitorDone    chan struct{}
+	agentMu       sync.Mutex
+	agentsByScope map[string]*managedAgent
+	janitorStop   chan struct{}
+	janitorDone   chan struct{}
 }
 
 const (
@@ -116,6 +118,8 @@ const (
 	defaultCompactMaxChars    = 4000
 	defaultAgentIdleTTL       = 5 * time.Minute
 	defaultPermissionTimeout  = 2 * time.Hour
+
+	threadAgentOptionFreshSessionKey = "_ngentFreshSession"
 )
 
 const (
@@ -216,7 +220,7 @@ func New(cfg Config) *Server {
 		permissionTimeout:  permissionTimeout,
 		frontendHandler:    cfg.FrontendHandler,
 		permissions:        make(map[string]*pendingPermission),
-		agentsByThread:     make(map[string]*managedAgent),
+		agentsByScope:      make(map[string]*managedAgent),
 		janitorStop:        make(chan struct{}),
 		janitorDone:        make(chan struct{}),
 	}
@@ -550,10 +554,6 @@ func (s *Server) handleUpdateThread(w http.ResponseWriter, r *http.Request, clie
 		writeError(w, http.StatusNotFound, codeNotFound, "thread not found", map[string]any{})
 		return
 	}
-	if s.turns.IsThreadActive(thread.ThreadID) {
-		writeError(w, http.StatusConflict, codeConflict, "thread has an active turn", map[string]any{"threadId": thread.ThreadID})
-		return
-	}
 
 	var req struct {
 		Title        *string          `json:"title"`
@@ -561,6 +561,45 @@ func (s *Server) handleUpdateThread(w http.ResponseWriter, r *http.Request, clie
 	}
 	if err := decodeJSONBody(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, codeInvalidArgument, "invalid JSON body", map[string]any{"reason": err.Error()})
+		return
+	}
+
+	agentOptionsJSON := ""
+	sessionOnlyUpdate := false
+	currentSessionID := threadSessionID(thread.AgentOptionsJSON)
+	currentFreshSession := threadFreshSessionRequested(thread.AgentOptionsJSON)
+	if req.AgentOptions != nil {
+		var err error
+		agentOptionsJSON, err = normalizeAgentOptions(*req.AgentOptions)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, codeInvalidArgument, "agentOptions must be a JSON object", map[string]any{"field": "agentOptions"})
+			return
+		}
+		sessionOnlyUpdate, err = isSessionOnlyAgentOptionsUpdate(thread.AgentOptionsJSON, agentOptionsJSON)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, codeInvalidArgument, "agentOptions must be a JSON object", map[string]any{"field": "agentOptions"})
+			return
+		}
+
+		nextSessionID := threadSessionID(agentOptionsJSON)
+		shouldRequestFreshSession := currentFreshSession
+		switch {
+		case nextSessionID != "":
+			shouldRequestFreshSession = false
+		case currentSessionID != "":
+			shouldRequestFreshSession = true
+		}
+
+		agentOptionsJSON, _, err = withThreadFreshSessionRequested(agentOptionsJSON, shouldRequestFreshSession)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, codeInvalidArgument, "agentOptions must be a JSON object", map[string]any{"field": "agentOptions"})
+			return
+		}
+	}
+
+	allowSessionSelectionWhileActive := req.Title == nil && req.AgentOptions != nil && sessionOnlyUpdate
+	if s.turns.IsThreadActive(thread.ThreadID) && !allowSessionSelectionWhileActive {
+		writeError(w, http.StatusConflict, codeConflict, "thread has an active turn", map[string]any{"threadId": thread.ThreadID})
 		return
 	}
 
@@ -577,12 +616,6 @@ func (s *Server) handleUpdateThread(w http.ResponseWriter, r *http.Request, clie
 	}
 
 	if req.AgentOptions != nil {
-		agentOptionsJSON, err := normalizeAgentOptions(*req.AgentOptions)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, codeInvalidArgument, "agentOptions must be a JSON object", map[string]any{"field": "agentOptions"})
-			return
-		}
-
 		if err := s.store.UpdateThreadAgentOptions(r.Context(), thread.ThreadID, agentOptionsJSON); err != nil {
 			if errors.Is(err, storage.ErrNotFound) {
 				writeError(w, http.StatusNotFound, codeNotFound, "thread not found", map[string]any{})
@@ -592,7 +625,16 @@ func (s *Server) handleUpdateThread(w http.ResponseWriter, r *http.Request, clie
 			return
 		}
 
-		s.closeThreadAgent(thread.ThreadID, "thread_updated")
+		nextSessionID := threadSessionID(agentOptionsJSON)
+		if sessionOnlyUpdate && currentSessionID != nextSessionID && nextSessionID == "" {
+			s.closeThreadAgentScope(thread.ThreadID, agentOptionsJSON, "thread_session_reset")
+			if plainAgentOptionsJSON, changed, err := withThreadFreshSessionRequested(agentOptionsJSON, false); err == nil && changed {
+				s.closeThreadAgentScope(thread.ThreadID, plainAgentOptionsJSON, "thread_session_reset")
+			}
+		}
+		if !sessionOnlyUpdate {
+			s.closeThreadAgents(thread.ThreadID, "thread_updated")
+		}
 	}
 
 	updatedThread, ok := s.getOwnedThread(r.Context(), clientID, thread.ThreadID)
@@ -623,7 +665,7 @@ func (s *Server) handleDeleteThread(w http.ResponseWriter, r *http.Request, clie
 	}
 
 	deleteGuardTurnID := "delete-" + newTurnID()
-	if err := s.turns.Activate(thread.ThreadID, deleteGuardTurnID, nil); err != nil {
+	if err := s.turns.ActivateThreadExclusive(thread.ThreadID, deleteGuardTurnID, nil); err != nil {
 		if errors.Is(err, runtime.ErrActiveTurnExists) {
 			writeError(w, http.StatusConflict, codeConflict, "thread has an active turn", map[string]any{"threadId": thread.ThreadID})
 			return
@@ -631,7 +673,7 @@ func (s *Server) handleDeleteThread(w http.ResponseWriter, r *http.Request, clie
 		writeError(w, http.StatusInternalServerError, codeInternal, "failed to lock thread for delete", map[string]any{"reason": err.Error()})
 		return
 	}
-	defer s.turns.Release(thread.ThreadID, deleteGuardTurnID)
+	defer s.turns.ReleaseThreadExclusive(thread.ThreadID, deleteGuardTurnID)
 
 	if err := s.store.DeleteThread(r.Context(), thread.ThreadID); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
@@ -642,7 +684,7 @@ func (s *Server) handleDeleteThread(w http.ResponseWriter, r *http.Request, clie
 		return
 	}
 
-	s.closeThreadAgent(thread.ThreadID, "thread_deleted")
+	s.closeThreadAgents(thread.ThreadID, "thread_deleted")
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"threadId": thread.ThreadID,
@@ -693,11 +735,15 @@ func (s *Server) handleCreateTurnStream(w http.ResponseWriter, r *http.Request, 
 	}
 
 	turnID := newTurnID()
+	turnSessionID := threadSessionID(thread.AgentOptionsJSON)
 	turnCtx, cancelTurn := context.WithCancel(r.Context())
 	persistCtx := context.WithoutCancel(r.Context())
-	if err := s.turns.Activate(thread.ThreadID, turnID, cancelTurn); err != nil {
+	if err := s.turns.Activate(thread.ThreadID, turnSessionID, turnID, cancelTurn); err != nil {
 		if errors.Is(err, runtime.ErrActiveTurnExists) {
-			writeError(w, http.StatusConflict, "CONFLICT", "thread already has an active turn", map[string]any{"threadId": thread.ThreadID})
+			writeError(w, http.StatusConflict, "CONFLICT", "session already has an active turn", map[string]any{
+				"threadId":  thread.ThreadID,
+				"sessionId": turnSessionID,
+			})
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "INTERNAL", "failed to activate turn", map[string]any{"reason": err.Error()})
@@ -705,7 +751,7 @@ func (s *Server) handleCreateTurnStream(w http.ResponseWriter, r *http.Request, 
 	}
 	defer func() {
 		cancelTurn()
-		s.turns.Release(thread.ThreadID, turnID)
+		s.turns.Release(thread.ThreadID, turnSessionID, turnID)
 	}()
 
 	if _, err := s.store.CreateTurn(r.Context(), storage.CreateTurnParams{
@@ -777,6 +823,18 @@ func (s *Server) handleCreateTurnStream(w http.ResponseWriter, r *http.Request, 
 		if sessionID == "" {
 			return nil
 		}
+		if err := s.turns.BindTurnSession(turnID, sessionID); err != nil {
+			if !errors.Is(err, runtime.ErrActiveTurnExists) {
+				s.logger.Warn("thread.session_bind_runtime_failed",
+					"threadId", thread.ThreadID,
+					"agent", thread.AgentID,
+					"turnId", turnID,
+					"reason", err.Error(),
+				)
+			}
+		} else {
+			turnSessionID = sessionID
+		}
 
 		nextAgentOptionsJSON, changed, err := withThreadSessionID(thread.AgentOptionsJSON, sessionID)
 		if err != nil {
@@ -793,6 +851,14 @@ func (s *Server) handleCreateTurnStream(w http.ResponseWriter, r *http.Request, 
 					"reason", err.Error(),
 				)
 			} else {
+				if err := s.rebindManagedAgentScope(thread.ThreadID, thread.AgentOptionsJSON, nextAgentOptionsJSON); err != nil {
+					s.logger.Warn("thread.session_bind_agent_scope_failed",
+						"threadId", thread.ThreadID,
+						"agent", thread.AgentID,
+						"turnId", turnID,
+						"reason", err.Error(),
+					)
+				}
 				thread.AgentOptionsJSON = nextAgentOptionsJSON
 			}
 		}
@@ -896,7 +962,7 @@ func (s *Server) handleCompactThread(w http.ResponseWriter, r *http.Request, cli
 	turnID := newTurnID()
 	turnCtx, cancelTurn := context.WithCancel(r.Context())
 	persistCtx := context.WithoutCancel(r.Context())
-	if err := s.turns.Activate(thread.ThreadID, turnID, cancelTurn); err != nil {
+	if err := s.turns.ActivateThreadExclusive(thread.ThreadID, turnID, cancelTurn); err != nil {
 		if errors.Is(err, runtime.ErrActiveTurnExists) {
 			writeError(w, http.StatusConflict, "CONFLICT", "thread already has an active turn", map[string]any{"threadId": thread.ThreadID})
 			return
@@ -906,7 +972,7 @@ func (s *Server) handleCompactThread(w http.ResponseWriter, r *http.Request, cli
 	}
 	defer func() {
 		cancelTurn()
-		s.turns.Release(thread.ThreadID, turnID)
+		s.turns.ReleaseThreadExclusive(thread.ThreadID, turnID)
 	}()
 
 	if _, err := s.store.CreateTurn(r.Context(), storage.CreateTurnParams{
@@ -1260,6 +1326,25 @@ func (s *Server) handleThreadSessionHistory(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	cachedResult, found, err := s.loadCachedSessionTranscript(r.Context(), thread, sessionID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, codeInternal, "failed to load session transcript cache", map[string]any{
+			"threadId":  thread.ThreadID,
+			"sessionId": sessionID,
+			"reason":    err.Error(),
+		})
+		return
+	}
+	if found {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"threadId":  thread.ThreadID,
+			"sessionId": sessionID,
+			"supported": true,
+			"messages":  cachedResult.Messages,
+		})
+		return
+	}
+
 	provider, err := s.turnAgentFactory(thread)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, codeUpstreamUnavailable, "failed to resolve agent provider", map[string]any{
@@ -1313,12 +1398,92 @@ func (s *Server) handleThreadSessionHistory(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	result = agents.CloneSessionTranscriptResult(result)
+	if err := s.persistSessionTranscriptCache(r.Context(), thread, sessionID, result); err != nil {
+		s.logger.Warn("session_history.cache_persist_failed",
+			"threadId", thread.ThreadID,
+			"agent", thread.AgentID,
+			"sessionId", sessionID,
+			"reason", err.Error(),
+		)
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"threadId":  thread.ThreadID,
 		"sessionId": sessionID,
 		"supported": true,
 		"messages":  result.Messages,
 	})
+}
+
+func (s *Server) loadCachedSessionTranscript(
+	ctx context.Context,
+	thread storage.Thread,
+	sessionID string,
+) (agents.SessionTranscriptResult, bool, error) {
+	cache, err := s.store.GetSessionTranscriptCache(ctx, thread.AgentID, thread.CWD, sessionID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return agents.SessionTranscriptResult{}, false, nil
+		}
+		return agents.SessionTranscriptResult{}, false, err
+	}
+
+	result, err := decodeSessionTranscriptCache(cache.MessagesJSON)
+	if err != nil {
+		s.logger.Warn("session_history.cache_decode_failed",
+			"threadId", thread.ThreadID,
+			"agent", thread.AgentID,
+			"sessionId", sessionID,
+			"reason", err.Error(),
+		)
+		return agents.SessionTranscriptResult{}, false, nil
+	}
+	return result, true, nil
+}
+
+func (s *Server) persistSessionTranscriptCache(
+	ctx context.Context,
+	thread storage.Thread,
+	sessionID string,
+	result agents.SessionTranscriptResult,
+) error {
+	messagesJSON, err := encodeSessionTranscriptCache(result)
+	if err != nil {
+		return err
+	}
+	return s.store.UpsertSessionTranscriptCache(ctx, storage.UpsertSessionTranscriptCacheParams{
+		AgentID:      thread.AgentID,
+		CWD:          thread.CWD,
+		SessionID:    sessionID,
+		MessagesJSON: messagesJSON,
+	})
+}
+
+func decodeSessionTranscriptCache(raw string) (agents.SessionTranscriptResult, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		raw = "[]"
+	}
+
+	var messages []agents.SessionTranscriptMessage
+	if err := json.Unmarshal([]byte(raw), &messages); err != nil {
+		return agents.SessionTranscriptResult{}, fmt.Errorf("decode session transcript cache: %w", err)
+	}
+	return agents.CloneSessionTranscriptResult(agents.SessionTranscriptResult{Messages: messages}), nil
+}
+
+func encodeSessionTranscriptCache(result agents.SessionTranscriptResult) (string, error) {
+	result = agents.CloneSessionTranscriptResult(result)
+	messages := result.Messages
+	if len(messages) == 0 {
+		messages = []agents.SessionTranscriptMessage{}
+	}
+	payload, err := json.Marshal(messages)
+	if err != nil {
+		return "", fmt.Errorf("encode session transcript cache: %w", err)
+	}
+	return string(payload), nil
 }
 
 func (s *Server) handleThreadConfigOptions(w http.ResponseWriter, r *http.Request, clientID, threadID string) {
@@ -1445,6 +1610,7 @@ func (s *Server) handleThreadConfigOptions(w http.ResponseWriter, r *http.Reques
 				"reason", persistErr.Error(),
 			)
 		}
+		s.closeThreadAgents(thread.ThreadID, "thread_config_updated")
 
 		writeJSON(w, http.StatusOK, map[string]any{
 			"threadId":      thread.ThreadID,
@@ -1463,9 +1629,27 @@ func (s *Server) finalizeTurnWithBestEffort(ctx context.Context, turnID, status,
 	})
 }
 
+func normalizeThreadAgentOptionsForScope(agentOptionsJSON string) string {
+	normalized, err := normalizeAgentOptions(json.RawMessage(agentOptionsJSON))
+	if err != nil {
+		return strings.TrimSpace(agentOptionsJSON)
+	}
+	return normalized
+}
+
+func threadAgentScopeKey(thread storage.Thread) string {
+	return threadAgentScopeKeyFromOptions(thread.ThreadID, thread.AgentOptionsJSON)
+}
+
+func threadAgentScopeKeyFromOptions(threadID, agentOptionsJSON string) string {
+	return threadID + "\x00" + normalizeThreadAgentOptionsForScope(agentOptionsJSON)
+}
+
 func (s *Server) resolveTurnAgent(thread storage.Thread) (agents.Streamer, error) {
+	scopeKey := threadAgentScopeKey(thread)
+	sessionID := threadSessionID(thread.AgentOptionsJSON)
 	s.agentMu.Lock()
-	entry, ok := s.agentsByThread[thread.ThreadID]
+	entry, ok := s.agentsByScope[scopeKey]
 	if ok {
 		entry.lastUsed = time.Now().UTC()
 		provider := entry.provider
@@ -1491,7 +1675,7 @@ func (s *Server) resolveTurnAgent(thread storage.Thread) (agents.Streamer, error
 	}
 
 	s.agentMu.Lock()
-	if existing, exists := s.agentsByThread[thread.ThreadID]; exists {
+	if existing, exists := s.agentsByScope[scopeKey]; exists {
 		existing.lastUsed = time.Now().UTC()
 		s.agentMu.Unlock()
 		if closer != nil {
@@ -1499,11 +1683,13 @@ func (s *Server) resolveTurnAgent(thread storage.Thread) (agents.Streamer, error
 		}
 		return existing.provider, nil
 	}
-	s.agentsByThread[thread.ThreadID] = &managedAgent{
-		threadID: thread.ThreadID,
-		provider: provider,
-		closer:   closer,
-		lastUsed: time.Now().UTC(),
+	s.agentsByScope[scopeKey] = &managedAgent{
+		scopeKey:  scopeKey,
+		threadID:  thread.ThreadID,
+		sessionID: sessionID,
+		provider:  provider,
+		closer:    closer,
+		lastUsed:  time.Now().UTC(),
 	}
 	s.agentMu.Unlock()
 	return provider, nil
@@ -1557,28 +1743,32 @@ func (s *Server) reapIdleAgents(now time.Time) {
 	}
 
 	type reclaimItem struct {
-		threadID string
-		name     string
-		idleFor  time.Duration
-		closer   io.Closer
+		threadID  string
+		scopeKey  string
+		sessionID string
+		name      string
+		idleFor   time.Duration
+		closer    io.Closer
 	}
 	items := make([]reclaimItem, 0)
 
 	s.agentMu.Lock()
-	for threadID, entry := range s.agentsByThread {
-		if s.turns.IsThreadActive(threadID) {
+	for scopeKey, entry := range s.agentsByScope {
+		if s.turns.IsSessionActive(entry.threadID, entry.sessionID) {
 			continue
 		}
 		idleFor := now.Sub(entry.lastUsed)
 		if idleFor < s.agentIdleTTL {
 			continue
 		}
-		delete(s.agentsByThread, threadID)
+		delete(s.agentsByScope, scopeKey)
 		items = append(items, reclaimItem{
-			threadID: threadID,
-			name:     entry.provider.Name(),
-			idleFor:  idleFor,
-			closer:   entry.closer,
+			threadID:  entry.threadID,
+			scopeKey:  scopeKey,
+			sessionID: entry.sessionID,
+			name:      entry.provider.Name(),
+			idleFor:   idleFor,
+			closer:    entry.closer,
 		})
 	}
 	s.agentMu.Unlock()
@@ -1589,6 +1779,7 @@ func (s *Server) reapIdleAgents(now time.Time) {
 		}
 		s.logger.Info("agent.idle_reclaimed",
 			"threadId", item.threadID,
+			"sessionId", item.sessionID,
 			"agentName", item.name,
 			"idleFor", item.idleFor.String(),
 		)
@@ -1597,20 +1788,22 @@ func (s *Server) reapIdleAgents(now time.Time) {
 
 func (s *Server) closeAllThreadAgents() error {
 	type closeItem struct {
-		threadID string
-		name     string
-		closer   io.Closer
+		threadID  string
+		sessionID string
+		name      string
+		closer    io.Closer
 	}
 
 	items := make([]closeItem, 0)
 	s.agentMu.Lock()
-	for threadID, entry := range s.agentsByThread {
+	for scopeKey, entry := range s.agentsByScope {
 		items = append(items, closeItem{
-			threadID: threadID,
-			name:     entry.provider.Name(),
-			closer:   entry.closer,
+			threadID:  entry.threadID,
+			sessionID: entry.sessionID,
+			name:      entry.provider.Name(),
+			closer:    entry.closer,
 		})
-		delete(s.agentsByThread, threadID)
+		delete(s.agentsByScope, scopeKey)
 	}
 	s.agentMu.Unlock()
 
@@ -1620,6 +1813,7 @@ func (s *Server) closeAllThreadAgents() error {
 		}
 		s.logger.Info("agent.closed",
 			"threadId", item.threadID,
+			"sessionId", item.sessionID,
 			"agentName", item.name,
 			"reason", "server_close",
 		)
@@ -1627,33 +1821,113 @@ func (s *Server) closeAllThreadAgents() error {
 	return nil
 }
 
-func (s *Server) closeThreadAgent(threadID, reason string) {
+func (s *Server) closeThreadAgents(threadID, reason string) {
 	if strings.TrimSpace(threadID) == "" {
 		return
 	}
 
+	type closeItem struct {
+		sessionID string
+		name      string
+		closer    io.Closer
+	}
+
+	items := make([]closeItem, 0)
 	s.agentMu.Lock()
-	entry, ok := s.agentsByThread[threadID]
-	if ok {
-		delete(s.agentsByThread, threadID)
+	for scopeKey, entry := range s.agentsByScope {
+		if entry.threadID != threadID {
+			continue
+		}
+		items = append(items, closeItem{
+			sessionID: entry.sessionID,
+			name:      entry.provider.Name(),
+			closer:    entry.closer,
+		})
+		delete(s.agentsByScope, scopeKey)
 	}
 	s.agentMu.Unlock()
 
-	if !ok {
+	for _, item := range items {
+		if item.closer != nil {
+			_ = item.closer.Close()
+		}
+		s.logger.Info("agent.closed",
+			"threadId", threadID,
+			"sessionId", item.sessionID,
+			"agentName", item.name,
+			"reason", reason,
+		)
+	}
+}
+
+func (s *Server) closeThreadAgentScope(threadID, agentOptionsJSON, reason string) {
+	threadID = strings.TrimSpace(threadID)
+	if threadID == "" {
 		return
 	}
-	if entry.closer != nil {
-		_ = entry.closer.Close()
+
+	sessionID := threadSessionID(agentOptionsJSON)
+	if s.turns.IsSessionActive(threadID, sessionID) {
+		return
+	}
+
+	scopeKey := threadAgentScopeKeyFromOptions(threadID, agentOptionsJSON)
+
+	var item *managedAgent
+	s.agentMu.Lock()
+	entry, ok := s.agentsByScope[scopeKey]
+	if ok {
+		delete(s.agentsByScope, scopeKey)
+		item = entry
+	}
+	s.agentMu.Unlock()
+	if item == nil {
+		return
+	}
+
+	if item.closer != nil {
+		_ = item.closer.Close()
 	}
 	s.logger.Info("agent.closed",
-		"threadId", threadID,
-		"agentName", entry.provider.Name(),
+		"threadId", item.threadID,
+		"sessionId", item.sessionID,
+		"agentName", item.provider.Name(),
 		"reason", reason,
 	)
 }
 
+func (s *Server) rebindManagedAgentScope(threadID, fromAgentOptionsJSON, toAgentOptionsJSON string) error {
+	threadID = strings.TrimSpace(threadID)
+	if threadID == "" {
+		return nil
+	}
+	fromScopeKey := threadAgentScopeKeyFromOptions(threadID, fromAgentOptionsJSON)
+	toScopeKey := threadAgentScopeKeyFromOptions(threadID, toAgentOptionsJSON)
+	if fromScopeKey == toScopeKey {
+		return nil
+	}
+
+	s.agentMu.Lock()
+	defer s.agentMu.Unlock()
+
+	entry, ok := s.agentsByScope[fromScopeKey]
+	if !ok {
+		return nil
+	}
+	if _, exists := s.agentsByScope[toScopeKey]; exists {
+		return nil
+	}
+
+	delete(s.agentsByScope, fromScopeKey)
+	entry.scopeKey = toScopeKey
+	entry.sessionID = threadSessionID(toAgentOptionsJSON)
+	entry.lastUsed = time.Now().UTC()
+	s.agentsByScope[toScopeKey] = entry
+	return nil
+}
+
 func (s *Server) buildInjectedPrompt(ctx context.Context, thread storage.Thread, input string) (string, error) {
-	if threadSessionID(thread.AgentOptionsJSON) != "" {
+	if threadSessionID(thread.AgentOptionsJSON) != "" || threadFreshSessionRequested(thread.AgentOptionsJSON) {
 		return strings.TrimSpace(input), nil
 	}
 
@@ -1882,10 +2156,12 @@ type pendingPermission struct {
 }
 
 type managedAgent struct {
-	threadID string
-	provider agents.Streamer
-	closer   io.Closer
-	lastUsed time.Time
+	scopeKey  string
+	threadID  string
+	sessionID string
+	provider  agents.Streamer
+	closer    io.Closer
+	lastUsed  time.Time
 }
 
 func newPendingPermission(clientID string) *pendingPermission {
@@ -1906,11 +2182,8 @@ func (p *pendingPermission) Resolve(outcome agents.PermissionOutcome) bool {
 }
 
 func toThreadResponse(thread storage.Thread) (threadResponse, error) {
-	raw := json.RawMessage(thread.AgentOptionsJSON)
-	if len(strings.TrimSpace(thread.AgentOptionsJSON)) == 0 {
-		raw = json.RawMessage(`{}`)
-	}
-	if !json.Valid(raw) {
+	raw, err := sanitizeThreadAgentOptionsForResponse(thread.AgentOptionsJSON)
+	if err != nil {
 		return threadResponse{}, fmt.Errorf("invalid agent_options_json for thread %s", thread.ThreadID)
 	}
 
@@ -2317,9 +2590,52 @@ func threadSessionID(agentOptionsJSON string) string {
 	return strings.TrimSpace(raw.SessionID)
 }
 
+func threadFreshSessionRequested(agentOptionsJSON string) bool {
+	var raw struct {
+		FreshSession bool `json:"_ngentFreshSession"`
+	}
+	if strings.TrimSpace(agentOptionsJSON) == "" {
+		return false
+	}
+	if err := json.Unmarshal([]byte(agentOptionsJSON), &raw); err != nil {
+		return false
+	}
+	return raw.FreshSession
+}
+
+func withoutThreadSessionID(agentOptionsJSON string) (string, error) {
+	objectValue := map[string]any{}
+	trimmed := strings.TrimSpace(agentOptionsJSON)
+	if trimmed != "" {
+		if err := json.Unmarshal([]byte(trimmed), &objectValue); err != nil {
+			return "", err
+		}
+	}
+
+	delete(objectValue, "sessionId")
+	delete(objectValue, threadAgentOptionFreshSessionKey)
+	normalized, err := json.Marshal(objectValue)
+	if err != nil {
+		return "", err
+	}
+	return string(normalized), nil
+}
+
+func isSessionOnlyAgentOptionsUpdate(currentAgentOptionsJSON, nextAgentOptionsJSON string) (bool, error) {
+	currentWithoutSessionID, err := withoutThreadSessionID(currentAgentOptionsJSON)
+	if err != nil {
+		return false, err
+	}
+	nextWithoutSessionID, err := withoutThreadSessionID(nextAgentOptionsJSON)
+	if err != nil {
+		return false, err
+	}
+	return currentWithoutSessionID == nextWithoutSessionID, nil
+}
+
 func withThreadSessionID(agentOptionsJSON, sessionID string) (string, bool, error) {
 	sessionID = strings.TrimSpace(sessionID)
-	currentSessionID := threadSessionID(agentOptionsJSON)
+	previousNormalized := normalizeThreadAgentOptionsForScope(agentOptionsJSON)
 
 	objectValue := map[string]any{}
 	trimmed := strings.TrimSpace(agentOptionsJSON)
@@ -2333,13 +2649,57 @@ func withThreadSessionID(agentOptionsJSON, sessionID string) (string, bool, erro
 		delete(objectValue, "sessionId")
 	} else {
 		objectValue["sessionId"] = sessionID
+		delete(objectValue, threadAgentOptionFreshSessionKey)
 	}
 
 	normalized, err := json.Marshal(objectValue)
 	if err != nil {
 		return "", false, err
 	}
-	return string(normalized), sessionID != currentSessionID, nil
+	nextNormalized := string(normalized)
+	return nextNormalized, previousNormalized != nextNormalized, nil
+}
+
+func withThreadFreshSessionRequested(agentOptionsJSON string, fresh bool) (string, bool, error) {
+	previousNormalized := normalizeThreadAgentOptionsForScope(agentOptionsJSON)
+
+	objectValue := map[string]any{}
+	trimmed := strings.TrimSpace(agentOptionsJSON)
+	if trimmed != "" {
+		if err := json.Unmarshal([]byte(trimmed), &objectValue); err != nil {
+			return "", false, err
+		}
+	}
+
+	if fresh {
+		objectValue[threadAgentOptionFreshSessionKey] = true
+	} else {
+		delete(objectValue, threadAgentOptionFreshSessionKey)
+	}
+
+	normalized, err := json.Marshal(objectValue)
+	if err != nil {
+		return "", false, err
+	}
+	nextNormalized := string(normalized)
+	return nextNormalized, previousNormalized != nextNormalized, nil
+}
+
+func sanitizeThreadAgentOptionsForResponse(agentOptionsJSON string) (json.RawMessage, error) {
+	objectValue := map[string]any{}
+	trimmed := strings.TrimSpace(agentOptionsJSON)
+	if trimmed != "" {
+		if err := json.Unmarshal([]byte(trimmed), &objectValue); err != nil {
+			return nil, err
+		}
+	}
+
+	delete(objectValue, threadAgentOptionFreshSessionKey)
+	normalized, err := json.Marshal(objectValue)
+	if err != nil {
+		return nil, err
+	}
+	return json.RawMessage(normalized), nil
 }
 
 func applyThreadConfigSelections(

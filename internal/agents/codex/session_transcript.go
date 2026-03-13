@@ -1,24 +1,19 @@
 package codex
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"os"
-	"path/filepath"
 	"strings"
 
+	"github.com/beyond5959/acp-adapter/pkg/codexacp"
 	"github.com/beyond5959/ngent/internal/agents"
+	"github.com/beyond5959/ngent/internal/observability"
 )
-
-const sessionTranscriptScannerMaxToken = 16 * 1024 * 1024
 
 var _ agents.SessionTranscriptLoader = (*Client)(nil)
 
-// LoadSessionTranscript returns replayable user/assistant messages for one Codex session.
+// LoadSessionTranscript replays one Codex session through ACP session/load.
 func (c *Client) LoadSessionTranscript(
 	ctx context.Context,
 	req agents.SessionTranscriptRequest,
@@ -30,20 +25,58 @@ func (c *Client) LoadSessionTranscript(
 		ctx = context.Background()
 	}
 
-	sessionID := strings.TrimSpace(req.SessionID)
-	if sessionID == "" {
-		return agents.SessionTranscriptResult{}, errors.New("codex: sessionID is required")
+	startCtx, cancel := context.WithTimeout(ctx, c.startTimeout)
+	defer cancel()
+
+	runtime, caps, err := c.startRuntime(startCtx)
+	if err != nil {
+		return agents.SessionTranscriptResult{}, err
+	}
+	defer runtime.Close()
+
+	if !caps.CanLoad {
+		return agents.SessionTranscriptResult{}, agents.ErrSessionLoadUnsupported
 	}
 
-	session, err := c.findSession(ctx, req.CWD, sessionID)
+	session, err := c.findSessionInRuntime(startCtx, runtime, req.CWD, req.SessionID)
 	if err != nil {
 		return agents.SessionTranscriptResult{}, err
 	}
-	path, err := sessionTranscriptPath(session)
-	if err != nil {
-		return agents.SessionTranscriptResult{}, err
+
+	loadSessionID := strings.TrimSpace(codexLoadSessionID(session))
+	if loadSessionID == "" {
+		return agents.SessionTranscriptResult{}, agents.ErrSessionNotFound
 	}
-	return loadSessionTranscriptFile(path)
+
+	return c.collectSessionReplay(ctx, runtime, loadSessionID)
+}
+
+func (c *Client) findSessionInRuntime(
+	ctx context.Context,
+	runtime *codexacp.EmbeddedRuntime,
+	cwd, sessionID string,
+) (agents.SessionInfo, error) {
+	cursor := ""
+	for {
+		result, err := c.listSessionsRaw(ctx, runtime, agents.SessionListRequest{
+			CWD:    cwd,
+			Cursor: cursor,
+		})
+		if err != nil {
+			return agents.SessionInfo{}, err
+		}
+		for _, session := range result.Sessions {
+			normalized := normalizeCodexSessionInfo(session)
+			if codexSessionMatchesID(normalized, sessionID) {
+				return normalized, nil
+			}
+		}
+		cursor = strings.TrimSpace(result.NextCursor)
+		if cursor == "" {
+			break
+		}
+	}
+	return agents.SessionInfo{}, agents.ErrSessionNotFound
 }
 
 func (c *Client) findSession(
@@ -72,196 +105,88 @@ func (c *Client) findSession(
 	return agents.SessionInfo{}, agents.ErrSessionNotFound
 }
 
-func sessionTranscriptPath(session agents.SessionInfo) (string, error) {
-	if len(session.Meta) == 0 {
-		return "", fmt.Errorf("codex: session %q transcript path missing", session.SessionID)
+func (c *Client) collectSessionReplay(
+	ctx context.Context,
+	runtime *codexacp.EmbeddedRuntime,
+	sessionID string,
+) (agents.SessionTranscriptResult, error) {
+	if runtime == nil {
+		return agents.SessionTranscriptResult{}, errors.New("codex: embedded runtime is nil")
 	}
-	pathValue, _ := session.Meta["path"].(string)
-	path := strings.TrimSpace(pathValue)
-	if path == "" {
-		return "", fmt.Errorf("codex: session %q transcript path missing", session.SessionID)
+
+	collector := agents.NewACPTranscriptCollector()
+	updates, unsubscribe := runtime.SubscribeUpdates(256)
+	defer unsubscribe()
+
+	type loadResult struct {
+		err error
 	}
-	if !filepath.IsAbs(path) {
-		return "", fmt.Errorf("codex: session %q transcript path is not absolute", session.SessionID)
-	}
-	return filepath.Clean(path), nil
-}
-
-func loadSessionTranscriptFile(path string) (agents.SessionTranscriptResult, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return agents.SessionTranscriptResult{}, agents.ErrSessionNotFound
-		}
-		return agents.SessionTranscriptResult{}, fmt.Errorf("codex: open session transcript: %w", err)
-	}
-	defer file.Close()
-
-	messages, err := parseSessionTranscript(file)
-	if err != nil {
-		return agents.SessionTranscriptResult{}, err
-	}
-	return agents.CloneSessionTranscriptResult(agents.SessionTranscriptResult{
-		Messages: messages,
-	}), nil
-}
-
-func parseSessionTranscript(reader io.Reader) ([]agents.SessionTranscriptMessage, error) {
-	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 0, 64*1024), sessionTranscriptScannerMaxToken)
-
-	messages := make([]agents.SessionTranscriptMessage, 0)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-
-		var item struct {
-			Timestamp string          `json:"timestamp"`
-			Type      string          `json:"type"`
-			Payload   json.RawMessage `json:"payload"`
-		}
-		if err := json.Unmarshal([]byte(line), &item); err != nil {
-			return nil, fmt.Errorf("codex: decode session transcript line: %w", err)
-		}
-		if item.Type != "response_item" {
-			continue
-		}
-
-		message, ok, err := parseSessionTranscriptMessage(item.Timestamp, item.Payload)
+	loadDone := make(chan loadResult, 1)
+	go func() {
+		_, err := c.clientRequest(ctx, runtime, "session/load", map[string]any{
+			"sessionId":  sessionID,
+			"cwd":        c.Dir(),
+			"mcpServers": []any{},
+		})
 		if err != nil {
-			return nil, err
+			loadDone <- loadResult{err: fmt.Errorf("codex: session/load failed: %w", err)}
+			return
 		}
-		if ok {
-			messages = append(messages, message)
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("codex: scan session transcript: %w", err)
-	}
-	return messages, nil
-}
+		loadDone <- loadResult{}
+	}()
 
-func parseSessionTranscriptMessage(
-	timestamp string,
-	payload json.RawMessage,
-) (agents.SessionTranscriptMessage, bool, error) {
-	var item struct {
-		Type    string `json:"type"`
-		Role    string `json:"role"`
-		Phase   string `json:"phase"`
-		Content []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		} `json:"content"`
-	}
-	if err := json.Unmarshal(payload, &item); err != nil {
-		return agents.SessionTranscriptMessage{}, false, fmt.Errorf("codex: decode transcript message: %w", err)
-	}
-	if item.Type != "message" {
-		return agents.SessionTranscriptMessage{}, false, nil
-	}
-
-	role := strings.TrimSpace(strings.ToLower(item.Role))
-	if role != "user" && role != "assistant" {
-		return agents.SessionTranscriptMessage{}, false, nil
-	}
-	if role == "assistant" {
-		phase := strings.TrimSpace(strings.ToLower(item.Phase))
-		if phase != "" && phase != "final_answer" {
-			return agents.SessionTranscriptMessage{}, false, nil
+	for {
+		select {
+		case <-ctx.Done():
+			return agents.SessionTranscriptResult{}, ctx.Err()
+		case result := <-loadDone:
+			if result.err != nil {
+				return agents.SessionTranscriptResult{}, result.err
+			}
+			if err := drainCodexReplayUpdates(collector, updates); err != nil {
+				return agents.SessionTranscriptResult{}, err
+			}
+			return collector.Result(), nil
+		case msg, ok := <-updates:
+			if !ok {
+				if ctx.Err() != nil {
+					return agents.SessionTranscriptResult{}, ctx.Err()
+				}
+				return agents.SessionTranscriptResult{}, errors.New("codex: embedded updates channel closed")
+			}
+			if err := consumeCodexReplayUpdate(collector, msg); err != nil {
+				return agents.SessionTranscriptResult{}, err
+			}
 		}
 	}
+}
 
-	var body strings.Builder
-	for _, part := range item.Content {
-		if strings.TrimSpace(part.Text) == "" {
-			continue
+func drainCodexReplayUpdates(
+	collector *agents.ACPTranscriptCollector,
+	updates <-chan codexacp.RPCMessage,
+) error {
+	for {
+		select {
+		case msg, ok := <-updates:
+			if !ok {
+				return nil
+			}
+			if err := consumeCodexReplayUpdate(collector, msg); err != nil {
+				return err
+			}
+		default:
+			return nil
 		}
-		body.WriteString(part.Text)
 	}
-	content, ok := normalizeCodexTranscriptContent(role, body.String())
-	if !ok {
-		return agents.SessionTranscriptMessage{}, false, nil
-	}
-
-	return agents.SessionTranscriptMessage{
-		Role:      role,
-		Content:   content,
-		Timestamp: strings.TrimSpace(timestamp),
-	}, true, nil
 }
 
-func normalizeCodexTranscriptContent(role, content string) (string, bool) {
-	content = strings.TrimSpace(content)
-	if content == "" {
-		return "", false
+func consumeCodexReplayUpdate(
+	collector *agents.ACPTranscriptCollector,
+	msg codexacp.RPCMessage,
+) error {
+	observability.LogACPMessage("codex-embedded", "inbound", msg)
+	if msg.Method != methodSessionUpdate || len(msg.Params) == 0 {
+		return nil
 	}
-	if role != "user" {
-		return content, true
-	}
-	return normalizeCodexTranscriptUserContent(content)
-}
-
-func normalizeCodexTranscriptUserContent(content string) (string, bool) {
-	content = normalizeTranscriptNewlines(content)
-
-	if normalized := codexExtractIDERequest(content); normalized != "" {
-		return normalized, true
-	}
-	if normalized := codexExtractCurrentUserInput(content); normalized != "" {
-		return normalized, true
-	}
-	if codexIsBootstrapUserContent(content) {
-		return "", false
-	}
-	content = strings.TrimSpace(content)
-	if content == "" {
-		return "", false
-	}
-	return content, true
-}
-
-func normalizeTranscriptNewlines(content string) string {
-	content = strings.ReplaceAll(content, "\r\n", "\n")
-	content = strings.ReplaceAll(content, "\r", "\n")
-	return strings.TrimSpace(content)
-}
-
-func codexExtractIDERequest(content string) string {
-	if !strings.HasPrefix(content, "# Context from my IDE setup:") {
-		return ""
-	}
-	return extractCodexTranscriptSuffix(content, "## My request for Codex:")
-}
-
-func codexExtractCurrentUserInput(content string) string {
-	if !strings.HasPrefix(content, "[Conversation Summary]") {
-		return ""
-	}
-	return extractCodexTranscriptSuffix(content, "[Current User Input]")
-}
-
-func extractCodexTranscriptSuffix(content, marker string) string {
-	index := strings.LastIndex(content, marker)
-	if index < 0 {
-		return ""
-	}
-	content = strings.TrimSpace(content[index+len(marker):])
-	if content == "" {
-		return ""
-	}
-	return content
-}
-
-func codexIsBootstrapUserContent(content string) bool {
-	if strings.HasPrefix(content, "# AGENTS.md instructions for ") {
-		return true
-	}
-	if strings.HasPrefix(content, "<environment_context>") {
-		return true
-	}
-	return strings.Contains(content, "\n<environment_context>") &&
-		strings.Contains(content, "# AGENTS.md instructions for ")
+	return collector.HandleRawUpdate(msg.Params)
 }

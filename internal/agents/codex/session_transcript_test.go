@@ -2,99 +2,67 @@ package codex
 
 import (
 	"encoding/json"
-	"strings"
 	"testing"
+
+	"github.com/beyond5959/acp-adapter/pkg/codexacp"
+	"github.com/beyond5959/ngent/internal/agents"
 )
 
-func TestParseSessionTranscriptMessage(t *testing.T) {
+func TestConsumeCodexReplayUpdate(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
-		name    string
-		payload string
-		want    string
-		wantOK  bool
-	}{
+	collector := agents.NewACPTranscriptCollector()
+	updates := []codexacp.RPCMessage{
 		{
-			name: "assistant final answer kept",
-			payload: `{
-				"type":"message",
-				"role":"assistant",
-				"phase":"final_answer",
-				"content":[{"type":"output_text","text":"answer"}]
-			}`,
-			want:   "answer",
-			wantOK: true,
+			Method: methodSessionUpdate,
+			Params: json.RawMessage(`{"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hello codex"}}}`),
 		},
 		{
-			name: "assistant commentary skipped",
-			payload: `{
-				"type":"message",
-				"role":"assistant",
-				"phase":"commentary",
-				"content":[{"type":"output_text","text":"thinking"}]
-			}`,
-			wantOK: false,
-		},
-		{
-			name: "bootstrap user message skipped",
-			payload: `{
-				"type":"message",
-				"role":"user",
-				"content":[{"type":"input_text","text":"# AGENTS.md instructions for /tmp/repo\n\n<INSTRUCTIONS>...\n</INSTRUCTIONS>"},{"type":"input_text","text":"\n<environment_context>\n  <cwd>/tmp/repo</cwd>\n</environment_context>"}]
-			}`,
-			wantOK: false,
-		},
-		{
-			name: "ide context user message extracts request",
-			payload: `{
-				"type":"message",
-				"role":"user",
-				"content":[{"type":"input_text","text":"# Context from my IDE setup:\n\n## Active file: foo.go\n\n## My request for Codex:\nkeep only the real request"}]
-			}`,
-			want:   "keep only the real request",
-			wantOK: true,
-		},
-		{
-			name: "conversation summary extracts current input",
-			payload: `{
-				"type":"message",
-				"role":"user",
-				"content":[{"type":"input_text","text":"[Conversation Summary]\n(empty)\n\n[Recent Turns]\nUser: one\nAssistant: two\n----\n\n[Current User Input]\nreal prompt"}]
-			}`,
-			want:   "real prompt",
-			wantOK: true,
-		},
-		{
-			name: "plain user message kept",
-			payload: `{
-				"type":"message",
-				"role":"user",
-				"content":[{"type":"input_text","text":"plain prompt"}]
-			}`,
-			want:   "plain prompt",
-			wantOK: true,
+			Method: methodSessionUpdate,
+			Params: json.RawMessage(`{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"reply"}}}`),
 		},
 	}
+	for _, update := range updates {
+		if err := consumeCodexReplayUpdate(collector, update); err != nil {
+			t.Fatalf("consumeCodexReplayUpdate() error = %v", err)
+		}
+	}
 
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
+	result := collector.Result()
+	if got, want := len(result.Messages), 2; got != want {
+		t.Fatalf("len(messages) = %d, want %d", got, want)
+	}
+	if got := result.Messages[0]; got.Role != "user" || got.Content != "hello codex" {
+		t.Fatalf("messages[0] = %+v, want user hello codex", got)
+	}
+	if got := result.Messages[1]; got.Role != "assistant" || got.Content != "reply" {
+		t.Fatalf("messages[1] = %+v, want assistant reply", got)
+	}
+}
 
-			msg, ok, err := parseSessionTranscriptMessage("2026-03-11T11:04:48.797Z", json.RawMessage(tt.payload))
-			if err != nil {
-				t.Fatalf("parseSessionTranscriptMessage() error = %v", err)
-			}
-			if ok != tt.wantOK {
-				t.Fatalf("parseSessionTranscriptMessage() ok = %v, want %v", ok, tt.wantOK)
-			}
-			if !tt.wantOK {
-				return
-			}
-			if got := strings.TrimSpace(msg.Content); got != tt.want {
-				t.Fatalf("content = %q, want %q", got, tt.want)
-			}
-		})
+func TestDrainCodexReplayUpdates(t *testing.T) {
+	t.Parallel()
+
+	collector := agents.NewACPTranscriptCollector()
+	updates := make(chan codexacp.RPCMessage, 2)
+	updates <- codexacp.RPCMessage{
+		Method: methodSessionUpdate,
+		Params: json.RawMessage(`{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"chunk one"}}}`),
+	}
+	updates <- codexacp.RPCMessage{
+		Method: methodSessionUpdate,
+		Params: json.RawMessage(`{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":" and two"}}}`),
+	}
+
+	if err := drainCodexReplayUpdates(collector, updates); err != nil {
+		t.Fatalf("drainCodexReplayUpdates() error = %v", err)
+	}
+
+	result := collector.Result()
+	if got, want := len(result.Messages), 1; got != want {
+		t.Fatalf("len(messages) = %d, want %d", got, want)
+	}
+	if got := result.Messages[0].Content; got != "chunk one and two" {
+		t.Fatalf("messages[0].Content = %q, want %q", got, "chunk one and two")
 	}
 }

@@ -130,6 +130,7 @@ export interface PermissionRequest {
 export interface StreamState {
   turnId: string
   threadId: string
+  sessionId: string
   /** ID of the Message placeholder being streamed into */
   messageId: string
   status: 'streaming' | 'cancelling'
@@ -148,9 +149,9 @@ export interface AppState {
   agents: AgentInfo[]
   threads: Thread[]
   activeThreadId: string | null
-  /** Keyed by threadId */
+  /** Keyed by `${threadId}::${sessionId}` */
   messages: Record<string, Message[]>
-  /** Keyed by threadId */
+  /** Keyed by `${threadId}::${sessionId}` */
   streamStates: Record<string, StreamState>
   /** Keyed by threadId; shown after a background turn finishes until revisited */
   threadCompletionBadges: Record<string, boolean>

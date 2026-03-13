@@ -108,6 +108,7 @@
 - Workaround:
   - ensure writable home/config directory for qwen runtime (`HOME`, `~/.qwen`).
   - ensure qwen authentication is completed and network path to model backend is available before turn execution.
+  - run real qwen validation outside restrictive sandboxes when verifying `session/list` / `session/load` behavior against the locally installed CLI.
 - Follow-up plan:
   - add clearer preflight diagnostics for qwen runtime prerequisites (filesystem writable check + auth hints).
   - map common qwen upstream errors to stable hub error details for easier operator debugging.
@@ -195,15 +196,70 @@
 - Status: Open
 - Severity: Medium
 - Affects: threads that select an existing ACP `sessionId` from the Web UI/API
-- Symptom: ngent now replays prior provider transcript into the center chat area when a session is selected, but that replay is still reconstructed on demand and is not imported into SQLite `turns/events`; history APIs remain source-of-truth only for hub-created turns.
-- Workaround: use the center chat/session replay for browsing earlier context, but rely on persisted hub history only for turns created through ngent itself.
-- Follow-up plan: evaluate importing selected provider transcript into local persisted history without duplicating future hub-originated turns.
+- Symptom: ngent now caches prior provider transcript snapshots in SQLite for `GET /v1/threads/{threadId}/session-history`, but that replay is still not imported into SQLite `turns/events`; history APIs remain source-of-truth only for hub-created turns.
+- Workaround: use the session sidebar replay for provider-owned historical context, but rely on persisted hub `/history` for turns created through ngent itself.
+- Follow-up plan: evaluate importing selected provider transcript into local persisted history, or exposing an explicit merged-history view, without duplicating future hub-originated turns.
 
 - ID: KI-022
 - Title: Codex session sidebar titles can still show provider wrapper text
 - Status: Open
 - Severity: Low
 - Affects: Codex `session/list` entries rendered in the Web UI session sidebar
-- Symptom: Codex provider metadata can expose long summary-style titles/previews such as `[Conversation Summary] ... [Current User Input] ...`; replayed chat messages are normalized, but the sidebar item title itself can still look noisy.
-- Workaround: use the thread title or open the session to inspect the normalized chat content when the sidebar label is ambiguous.
+- Symptom: Codex provider metadata and replayed transcript can expose long wrapper-generated text such as `[Conversation Summary] ... [Current User Input] ...` or IDE context blocks because ngent now shows the raw provider-owned ACP replay.
+- Workaround: use the thread title or the most recent visible turn content when the sidebar label or replayed prompt body is noisy.
 - Follow-up plan: normalize Codex `session/list` display titles in the backend, likely by preferring the first replayable user prompt over raw provider preview text when available.
+
+- ID: KI-023
+- Title: Fresh Kimi ACP sessions may resume before they appear in Kimi session browsing surfaces
+- Status: Open
+- Severity: Medium
+- Affects: newly created Kimi sessions bound through ngent ACP turns
+- Symptom:
+  - a just-created Kimi `sessionId` can be resumed successfully through ACP `session/load`, but may still be absent from Kimi's own `session/list`, `kimi export`, and local `~/.kimi/sessions/*/<sessionId>` files for a while.
+  - ngent can continue the bound session on the same or another thread if the `sessionId` is already known, but the session sidebar may not show the new session immediately after creation.
+- Workaround:
+  - continue using the bound thread directly after the first Kimi turn when the new session does not yet appear in the sidebar.
+  - retry session browsing later if the session needs to be re-selected from the sidebar.
+- Follow-up plan:
+  - keep validating newer Kimi CLI releases and add a backend fallback only if Kimi later exposes a reliable transcript/export path for freshly created ACP sessions.
+
+- ID: KI-024
+- Title: Kimi CLI 1.20.0 does not replay transcript messages during historical session/load
+- Status: Open
+- Severity: Medium
+- Affects: Kimi historical session replay through `GET /v1/threads/{threadId}/session-history`
+- Symptom:
+  - Kimi `session/list` returns historical sessions and ACP `session/load` succeeds for those session ids.
+  - Kimi CLI 1.20.0 currently emits no replay `session/update` notifications for those historical loads, so ngent returns `supported=true` with an empty transcript under the ACP-only implementation.
+- Workaround:
+  - continue the selected Kimi session normally; `session/load` still restores provider context for subsequent turns.
+  - use ngent-local `/history` for turns created through ngent itself.
+- Follow-up plan:
+  - keep validating newer Kimi CLI releases and switch to transcript replay immediately if Kimi starts emitting standard `session/update` history during `session/load`.
+
+- ID: KI-025
+- Title: Session-history cache does not auto-refresh from provider metadata
+- Status: Open
+- Severity: Medium
+- Affects: repeated `GET /v1/threads/{threadId}/session-history` requests for the same `(agent, cwd, sessionId)`
+- Symptom:
+  - after the first successful replay, ngent serves the cached SQLite snapshot on later requests and server restarts.
+  - if the provider session later gains more messages outside that cached snapshot, ngent does not yet compare provider `updatedAt` metadata before returning the cached transcript.
+- Workaround:
+  - continue the conversation through the current ngent thread so new hub-local turns remain visible in `/history`.
+  - if a full provider replay refresh is required immediately, clear the cached row from sqlite and request `/session-history` again.
+- Follow-up plan:
+  - persist `session/list.updatedAt` metadata and invalidate or refresh `session_transcript_cache` when that metadata advances.
+
+- ID: KI-026
+- Title: Thread-wide config changes still serialize across concurrent sessions
+- Status: Open
+- Severity: Low
+- Affects: `PATCH /v1/threads/{threadId}` non-session updates and `POST /v1/threads/{threadId}/config-options`
+- Symptom:
+  - the server now allows concurrent turns across different sessions on the same thread.
+  - shared thread metadata such as title, model, and config overrides still returns `409 CONFLICT` while any session on that thread is active.
+- Workaround:
+  - wait for active sessions to finish or cancel them before renaming the thread or changing shared model/config options.
+- Follow-up plan:
+  - evaluate whether some metadata-only updates can move to a narrower guard without letting shared provider state drift across sessions.

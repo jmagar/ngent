@@ -2,6 +2,7 @@ package qwen_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -486,5 +487,75 @@ func TestQwenE2ESmoke(t *testing.T) {
 	}
 	if builder.Len() == 0 {
 		t.Error("no response text received")
+	}
+}
+
+func TestQwenE2ESessionTranscriptReplay(t *testing.T) {
+	if os.Getenv("E2E_QWEN") != "1" {
+		t.Skip("set E2E_QWEN=1 to run")
+	}
+	if err := qwen.Preflight(); err != nil {
+		t.Skipf("qwen not available: %v", err)
+	}
+
+	cwd := t.TempDir()
+	c, err := qwen.New(qwen.Config{Dir: cwd})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	marker := fmt.Sprintf("QWEN_TRANSCRIPT_%d", time.Now().UnixNano())
+	prompt := fmt.Sprintf("Reply with exactly %s and nothing else.", marker)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	var response strings.Builder
+	if _, err := c.Stream(ctx, prompt, func(delta string) error {
+		response.WriteString(delta)
+		return nil
+	}); err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+
+	sessionID := c.CurrentSessionID()
+	if sessionID == "" {
+		t.Fatal("CurrentSessionID() returned empty session id")
+	}
+	t.Logf("sessionID: %s", sessionID)
+	t.Logf("response: %q", response.String())
+
+	var transcript agents.SessionTranscriptResult
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		transcript, err = c.LoadSessionTranscript(context.Background(), agents.SessionTranscriptRequest{
+			CWD:       cwd,
+			SessionID: sessionID,
+		})
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, agents.ErrSessionNotFound) {
+			t.Fatalf("LoadSessionTranscript: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("LoadSessionTranscript: session %q not visible in session/list within timeout", sessionID)
+		}
+		time.Sleep(time.Second)
+	}
+
+	if len(transcript.Messages) == 0 {
+		t.Fatal("LoadSessionTranscript returned no replay messages")
+	}
+
+	foundMarker := false
+	for _, msg := range transcript.Messages {
+		if strings.Contains(msg.Content, marker) {
+			foundMarker = true
+			break
+		}
+	}
+	if !foundMarker {
+		t.Fatalf("replayed transcript did not contain marker %q: %+v", marker, transcript.Messages)
 	}
 }

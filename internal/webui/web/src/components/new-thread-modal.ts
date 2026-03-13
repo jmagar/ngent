@@ -340,9 +340,10 @@ async function submit(): Promise<void> {
 
     const threads = await api.getThreads()
     const state = store.get()
-    const nextMessages = Object.prototype.hasOwnProperty.call(state.messages, threadId)
+    const initialScopeKey = `${threadId}::`
+    const nextMessages = Object.prototype.hasOwnProperty.call(state.messages, initialScopeKey)
       ? state.messages
-      : { ...state.messages, [threadId]: [] }
+      : { ...state.messages, [initialScopeKey]: [] }
     store.set({ threads, activeThreadId: threadId, messages: nextMessages })
 
     unmount()

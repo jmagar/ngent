@@ -25,12 +25,12 @@ This checklist defines executable acceptance checks for requirements 1-16.
 - Verification command:
   - `go test ./internal/httpapi -run TestMultiThreadParallelTurns -count=1`
 
-## Requirement 4: One active turn per thread plus cancel
+## Requirement 4: One active turn per thread/session scope plus cancel
 
-- Operation: start first turn, submit second turn on same thread, then cancel.
-- Expected: second turn gets `409 CONFLICT`; cancel converges quickly.
+- Operation: start first turn, submit second turn on same session, verify conflict; then switch to another session on the same thread and verify that second session can run concurrently; finally cancel.
+- Expected: same-session second turn gets `409 CONFLICT`; different session on the same thread is allowed; cancel converges quickly.
 - Verification command:
-  - `go test ./internal/httpapi -run TestTurnConflictSingleActiveTurnPerThread -count=1`
+  - `go test ./internal/httpapi -run 'TestTurnConflictSingleActiveTurnPerSession|TestTurnAllowsConcurrentSessionsOnSameThread|TestUpdateThreadClearingSessionDropsStaleUnboundProvider' -count=1`
   - `go test ./internal/httpapi -run TestTurnCancel -count=1`
 
 ## Requirement 5: Lazy startup
@@ -215,7 +215,10 @@ This checklist defines executable acceptance checks for requirements 1-16.
   - normalized model/reasoning catalogs are persisted in sqlite and reused after service restart.
   - startup refresh of persisted catalogs happens asynchronously in the background and does not block frontend/API availability.
   - same-agent threads do not share selected current values, but can reuse the same stored catalog data for the same selected model.
-  - active turn mutation is rejected with `409 CONFLICT`.
+  - title/model/config mutations are rejected with `409 CONFLICT` while any session on the thread is active.
+  - session-only selection updates remain allowed when they switch to a different session.
+  - clearing `sessionId` from the Web UI `New session` action invalidates any stale empty-session provider cache so the next turn does not fall back into an older ACP session.
+  - if that clear happens after an explicit historical-session selection, the first turn of the fresh session is sent without `[Conversation Summary]` / `[Recent Turns]` injection, so the new ACP session transcript contains only the new exchange.
 - Verification commands (executed 2026-03-06):
   - `go test ./internal/httpapi -run TestThreadConfigOptions -count=1`
   - `go test ./internal/httpapi -run TestThreadConfigOptionsPersistConfigOverrides -count=1`
@@ -294,13 +297,26 @@ This checklist defines executable acceptance checks for requirements 1-16.
 - Expected:
   - the backend proxies ACP `session/list` through `GET /v1/threads/{threadId}/sessions`.
   - response includes `supported`, `sessions`, and `nextCursor`.
+  - for providers that replay transcript over ACP `session/load`, the first `GET /v1/threads/{threadId}/session-history?sessionId=...` warms sqlite `session_transcript_cache`, and later requests can return the same replayed `user` / `assistant` messages without calling the provider again.
   - the Web UI renders a right-side session sidebar with:
     - first-page load on active thread selection.
     - `Show more` pagination when `nextCursor` is present.
-    - `New session` action that clears the selected `sessionId`.
+  - `New session` action that clears the selected `sessionId`.
+  - selecting an existing session requests provider-owned transcript replay before the next turn.
   - turn SSE emits `session_bound`, and the thread persists `agentOptions.sessionId`.
   - once a thread is session-bound, subsequent prompt building no longer injects prior local turns into the provider prompt.
-- Verification commands (executed 2026-03-11):
-  - `go test ./internal/httpapi -run 'TestThreadSessionsListEndpoint|TestTurnSessionBoundPersistsSessionIDAndSkipsContextInjection' -count=1`
+- Verification commands (executed 2026-03-13):
+  - `go test ./internal/httpapi -run 'TestThreadSessionsListEndpoint|TestTurnSessionBoundPersistsSessionIDAndSkipsContextInjection|TestNewSessionResetSkipsContextInjection' -count=1`
   - `cd internal/webui/web && npm run build`
+  - `go test ./...`
+- Additional verification commands (executed 2026-03-12):
+  - `go test ./internal/agents/kimi -run 'SessionTranscript' -count=1`
+  - `go test ./internal/agents/opencode -run 'SessionTranscript' -count=1`
+  - `go test ./internal/agents/codex -run 'Test(ConsumeCodexReplayUpdate|DrainCodexReplayUpdates)$' -count=1`
+  - `go test ./internal/agents/qwen -run 'SessionTranscript' -count=1`
+  - `E2E_QWEN=1 go test ./internal/agents/qwen -run 'TestQwenE2E(Smoke|SessionTranscriptReplay)$' -count=1 -v -timeout 180s`
+  - real Qwen provider repro: confirm a locally created Qwen session reappears in `session/list` and `LoadSessionTranscript` replays the unique prompt marker through ACP `session/load`.
+  - observed limitation: Kimi CLI 1.20.0 accepts ACP `session/load` for listed historical sessions but emits no replay transcript updates, so `/session-history` remains empty under the ACP-only implementation.
+- Additional verification commands (executed 2026-03-13):
+  - `go test ./internal/storage ./internal/httpapi -run 'Test(SessionTranscriptCacheCRUD|ThreadSessionHistoryEndpoint|ThreadSessionHistoryEndpointUsesSQLiteCacheAcrossRestart)$' -count=1`
   - `go test ./...`

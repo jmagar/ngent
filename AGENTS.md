@@ -14,7 +14,8 @@ This repository implements the Code Agent Hub Server.
   - `cwd` must be inside configured allowed roots, otherwise reject.
 - MUST run codex provider in embedded mode (`github.com/beyond5959/acp-adapter/pkg/codexacp`), not via user-supplied external binary path flags.
 - MUST enforce concurrency model:
-  - one active turn per thread at a time.
+  - one active turn per `(thread, session)` scope at a time.
+  - thread-level destructive or shared-state operations must still fail/lock at whole-thread scope.
   - cancel must take effect quickly.
   - permission workflow is fail-closed by default.
 - MUST keep stdout and HTTP output protocol-only.
@@ -68,7 +69,7 @@ All files live under `internal/webui/web/src/`.
 
 **Streaming sentinel** — prevents `updateMessageList()` from wiping the live bubble:
 ```
-let activeStreamMsgId: string | null = null  // set BEFORE store.set({ streamState })
+let activeStreamMsgId: string | null = null
 ```
 The subscribe handler skips `updateMessageList()` while `activeStreamMsgId !== null`.
 
@@ -76,9 +77,11 @@ The subscribe handler skips `updateMessageList()` while `activeStreamMsgId !== n
 ```
 store.subscribe(() => {
   const threadChanged = activeThreadId !== lastRenderThreadId
+  const chatScopeChanged = chatScopeKey !== lastRenderChatScopeKey
   updateThreadList()
-  if (threadChanged) {
+  if (threadChanged || (chatScopeChanged && !getScopeStreamState(chatScopeKey))) {
     lastRenderThreadId = activeThreadId
+    lastRenderChatScopeKey = chatScopeKey
     updateChatArea()               // full re-render on thread switch
   } else {
     if (!activeStreamMsgId) updateMessageList()   // skip during streaming
@@ -89,11 +92,12 @@ store.subscribe(() => {
 
 **`handleSend()` sequence**:
 1. Add user message → `addMessageToStore` (triggers subscribe → renders user bubble).
-2. Set `activeStreamMsgId = agentMsgId` (before touching streamState).
-3. `store.set({ streamState: ... })` (subscribe fires but skips `updateMessageList`).
+2. Compute the current chat scope key `threadId::sessionId`.
+3. Set `activeStreamMsgId = agentMsgId` before `setScopeStreamState(...)`.
 4. Append streaming bubble directly to DOM (`id="bubble-<agentMsgId>"`).
 5. `api.startTurn(...)` — `onDelta` patches `bubbleEl.textContent` in-place.
-6. `onCompleted` / `onError` / `onDisconnect`: clear stream tracking, `addMessageToStore` finalized message, `store.set({ streamState: null })`.
+6. `onSessionBound`: move in-memory message/stream buffers from the provisional scope into the bound session scope.
+7. `onCompleted` / `onError` / `onDisconnect`: clear scope-local stream tracking and append the finalized message back into that chat scope.
 
 **Smart auto-scroll** (`isNearBottom(el)` — 100px threshold):
 - `onDelta`: only scrolls when user was already near the bottom.
@@ -101,7 +105,7 @@ store.subscribe(() => {
 - Scroll-to-bottom button (`#scroll-bottom-btn`) shown by scroll-event listener on `#message-list`; button is inside `.message-list-wrap` (position: relative).
 
 **History load guards** in `loadHistory(threadId)`:
-- After `await api.getHistory(...)`, check `state.activeThreadId !== threadId` (navigated away) and `state.streamState?.threadId === threadId` (streaming in progress) before writing to store.
+- After `await api.getHistory(...)`, check `state.activeThreadId !== threadId` (navigated away), that the selected `sessionId` still matches, and that `getScopeStreamState(threadId::sessionId)` is empty before writing to store.
 
 **Markdown rendering** is applied only for agent `done` messages via `renderMarkdown(bodyText)` in `renderMessage()`. Streaming bubbles use plain `textContent` assignment; markdown is rendered once after `onCompleted` fires and `updateMessageList()` re-renders from store.
 
@@ -123,7 +127,7 @@ store.subscribe(() => {
 - MUST run `go test ./...` after any change (including frontend-only changes that affect `web/dist`).
 - MUST NOT add a JS framework (React, Vue, Svelte, etc.).
 - MUST NOT use `EventSource` for SSE — it does not support POST or custom headers. Use `TurnStream` (`fetch` + `ReadableStream`).
-- MUST set `activeStreamMsgId` before calling `store.set({ streamState })` to prevent the subscribe handler from wiping the streaming bubble.
+- MUST set `activeStreamMsgId` before calling `setScopeStreamState(...)` to prevent the subscribe handler from wiping the streaming bubble.
 - MUST call `bindMarkdownControls(container)` after any `innerHTML` assignment that may contain `.code-copy-btn`, `.code-expand-btn`, or `.msg-copy-btn` elements.
 - MUST escape user/agent content with `escHtml()` before inserting as HTML; only pass finalised agent text to `renderMarkdown()`.
 - MUST NOT commit `web/dist/` — it is gitignored and built by CI. Local builds use `make build` or `make build-web`.

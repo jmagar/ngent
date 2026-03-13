@@ -26,9 +26,10 @@ Modules:
 
 ## 3. Concurrency Model
 
-- Thread is the concurrency isolation unit.
-- Each thread has exactly one active turn.
-- New turn requests on active thread return conflict error.
+- `(thread, sessionId)` is the turn-execution isolation unit; empty `sessionId` represents the provisional "new session" scope.
+- Each thread/session scope has at most one active turn.
+- New turn requests on an active scope return conflict error, while different sessions on the same thread may run concurrently.
+- Thread-level destructive or shared-state operations (for example delete/compact and thread-wide config changes) remain whole-thread guarded.
 - Cancel request transitions turn state immediately and propagates cancellation token to provider.
 - Permission requests suspend the turn until a client decision arrives or timeout occurs.
 
@@ -39,7 +40,9 @@ Modules:
 - On first turn execution for embedded-provider thread (currently `codex`): server creates the in-process runtime and initializes ACP session lazily.
 - Embedded runtime `session/new` is created with `cwd=thread.cwd` (validated as absolute path at thread creation).
 - If `thread.agent_options_json` contains `modelId`, providers apply it as model override during thread-level runtime/session initialization.
-- Provider instances are cached per thread and reclaimed by idle TTL (`--agent-idle-ttl`) when thread has no active turn.
+- Provider instances are cached per thread/session/config scope and reclaimed by idle TTL (`--agent-idle-ttl`) when that scope has no active turn.
+- Clearing `thread.agent_options_json.sessionId` to represent Web UI `New session` also invalidates any idle cached provider under the provisional empty-session scope so the following turn must resolve a fresh ACP session.
+- Explicit Web UI `New session` also persists one internal fresh-session marker until the next `session_bound`; while that marker is set, ngent skips `[Conversation Summary]` / `[Recent Turns]` prompt injection and sends raw user input into the fresh ACP session.
 
 ## 5. Permission Bridge
 
@@ -104,7 +107,7 @@ See `docs/API.md` for endpoint and schema contracts.
 - strict input validation:
   - agent must be allowlisted.
   - cwd must be absolute.
-- thread option updates are rejected while a turn is active on the same thread.
+- thread option updates that change shared thread state are rejected while any session on that thread is active; session-only selection updates are allowed while a different session is running.
 - logs are JSON on stderr and redact sensitive data.
 - `--debug=true` raises log verbosity to debug level and emits sanitized ACP JSON-RPC request/response traces on stderr.
 - HTTP payloads contain protocol data only.
@@ -128,7 +131,7 @@ See `docs/API.md` for concrete schema and codes.
 - add `qwen` as a first-class ACP provider using `qwen --acp`.
 - preserve all existing contracts and behavior for `codex`, `opencode`, and `gemini`.
 - keep runtime/security invariants unchanged:
-  - one active turn per thread.
+  - one active turn per `(thread, session)` scope.
   - fail-closed permission workflow.
   - allowlisted `agent` and absolute+allowed `cwd` validation.
   - protocol-only stdout/HTTP payloads, JSON logs on stderr.
@@ -227,7 +230,7 @@ and upstream ACP schema:
 
 - add `kimi` as a first-class ACP provider using the Kimi CLI ACP mode.
 - preserve existing runtime/security invariants:
-  - one active turn per thread.
+  - one active turn per `(thread, session)` scope.
   - fail-closed permission workflow.
   - allowlisted `agent` and absolute+allowed `cwd` validation.
   - protocol-only stdout/HTTP payloads, JSON logs on stderr.
@@ -399,6 +402,7 @@ and upstream ACP schema:
 - Session selection remains a normal thread metadata update:
   - `PATCH /v1/threads/{threadId}` with `agentOptions.sessionId="<existing>"` binds an existing ACP session.
   - `PATCH /v1/threads/{threadId}` with `agentOptions.sessionId` omitted/empty clears the binding and means "create a new session on next turn".
+  - when that clear transitions from a previously bound session to empty, ngent records an internal fresh-session marker so the first turn of the new session does not inherit prior thread prompt wrappers.
 
 ### 15.3 Provider Behavior
 
@@ -408,7 +412,19 @@ and upstream ACP schema:
 - Turn setup:
   - if thread `sessionId` is present, provider calls ACP `session/load`.
   - otherwise provider calls ACP `session/new`.
+  - if the thread is in explicit fresh-session mode, the first prompt sent into that new ACP session is the raw user input instead of a locally wrapped context prompt.
   - provider reports the effective session id back through a thread-scoped callback.
+- Session transcript replay:
+  - providers may optionally expose replayable transcript messages for one selected session through `GET /v1/threads/{threadId}/session-history`.
+  - `GET /v1/threads/{threadId}/session-history` first checks SQLite `session_transcript_cache` keyed by `(agent_id, cwd, session_id)`.
+  - on cache miss, `codex`, `kimi`, `opencode`, and `qwen` implement replay by calling ACP `session/load` and collecting the replayed `session/update` stream (`user_message_chunk` / `agent_message_chunk`) into displayable transcript messages.
+  - successful replay snapshots, including empty transcript results, are written back to `session_transcript_cache` for reuse across later clicks and server restarts.
+  - replay collectors must ignore provider-specific non-message updates (for example Qwen `tool_call_update`) instead of treating them as fatal transport errors.
+  - `codex` must resolve the selected session and call `session/load` within the same embedded runtime because the raw ACP `sessionId` values returned by `session/list` are runtime-scoped.
+  - replay content is provider-owned and is returned as-is from the ACP stream; ngent caches it separately from `turns/events` and does not import it into persisted SQLite turn/event history.
+  - current real-provider behavior is provider-dependent:
+    - `opencode`, `codex`, and `qwen` replay transcript messages over ACP `session/load`.
+    - Kimi CLI 1.20.0 successfully resumes historical sessions through `session/load` but currently emits no replay `session/update` notifications for those sessions, so transcript replay stays empty under the ACP-only implementation.
 - HTTP turn handling persists the bound session id back into `threads.agent_options_json` and emits SSE `session_bound`.
 
 ### 15.4 Prompt Construction

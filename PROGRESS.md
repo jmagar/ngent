@@ -11,22 +11,71 @@ This file is the source of milestone progress, validation commands, and next act
 
 - `Post-M8` ACP multi-agent readiness and maintenance.
 
-## Latest Update (2026-03-11)
+## Latest Update (2026-03-13)
+
+- `Post-M8` Web UI/session reset regression fixed:
+  - completed the `New session` fix after switching to a historical ACP session: clearing `thread.agentOptions.sessionId` still evicts stale empty-scope providers, and now also marks the next turn as an explicit fresh-session request so prompt building skips `[Conversation Summary]` / `[Recent Turns]` injection for that first turn.
+  - kept the fresh-session marker server-internal: it is persisted in `thread.agent_options_json` only until the next `session_bound`, but stripped from public thread responses so the API contract stays stable.
+  - added a backend regression test that reproduces the real `A -> historical B -> New session -> send` path and verifies the new session transcript contains only the new user/assistant exchange instead of wrapped prior thread history.
+  - disabled composer send/input while the Web UI is switching thread sessions, preventing users from submitting a turn against a session selection that is still in flight.
+  - validation:
+    - pass: `go test ./internal/httpapi -run 'Test(NewSessionResetSkipsContextInjection|TurnSessionBoundPersistsSessionIDAndSkipsContextInjection|UpdateThreadClearingSessionDropsStaleUnboundProvider)' -count=1`
+    - pass: `cd internal/webui/web && npm run build`
+    - pass: `go test ./...`
+
+- `Post-M8` session-history sqlite cache completed:
+  - added SQLite table `session_transcript_cache` keyed by `(agent_id, cwd, session_id)` to persist provider-owned session replay snapshots separately from hub `turns/events`.
+  - `GET /v1/threads/{threadId}/session-history` now reads sqlite first; on cache miss it still calls provider `LoadSessionTranscript`, then persists the normalized replay snapshot for later reuse.
+  - cached session-history snapshots survive server restart, so revisiting the same historical session no longer requires a fresh provider `session/load` every time.
+  - known tradeoff: cache freshness is not yet invalidated by provider `updatedAt` metadata; stale replay risk is tracked in `docs/KNOWN_ISSUES.md`.
+  - validation:
+    - pass: `go test ./internal/storage ./internal/httpapi -run 'Test(SessionTranscriptCacheCRUD|ThreadSessionHistoryEndpoint|ThreadSessionHistoryEndpointUsesSQLiteCacheAcrossRestart)$' -count=1`
+    - pass: `go test ./...`
+
+- `Post-M8` ACP `session/load` transcript replay standardization completed:
+  - removed provider-specific transcript reconstruction for `kimi`, `opencode`, `codex`, and `qwen`; `GET /v1/threads/{threadId}/session-history` now uses the same ACP path for all four providers:
+    - resolve the selected session from ACP `session/list`
+    - call ACP `session/load`
+    - collect replayed `session/update` notifications into `user` / `assistant` messages
+  - extended shared ACP update parsing to support standard `user_message_chunk` and `agent_message_chunk` replay events, and added a shared transcript collector for `session/load` history replay.
+  - fixed Codex session replay to list and load within the same embedded runtime because Codex raw ACP `sessionId` values are runtime-scoped; cross-runtime reuse of `session-1`-style ids returns `unknown session`.
+  - real regression on rebuilt ngent:
+    - `kimi`: ACP `session/load` succeeds for historical sessions but Kimi CLI 1.20.0 emits no replay `session/update` notifications, so `/session-history` currently returns `supported=true` with an empty message list under the standard ACP-only implementation.
+    - `qwen`: a real locally-created Qwen session now replays transcript messages through the same ACP `session/list` + `session/load` path; env-gated provider E2E confirms the replay contains the unique prompt marker from the created session.
+  - validation:
+    - pass: `go test ./internal/agents/qwen -count=1`
+    - pass: `E2E_QWEN=1 go test ./internal/agents/qwen -run 'TestQwenE2E(Smoke|SessionTranscriptReplay)$' -count=1 -v -timeout 180s`
+    - pass: `go test ./internal/agents/...`
+    - pass: `cd internal/webui/web && npm run build`
+    - pass: `go test ./...`
+    - pass: real `opencode` `/session-history` regression on rebuilt ngent
+    - pass: real `codex` `/session-history` regression on rebuilt ngent
+    - observed: real `kimi` `session/load` returns no replay updates on Kimi CLI 1.20.0
+- `Post-M8` Qwen session-history replay fix completed:
+    - direct ACP `session/load` for that session replayed `user_message_chunk` and `agent_message_chunk`, proving Qwen itself was returning transcript content.
+    - ngent `GET /v1/threads/{threadId}/session-history?sessionId=...` initially failed with `503 UPSTREAM_UNAVAILABLE` and `qwen: session/load: qwen: connection closed`.
+  - root cause:
+    - ngent transcript replay parsing treated Qwen `tool_call_update` notifications as fatal because their `content` payload is an array/object, not the `{type,text}` shape used by text chunks.
+    - the ACP stdio transport closes the whole connection when a notification handler returns an error, so one unexpected Qwen update aborted the replay before the RPC response arrived.
+  - fix:
+    - relaxed shared ACP update parsing so only text-bearing `user_message_chunk` / `agent_message_chunk` notifications are decoded strictly; non-text update payloads are ignored instead of aborting replay.
+    - extended Qwen transcript fake-process coverage to include a `tool_call_update` regression payload.
+  - validation:
+    - pass: `go test ./internal/agents -run 'TestParseACPUpdate' -count=1`
+    - pass: `go test ./internal/agents/qwen -run 'SessionTranscript' -count=1`
+    - pass: `cd internal/webui/web && npm run build`
+    - pass: `go test ./...`
+
+## Previous Update (2026-03-11)
 
 - `Post-M8` codex session identity and replay normalization completed:
   - fixed fresh Codex `New session` persistence so ngent no longer stores provisional runtime ids like `session-1` as the thread session binding when a durable `_meta.threadId` is not yet available.
   - deferred initial `session_bound` persistence/emission for fresh Codex sessions until a stable session id can be resolved after the first prompt, then updated in-memory and persisted thread `agentOptions.sessionId` with the durable id.
-  - normalized Codex transcript replay by filtering bootstrap user messages injected by the desktop wrapper (`AGENTS.md` / `environment_context`) and extracting the actual user request from known wrapper formats:
-    - `[Conversation Summary] ... [Current User Input]`
-    - `# Context from my IDE setup: ... ## My request for Codex:`
   - verified with real local Codex and Playwright against `http://127.0.0.1:8687/`:
     - `New session` now produces distinct stable Codex session ids and no longer mixes first-session messages into the second-session chat.
-    - switching between the two replayed sessions in the Web UI now shows only the expected user/assistant pairs.
-    - direct `session-history` API responses for the repro sessions now return cleaned transcript messages.
+    - switching between the two replayed sessions in the Web UI no longer mixes first-session messages into the second-session chat.
   - validation:
-    - pass: `go test ./internal/agents/codex -run 'Test(ParseSessionTranscriptMessage|CodexShouldDeferInitialSessionBinding|NormalizeCodexSessionListResultUsesStableThreadID|CodexSessionMatchesIDAcceptsStableAndRawIDs|CodexStableSessionIDFallsBackToRawSessionID)$' -count=1`
-    - pass: `cd internal/webui/web && npm run build`
-    - pass: `go test ./...`
+    - pass: `go test ./internal/agents/codex -run 'Test(CodexShouldDeferInitialSessionBinding|NormalizeCodexSessionListResultUsesStableThreadID|CodexSessionMatchesIDAcceptsStableAndRawIDs|CodexStableSessionIDFallsBackToRawSessionID)$' -count=1`
 
 ## Previous Update (2026-03-09)
 
@@ -265,8 +314,6 @@ This file is the source of milestone progress, validation commands, and next act
   - implemented transactional storage deletion in `internal/storage` with dependent cleanup (`events` -> `turns` -> `threads`).
   - wired Web UI thread-list delete action with confirmation and local state cleanup (threads/messages/active selection/stream state).
   - executed validation:
-    - pass: `cd internal/webui/web && npm run build`
-    - pass: `go test ./...`
   - added unit tests (`TestPreflight_*`, `TestNew_*`, `TestClose_*`, `TestDefaultRuntimeConfig_ReadsEnv`) covering token presence/absence, default/custom timeouts, and idempotent close.
   - added optional real smoke test (`E2E_CLAUDE=1 go test ./internal/agents/claude/ -run TestClaudeE2ESmoke -v -timeout 120s`); confirmed `PONG` response and `stopReason=end_turn` (16.68s).
   - added `go.mod` `replace` directive pointing to local `github.com/beyond5959/acp-adapter` for local development; refreshed module dependencies for the embedded Claude runtime integration.
@@ -287,12 +334,6 @@ This file is the source of milestone progress, validation commands, and next act
   - updated `AGENTS.md`: replaced "MUST keep web/dist committed" rule with "MUST NOT commit web/dist"; added CI/Release pipeline section.
 
 
-
-- `gofmt -w .`
-- `go test ./...`
-- `make fmt`
-- `make test`
-- `make run`
 
 ## Latest Verification
 
@@ -327,17 +368,6 @@ This file is the source of milestone progress, validation commands, and next act
   - qwen real smoke: pass (`PONG`, `stopReason=end_turn`)
   - server/httpapi regression tests: pass
   - full repo tests: pass
-
-## Dependency Fetch Notes
-
-- Date: `2026-02-28`
-- Failure 1:
-  - command: `go get modernc.org/sqlite`
-  - error: `lookup proxy.golang.org: no such host`
-- Effective workaround:
-  - used locally cached module `modernc.org/sqlite@v1.18.2` and offline-capable verification.
-- Effective workaround:
-  - reused locally cached `github.com/beyond5959/acp-adapter` pseudo-version already present in module cache and pinned it as direct dependency in `go.mod`.
 
 ## Milestone Plan (M0-M8)
 
@@ -422,8 +452,6 @@ This file is the source of milestone progress, validation commands, and next act
   - maintained per-thread stream runtime maps (stream handle, delta buffer, start time), so background threads can keep streaming and finalize correctly.
   - wired send/cancel/input disable logic to current thread only, enabling concurrent in-flight turns across different threads.
   - executed validation:
-    - pass: `cd internal/webui/web && npm run build`
-    - pass: `go test ./...`
 
 - `Post-F9` permission countdown updated to 2 hours:
   - changed server default permission timeout to `2 * time.Hour`.
@@ -434,8 +462,6 @@ This file is the source of milestone progress, validation commands, and next act
   - when switching back to a thread, pending Permission Required cards are re-mounted with original deadline.
   - resolved/timeout outcomes remove pending records to avoid stale prompts.
   - executed validation:
-    - pass: `cd internal/webui/web && npm run build`
-    - pass: `go test ./...`
 
 - `Post-F9` thread model selection and switching completed:
   - added thread update API `PATCH /v1/threads/{threadId}` (agentOptions-only payload) with ownership checks and active-turn conflict (`409`).
@@ -455,8 +481,6 @@ This file is the source of milestone progress, validation commands, and next act
     - active thread header switched from free-text model input to ACP-backed model dropdown + Apply action.
     - model controls are disabled while model lists load and during streaming turns.
   - executed validation:
-    - pass: `cd internal/webui/web && npm run build`
-    - pass: `go test ./...`
 
 - `Post-F9` thread session model config switched to ACP `configOptions` + immediate apply:
   - added thread-scoped config options APIs:
@@ -474,8 +498,6 @@ This file is the source of milestone progress, validation commands, and next act
   - thread metadata sync:
     - successful model switch persists `agentOptions.modelId` for thread continuity and restart recovery.
   - executed validation:
-    - pass: `cd internal/webui/web && npm run build`
-    - pass: `go test ./...`
 
 - `Post-F9` thread reasoning selector and config override persistence completed:
   - backend now persists non-model session config selections under `agentOptions.configOverrides` when `POST /v1/threads/{threadId}/config-options` succeeds.
@@ -484,8 +506,6 @@ This file is the source of milestone progress, validation commands, and next act
   - reasoning control remains model-specific and is disabled/updated in the same active-turn safety envelope as model switching.
   - added coverage for config override persistence and thread agent-option parsing.
   - executed validation:
-    - pass: `cd internal/webui/web && npm run build`
-    - pass: `go test ./...`
 
 - `Post-F9` shared agent config catalog caching completed:
   - Web UI no longer re-fetches thread config options when switching between threads that use the same agent and already have a cached agent config catalog.
@@ -506,8 +526,6 @@ This file is the source of milestone progress, validation commands, and next act
     - thread model list now loads successfully from ACP `configOptions`.
     - model switching calls `POST /v1/threads/{threadId}/config-options` and persists selected model.
     - no frontend console errors during switch flow.
-  - executed validation:
-    - pass: `go test ./...`
 
 - `Post-F9` codex model-discovery stability improvement:
   - replaced per-request codex model discovery runtime startup/shutdown with a shared discovery client in `internal/agents/codex/models.go`.
@@ -519,8 +537,6 @@ This file is the source of milestone progress, validation commands, and next act
     - first call `GET /v1/agents/codex/models` took ~16s (initial discovery).
     - second call returned in ~0ms from shared client (no repeated startup/shutdown).
   - executed validation:
-    - pass: `cd internal/webui/web && npm run build`
-    - pass: `go test ./...`
 
 - `Post-F9` persisted agent config catalog completed:
   - added sqlite-backed `agent_config_catalogs` storage keyed by `agent_id + model_id`, with a reserved default snapshot row used when a thread has no explicit model selection yet.
@@ -531,8 +547,6 @@ This file is the source of milestone progress, validation commands, and next act
   - service startup now launches a background catalog refresher that silently re-queries built-in agents and refreshes stored model/reasoning catalogs without delaying frontend availability.
   - Web UI config cache is now keyed by `agent + selected model`, so different threads on the same agent no longer accidentally reuse the wrong reasoning list for another model.
   - executed validation:
-    - pass: `cd internal/webui/web && npm run build`
-    - pass: `go test ./...`
 
 - `Post-F9` streaming bubble typing-indicator persistence completed:
   - Web UI streaming agent bubble now keeps the three animated dots rendered at the bottom of the bubble after the first delta arrives, until the turn finishes.
@@ -547,39 +561,29 @@ This file is the source of milestone progress, validation commands, and next act
   - removed the blank spacer above the three animated dots before the first token arrives by hiding the empty text container in streaming bubbles.
   - typing indicator now sits directly under the top padding until real content starts streaming.
   - executed validation:
-    - pass: `cd internal/webui/web && npm run build`
-    - pass: `go test ./...`
 
 - `Post-F9` sidebar thread activity indicators completed:
   - thread list now shows a live spinner for any thread with an in-flight turn, so background work stays visible after switching to another thread.
   - when a background turn finishes, the spinner flips to a green check badge that stays on that thread until the user opens it again.
   - slowed the sidebar thread spinner slightly so the activity indicator reads as background work instead of a high-frequency busy loop.
   - executed validation:
-    - pass: `cd internal/webui/web && npm run build`
-    - pass: `go test ./...`
 
 - `Post-F9` sidebar thread drawer actions and rename completed:
   - replaced the direct delete icon in sidebar thread rows with a drawer trigger.
   - added drawer actions for inline rename and delete, with rename ordered before delete and delete styled as the only dangerous text action.
   - extended `PATCH /v1/threads/{threadId}` so thread title updates reuse the existing ownership and active-turn conflict model.
   - executed validation:
-    - pass: `cd internal/webui/web && npm run build`
-    - pass: `go test ./...`
 
 - `Post-F9` sidebar thread action popover refinement completed:
   - replaced the expanding inline drawer with a floating popover anchored to the three-dot trigger, so opening thread actions no longer changes sidebar row height.
   - kept rename and delete in the same order, with rename editing rendered in a floating panel and delete remaining the red dangerous action.
   - executed validation:
-    - pass: `cd internal/webui/web && npm run build`
-    - pass: `go test ./...`
 
 - `Post-F9` ACP plan streaming in Web UI completed:
   - added shared ACP `session/update` parsing for both `agent_message_chunk` and `plan`, with plan routed through a new per-turn `PlanHandler` context callback.
   - introduced SSE/history event `plan_update` so ACP plans are persisted alongside other turn events instead of being dropped at provider boundaries.
   - updated the Web UI to render live plan cards during streaming and restore the latest plan from turn history on reload.
   - executed validation:
-    - pass: `cd internal/webui/web && npm run build`
-    - pass: `go test ./...`
 
  
 - 2026-03-06: Removed the thread action trigger's per-thread actionLabel/title tooltip in the Web UI popover menu; the three-dot button now uses a neutral `aria-label` only, without hover text tied to the thread title.
@@ -611,13 +615,31 @@ This file is the source of milestone progress, validation commands, and next act
   - the active chat view now treats `(threadId, sessionId)` as its render scope instead of refreshing only on `threadId` changes.
   - `loadHistory()` now filters locally persisted turns by each turn's `session_bound` event so the center chat panel replays the selected session's ngent-recorded turns instead of leaving the previous session on screen.
   - session changes reported mid-stream by `session_bound` defer the full chat refresh until the active turn completes, so the live streaming bubble is not destroyed.
-  - executed validation:
-    - pass: `cd internal/webui/web && npm run build`
-    - pass: `go test ./...`
 
 - 2026-03-11: fixed Web UI history replay for legacy session threads whose `/history` data lacks per-turn `session_bound` events.
   - session-scoped history filtering now falls back to showing all turns when a thread has no annotated session markers at all, instead of rendering an empty chat pane despite non-empty `/history`.
   - when a thread has exactly one annotated session, the selected session view also keeps older unannotated turns so pre-annotation history is still visible for that same session.
+
+- 2026-03-13: allowed concurrent turns across different sessions on the same thread.
+  - changed the runtime turn controller from thread-wide locking to `(threadId, sessionId)` scoping, while keeping delete/compact/shared thread mutations guarded at whole-thread scope.
+  - changed cached provider reuse from thread scope to session/config scope so switching sessions mid-stream no longer reuses the wrong provider instance.
+  - updated the Web UI to key cached messages, live stream state, and permission cards by `(threadId, sessionId)`, which keeps background session output from overwriting the currently visible session.
+  - session-only `PATCH /v1/threads/{threadId}` updates now succeed while another session on the same thread is active, so the right-side session switcher can move to a new session before starting the next turn.
+
+- 2026-03-13: fixed Web UI session switching while another session on the same thread is still streaming.
+  - the chat subscribe loop now forces a full chat-area rebuild when the selected `(threadId, sessionId)` changes to a scope with an active stream whose bubble is not mounted in the current DOM.
+  - returning to a background-streaming session now restores the loading/typing bubble, live partial text, and pending permission UI instead of rendering only the persisted message list.
+
+- 2026-03-13: moved working-directory details into a chat-header Session Info popover in the Web UI.
+  - removed the visible working-directory line from the chat header and added an info icon that appears only when the selected session already has a persisted `sessionId`.
+  - clicking the icon now opens a `Session Info` popover showing `Session ID` and `Working Directory`, each with a dedicated copy action; clicking outside or pressing `Esc` closes it.
+  - executed validation:
+    - pass: `cd internal/webui/web && npm run build`
+    - pass: `go test ./...`
+
+- 2026-03-13: added per-session loading indicators to the Web UI session sidebar.
+  - the right-side `Sessions` list now shows the same spinner used by the left agent list when a specific `sessionId` on the active thread is still streaming.
+  - session items derive their loading state from scope-local `streamStates`, so background activity is shown only on the matching session row.
   - executed validation:
     - pass: `cd internal/webui/web && npm run build`
     - pass: `go test ./...`

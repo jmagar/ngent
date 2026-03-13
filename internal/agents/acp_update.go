@@ -8,8 +8,14 @@ import (
 )
 
 const (
-	// ACPUpdateTypeMessageChunk streams agent text deltas.
+	// ACPUpdateTypeMessageChunk streams assistant text deltas.
 	ACPUpdateTypeMessageChunk = "agent_message_chunk"
+	// ACPUpdateTypeAgentMessageChunk streams assistant text deltas.
+	ACPUpdateTypeAgentMessageChunk = ACPUpdateTypeMessageChunk
+	// ACPUpdateTypeUserMessageChunk replays user text during session/load.
+	ACPUpdateTypeUserMessageChunk = "user_message_chunk"
+	// ACPUpdateTypeThoughtMessageChunk streams hidden reasoning deltas.
+	ACPUpdateTypeThoughtMessageChunk = "thought_message_chunk"
 	// ACPUpdateTypePlan replaces the current agent plan entries.
 	ACPUpdateTypePlan = "plan"
 )
@@ -24,7 +30,10 @@ type PlanEntry struct {
 // ACPUpdate is one normalized ACP session/update payload.
 type ACPUpdate struct {
 	Type        string
+	Role        string
 	Delta       string
+	MessageID   string
+	Timestamp   string
 	PlanEntries []PlanEntry
 }
 
@@ -35,14 +44,17 @@ func ParseACPUpdate(raw json.RawMessage) (ACPUpdate, error) {
 	}
 
 	var payload struct {
-		Delta  string `json:"delta"`
-		Update struct {
-			SessionUpdate string `json:"sessionUpdate"`
-			Content       struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-			} `json:"content"`
-			Entries []PlanEntry `json:"entries"`
+		Delta     string         `json:"delta"`
+		MessageID string         `json:"messageId"`
+		Timestamp string         `json:"timestamp"`
+		Meta      map[string]any `json:"_meta"`
+		Update    struct {
+			SessionUpdate string          `json:"sessionUpdate"`
+			MessageID     string          `json:"messageId"`
+			Timestamp     string          `json:"timestamp"`
+			Meta          map[string]any  `json:"_meta"`
+			Content       json.RawMessage `json:"content"`
+			Entries       []PlanEntry     `json:"entries"`
 		} `json:"update"`
 	}
 	if err := json.Unmarshal(raw, &payload); err != nil {
@@ -56,15 +68,52 @@ func ParseACPUpdate(raw json.RawMessage) (ACPUpdate, error) {
 		}
 		return ACPUpdate{
 			Type:  ACPUpdateTypeMessageChunk,
+			Role:  "assistant",
 			Delta: payload.Delta,
+			MessageID: normalizeACPUpdateString(
+				payload.Update.MessageID,
+				payload.MessageID,
+				acpUpdateMetaString(payload.Update.Meta, "messageId"),
+				acpUpdateMetaString(payload.Meta, "messageId"),
+			),
+			Timestamp: normalizeACPUpdateString(
+				payload.Update.Timestamp,
+				payload.Timestamp,
+				acpUpdateMetaString(payload.Update.Meta, "timestamp"),
+				acpUpdateMetaString(payload.Meta, "timestamp"),
+			),
 		}, nil
-	case ACPUpdateTypeMessageChunk:
-		if contentType := strings.TrimSpace(payload.Update.Content.Type); contentType != "" && contentType != "text" {
-			return ACPUpdate{Type: ACPUpdateTypeMessageChunk}, nil
+	case ACPUpdateTypeAgentMessageChunk, ACPUpdateTypeUserMessageChunk, ACPUpdateTypeThoughtMessageChunk:
+		content, ok, err := parseACPUpdateTextContent(payload.Update.Content)
+		if err != nil {
+			return ACPUpdate{}, err
+		}
+		if !ok {
+			return ACPUpdate{Type: strings.TrimSpace(payload.Update.SessionUpdate)}, nil
+		}
+		role := ""
+		switch strings.TrimSpace(payload.Update.SessionUpdate) {
+		case ACPUpdateTypeAgentMessageChunk:
+			role = "assistant"
+		case ACPUpdateTypeUserMessageChunk:
+			role = "user"
 		}
 		return ACPUpdate{
-			Type:  ACPUpdateTypeMessageChunk,
-			Delta: payload.Update.Content.Text,
+			Type:  strings.TrimSpace(payload.Update.SessionUpdate),
+			Role:  role,
+			Delta: content,
+			MessageID: normalizeACPUpdateString(
+				payload.Update.MessageID,
+				payload.MessageID,
+				acpUpdateMetaString(payload.Update.Meta, "messageId"),
+				acpUpdateMetaString(payload.Meta, "messageId"),
+			),
+			Timestamp: normalizeACPUpdateString(
+				payload.Update.Timestamp,
+				payload.Timestamp,
+				acpUpdateMetaString(payload.Update.Meta, "timestamp"),
+				acpUpdateMetaString(payload.Meta, "timestamp"),
+			),
 		}, nil
 	case ACPUpdateTypePlan:
 		return ACPUpdate{
@@ -74,6 +123,47 @@ func ParseACPUpdate(raw json.RawMessage) (ACPUpdate, error) {
 	default:
 		return ACPUpdate{Type: strings.TrimSpace(payload.Update.SessionUpdate)}, nil
 	}
+}
+
+func parseACPUpdateTextContent(raw json.RawMessage) (string, bool, error) {
+	raw = json.RawMessage(strings.TrimSpace(string(raw)))
+	if len(raw) == 0 || string(raw) == "null" {
+		return "", false, nil
+	}
+
+	var content struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(raw, &content); err != nil {
+		// Providers like Qwen emit non-text updates such as tool_call_update
+		// whose content is an array/object with a different schema. Those
+		// updates should be ignored rather than aborting the whole replay.
+		return "", false, nil
+	}
+	if contentType := strings.TrimSpace(content.Type); contentType != "" && contentType != "text" {
+		return "", false, nil
+	}
+	return content.Text, true, nil
+}
+
+func acpUpdateMetaString(values map[string]any, key string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	value, _ := values[key]
+	text, _ := value.(string)
+	return strings.TrimSpace(text)
+}
+
+func normalizeACPUpdateString(values ...string) string {
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 // ClonePlanEntries returns a trimmed deep copy of the provided entries.

@@ -658,7 +658,7 @@ func (c *Client) ensureInitialized(ctx context.Context) (*codexacp.EmbeddedRunti
 			_ = runtime.Close()
 			return nil, "", "", agents.ErrSessionLoadUnsupported
 		}
-		session, err := c.findSession(startCtx, c.Dir(), requestedSessionID)
+		session, err := c.findSessionInRuntime(startCtx, runtime, c.Dir(), requestedSessionID)
 		if err != nil {
 			_ = runtime.Close()
 			return nil, "", "", err
