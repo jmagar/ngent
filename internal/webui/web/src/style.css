@@ -532,6 +532,13 @@ body {
   color: var(--text-1);
 }
 
+.session-panel-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
 .session-panel-subtitle {
   margin-top: 3px;
   color: var(--text-3);
@@ -617,6 +624,10 @@ body {
   flex-shrink: 0;
 }
 
+.session-refresh-btn--loading svg {
+  animation: session-refresh-spin 0.9s linear infinite;
+}
+
 .session-show-more-btn {
   align-self: center;
 }
@@ -637,6 +648,11 @@ body {
 .session-panel-inline-error {
   font-size: var(--font-size-xs);
   text-align: center;
+}
+
+@keyframes session-refresh-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
 }
 
 /* Chat header */

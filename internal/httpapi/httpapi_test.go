@@ -1158,8 +1158,8 @@ func TestThreadConfigOptionsGetAndSetModel(t *testing.T) {
 	if got := streamer.SetConfigCalls(); got != 1 {
 		t.Fatalf("set config call count = %d, want %d", got, 1)
 	}
-	if got := streamer.CloseCount(); got != 0 {
-		t.Fatalf("provider close count = %d, want %d", got, 0)
+	if got := streamer.CloseCount(); got != 1 {
+		t.Fatalf("provider close count = %d, want %d", got, 1)
 	}
 
 	threadStatus, threadBody := doJSON(
@@ -1668,7 +1668,7 @@ func TestTurnCancel(t *testing.T) {
 	}
 }
 
-func TestTurnConflictSingleActiveTurnPerThread(t *testing.T) {
+func TestTurnConflictSingleActiveTurnPerSession(t *testing.T) {
 	root := t.TempDir()
 	h := newTestServer(t, testServerOptions{allowedRoots: []string{root}})
 	ts := httptest.NewServer(h)
@@ -1700,6 +1700,94 @@ func TestTurnConflictSingleActiveTurnPerThread(t *testing.T) {
 	streamResult := <-streamResultCh
 	if streamResult.StatusCode != http.StatusOK {
 		t.Fatalf("first turn status = %d, want %d", streamResult.StatusCode, http.StatusOK)
+	}
+}
+
+func TestTurnAllowsConcurrentSessionsOnSameThread(t *testing.T) {
+	root := t.TempDir()
+	releaseSessionA := make(chan struct{})
+	h := newTestServer(t, testServerOptions{
+		allowedRoots: []string{root},
+		turnAgentFactory: func(thread storage.Thread) (agents.Streamer, error) {
+			sessionID := threadSessionID(thread.AgentOptionsJSON)
+			return &sessionScopedStreamer{
+				sessionID: sessionID,
+				release:   releaseSessionA,
+				block:     sessionID == "ses-a",
+			}, nil
+		},
+	})
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	threadID := createThreadHTTP(t, ts.URL, "client-a", root)
+
+	updateStatus, updateBody := doJSON(
+		t,
+		http.MethodPatch,
+		ts.URL+"/v1/threads/"+threadID,
+		map[string]any{"agentOptions": map[string]any{"sessionId": "ses-a"}},
+		map[string]string{"X-Client-ID": "client-a"},
+	)
+	if updateStatus != http.StatusOK {
+		t.Fatalf("set session a status = %d, want %d, body=%s", updateStatus, http.StatusOK, updateBody)
+	}
+
+	streamResultCh := make(chan httpTurnStreamResult, 1)
+	go func() {
+		streamResultCh <- runTurnStreamRequest(t, ts.URL, "client-a", threadID, "from-session-a")
+	}()
+
+	turnID := waitForTurnID(t, ts.URL, "client-a", threadID, 4*time.Second)
+	if turnID == "" {
+		t.Fatalf("failed to observe running session-a turn before timeout")
+	}
+
+	switchStatus, switchBody := doJSON(
+		t,
+		http.MethodPatch,
+		ts.URL+"/v1/threads/"+threadID,
+		map[string]any{"agentOptions": map[string]any{"sessionId": "ses-b"}},
+		map[string]string{"X-Client-ID": "client-a"},
+	)
+	if switchStatus != http.StatusOK {
+		t.Fatalf("switch session status = %d, want %d, body=%s", switchStatus, http.StatusOK, switchBody)
+	}
+
+	secondResultCh := make(chan httpTurnStreamResult, 1)
+	go func() {
+		secondResultCh <- runTurnStreamRequest(t, ts.URL, "client-a", threadID, "from-session-b")
+	}()
+
+	select {
+	case secondResult := <-secondResultCh:
+		if secondResult.StatusCode != http.StatusOK {
+			t.Fatalf("second turn status = %d, want %d, body=%s", secondResult.StatusCode, http.StatusOK, secondResult.Body)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("second session turn did not complete while first session was active")
+	}
+
+	history := getHistoryHTTP(t, ts.URL, "client-a", threadID, false)
+	if got, want := len(history.Turns), 2; got != want {
+		t.Fatalf("len(history.turns) = %d, want %d", got, want)
+	}
+	if got, want := history.Turns[len(history.Turns)-1].ResponseText, "ses-b:from-session-b"; got != want {
+		t.Fatalf("second response = %q, want %q", got, want)
+	}
+
+	cancelStatus, cancelBody := postCancel(t, ts.URL, "client-a", turnID)
+	if cancelStatus != http.StatusOK {
+		t.Fatalf("cancel status = %d, want %d, body=%s", cancelStatus, http.StatusOK, cancelBody)
+	}
+
+	select {
+	case streamResult := <-streamResultCh:
+		if streamResult.StatusCode != http.StatusOK {
+			t.Fatalf("first turn status = %d, want %d", streamResult.StatusCode, http.StatusOK)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("first session turn did not stop after cancel")
 	}
 }
 
@@ -2623,6 +2711,30 @@ func (s *sessionBoundStreamer) Stream(ctx context.Context, input string, onDelta
 		return agents.StopReasonEndTurn, err
 	}
 	if err := onDelta(input); err != nil {
+		return agents.StopReasonEndTurn, err
+	}
+	return agents.StopReasonEndTurn, nil
+}
+
+type sessionScopedStreamer struct {
+	sessionID string
+	release   <-chan struct{}
+	block     bool
+}
+
+func (s *sessionScopedStreamer) Name() string {
+	return "session-scoped-streamer"
+}
+
+func (s *sessionScopedStreamer) Stream(ctx context.Context, input string, onDelta func(delta string) error) (agents.StopReason, error) {
+	if s.block {
+		select {
+		case <-ctx.Done():
+			return agents.StopReasonCancelled, ctx.Err()
+		case <-s.release:
+		}
+	}
+	if err := onDelta(strings.TrimSpace(s.sessionID) + ":" + input); err != nil {
 		return agents.StopReasonEndTurn, err
 	}
 	return agents.StopReasonEndTurn, nil

@@ -201,8 +201,9 @@ All errors use:
 - Behavior:
   - when `title` is present, trims surrounding whitespace, persists `thread.title`, and updates `updatedAt`.
   - when `agentOptions` is present, updates persisted `thread.agentOptions` and `updatedAt`.
-  - if the thread has an active turn, returns `409 CONFLICT`.
-  - closes cached thread-level agent provider only when `agentOptions` is updated, so the next turn uses updated options.
+  - if the update changes shared thread state (`title`, `modelId`, `configOverrides`, or other non-session fields) while any session on the thread is active, returns `409 CONFLICT`.
+  - session-only `agentOptions.sessionId` updates are allowed while a different session on the same thread is active.
+  - closes cached thread-scoped agent providers only when the update changes non-session agent options, so the next turn uses updated shared options.
 - Response `200`:
 
 ```json
@@ -228,7 +229,7 @@ All errors use:
   - if thread does not exist OR does not belong to `X-Client-ID`, return `404`.
 - Behavior:
   - hard-deletes thread history (thread row + turns + events).
-  - if the thread has an active turn, returns `409 CONFLICT`.
+  - if any session on the thread has an active turn, returns `409 CONFLICT`.
 - Response `200`:
 
 ```json
@@ -251,8 +252,9 @@ All errors use:
 
 - Behavior:
   - response is SSE (`text/event-stream`).
-  - same thread allows only one active turn at a time.
-  - if another turn is active on that thread, return `409 CONFLICT`.
+  - same `(thread, sessionId)` scope allows only one active turn at a time.
+  - if another turn is active on that same scope, return `409 CONFLICT`.
+  - different sessions on the same thread may run concurrently after switching `agentOptions.sessionId`.
   - if provider requests runtime permission, server emits `permission_required` and pauses turn until decision/timeout.
 
 - SSE event types:

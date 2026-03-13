@@ -466,7 +466,7 @@ func TestGracefulShutdownForceCancelsTurns(t *testing.T) {
 		}
 	}
 
-	if err := controller.Activate("th-1", "tu-1", cancelFn); err != nil {
+	if err := controller.Activate("th-1", "ses-1", "tu-1", cancelFn); err != nil {
 		t.Fatalf("Activate() unexpected error: %v", err)
 	}
 

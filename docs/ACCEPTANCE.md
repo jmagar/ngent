@@ -25,12 +25,12 @@ This checklist defines executable acceptance checks for requirements 1-16.
 - Verification command:
   - `go test ./internal/httpapi -run TestMultiThreadParallelTurns -count=1`
 
-## Requirement 4: One active turn per thread plus cancel
+## Requirement 4: One active turn per thread/session scope plus cancel
 
-- Operation: start first turn, submit second turn on same thread, then cancel.
-- Expected: second turn gets `409 CONFLICT`; cancel converges quickly.
+- Operation: start first turn, submit second turn on same session, verify conflict; then switch to another session on the same thread and verify that second session can run concurrently; finally cancel.
+- Expected: same-session second turn gets `409 CONFLICT`; different session on the same thread is allowed; cancel converges quickly.
 - Verification command:
-  - `go test ./internal/httpapi -run TestTurnConflictSingleActiveTurnPerThread -count=1`
+  - `go test ./internal/httpapi -run 'TestTurnConflictSingleActiveTurnPerSession|TestTurnAllowsConcurrentSessionsOnSameThread' -count=1`
   - `go test ./internal/httpapi -run TestTurnCancel -count=1`
 
 ## Requirement 5: Lazy startup
@@ -215,7 +215,8 @@ This checklist defines executable acceptance checks for requirements 1-16.
   - normalized model/reasoning catalogs are persisted in sqlite and reused after service restart.
   - startup refresh of persisted catalogs happens asynchronously in the background and does not block frontend/API availability.
   - same-agent threads do not share selected current values, but can reuse the same stored catalog data for the same selected model.
-  - active turn mutation is rejected with `409 CONFLICT`.
+  - title/model/config mutations are rejected with `409 CONFLICT` while any session on the thread is active.
+  - session-only selection updates remain allowed when they switch to a different session.
 - Verification commands (executed 2026-03-06):
   - `go test ./internal/httpapi -run TestThreadConfigOptions -count=1`
   - `go test ./internal/httpapi -run TestThreadConfigOptionsPersistConfigOverrides -count=1`

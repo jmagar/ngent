@@ -250,3 +250,16 @@
   - if a full provider replay refresh is required immediately, clear the cached row from sqlite and request `/session-history` again.
 - Follow-up plan:
   - persist `session/list.updatedAt` metadata and invalidate or refresh `session_transcript_cache` when that metadata advances.
+
+- ID: KI-026
+- Title: Thread-wide config changes still serialize across concurrent sessions
+- Status: Open
+- Severity: Low
+- Affects: `PATCH /v1/threads/{threadId}` non-session updates and `POST /v1/threads/{threadId}/config-options`
+- Symptom:
+  - the server now allows concurrent turns across different sessions on the same thread.
+  - shared thread metadata such as title, model, and config overrides still returns `409 CONFLICT` while any session on that thread is active.
+- Workaround:
+  - wait for active sessions to finish or cancel them before renaming the thread or changing shared model/config options.
+- Follow-up plan:
+  - evaluate whether some metadata-only updates can move to a narrower guard without letting shared provider state drift across sessions.

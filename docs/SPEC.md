@@ -26,9 +26,10 @@ Modules:
 
 ## 3. Concurrency Model
 
-- Thread is the concurrency isolation unit.
-- Each thread has exactly one active turn.
-- New turn requests on active thread return conflict error.
+- `(thread, sessionId)` is the turn-execution isolation unit; empty `sessionId` represents the provisional "new session" scope.
+- Each thread/session scope has at most one active turn.
+- New turn requests on an active scope return conflict error, while different sessions on the same thread may run concurrently.
+- Thread-level destructive or shared-state operations (for example delete/compact and thread-wide config changes) remain whole-thread guarded.
 - Cancel request transitions turn state immediately and propagates cancellation token to provider.
 - Permission requests suspend the turn until a client decision arrives or timeout occurs.
 
@@ -39,7 +40,7 @@ Modules:
 - On first turn execution for embedded-provider thread (currently `codex`): server creates the in-process runtime and initializes ACP session lazily.
 - Embedded runtime `session/new` is created with `cwd=thread.cwd` (validated as absolute path at thread creation).
 - If `thread.agent_options_json` contains `modelId`, providers apply it as model override during thread-level runtime/session initialization.
-- Provider instances are cached per thread and reclaimed by idle TTL (`--agent-idle-ttl`) when thread has no active turn.
+- Provider instances are cached per thread/session/config scope and reclaimed by idle TTL (`--agent-idle-ttl`) when that scope has no active turn.
 
 ## 5. Permission Bridge
 
@@ -104,7 +105,7 @@ See `docs/API.md` for endpoint and schema contracts.
 - strict input validation:
   - agent must be allowlisted.
   - cwd must be absolute.
-- thread option updates are rejected while a turn is active on the same thread.
+- thread option updates that change shared thread state are rejected while any session on that thread is active; session-only selection updates are allowed while a different session is running.
 - logs are JSON on stderr and redact sensitive data.
 - `--debug=true` raises log verbosity to debug level and emits sanitized ACP JSON-RPC request/response traces on stderr.
 - HTTP payloads contain protocol data only.
@@ -128,7 +129,7 @@ See `docs/API.md` for concrete schema and codes.
 - add `qwen` as a first-class ACP provider using `qwen --acp`.
 - preserve all existing contracts and behavior for `codex`, `opencode`, and `gemini`.
 - keep runtime/security invariants unchanged:
-  - one active turn per thread.
+  - one active turn per `(thread, session)` scope.
   - fail-closed permission workflow.
   - allowlisted `agent` and absolute+allowed `cwd` validation.
   - protocol-only stdout/HTTP payloads, JSON logs on stderr.
@@ -227,7 +228,7 @@ and upstream ACP schema:
 
 - add `kimi` as a first-class ACP provider using the Kimi CLI ACP mode.
 - preserve existing runtime/security invariants:
-  - one active turn per thread.
+  - one active turn per `(thread, session)` scope.
   - fail-closed permission workflow.
   - allowlisted `agent` and absolute+allowed `cwd` validation.
   - protocol-only stdout/HTTP payloads, JSON logs on stderr.

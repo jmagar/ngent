@@ -645,3 +645,12 @@ This file is the source of milestone progress, validation commands, and next act
   - executed validation:
     - pass: `cd internal/webui/web && npm run build`
     - pass: `go test ./...`
+
+- 2026-03-13: allowed concurrent turns across different sessions on the same thread.
+  - changed the runtime turn controller from thread-wide locking to `(threadId, sessionId)` scoping, while keeping delete/compact/shared thread mutations guarded at whole-thread scope.
+  - changed cached provider reuse from thread scope to session/config scope so switching sessions mid-stream no longer reuses the wrong provider instance.
+  - updated the Web UI to key cached messages, live stream state, and permission cards by `(threadId, sessionId)`, which keeps background session output from overwriting the currently visible session.
+  - session-only `PATCH /v1/threads/{threadId}` updates now succeed while another session on the same thread is active, so the right-side session switcher can move to a new session before starting the next turn.
+  - executed validation:
+    - pass: `cd internal/webui/web && npm run build`
+    - pass: `go test ./...`

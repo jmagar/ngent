@@ -905,3 +905,25 @@ Use this template for new decisions.
 - Alternatives considered:
   - add a session-scoped history endpoint immediately (rejected: larger server contract change while turn events already contain the session discriminator).
   - keep all thread turns visible regardless of selected session (rejected: does not meet the expected session playback behavior).
+
+## ADR-038: Allow concurrent turns across different sessions on the same thread
+
+- Status: Accepted
+- Date: 2026-03-13
+- Context:
+  - once ACP session switching shipped, users needed to leave one session streaming while switching the same thread to another session and continuing work there.
+  - the existing runtime/controller and provider cache were keyed only by `threadId`, so a running turn blocked `PATCH /v1/threads/{threadId}` session changes and forced all sessions on that thread into a single execution lane.
+  - provider instances keep mutable session/model/config state, so simply removing the conflict check would have let different sessions reuse the wrong cached provider.
+- Decision:
+  - change turn concurrency from thread-wide to `(threadId, sessionId)` scope, with empty `sessionId` representing the provisional "new session" scope until `session_bound` arrives.
+  - keep delete/compact and shared thread-state mutations guarded at whole-thread scope.
+  - rebind active turn scope when `session_bound` reports the effective session id so same-session re-entry remains blocked after a new session is created.
+  - key cached providers by thread/session/shared-option scope instead of raw thread id, and evict all cached providers for a thread after shared config changes.
+  - update the Web UI to store messages and live stream state per chat scope `(threadId, sessionId)` so background turns in one session do not overwrite another session's visible transcript.
+- Consequences:
+  - users can switch the right-side session picker and start work in session B while session A is still streaming on the same thread.
+  - same-session re-entry protection, cancellation, and permission handling remain unchanged.
+  - thread-wide config changes remain serialized and are documented as KI-021.
+- Alternatives considered:
+  - keep thread-wide turn serialization and force users to create separate threads per ACP session (rejected: poor UX and redundant thread duplication).
+  - remove the conflict check without changing provider cache scope (rejected: would mix session-bound provider state and route turns to the wrong ACP session).
