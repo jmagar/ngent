@@ -395,7 +395,6 @@ This file is the source of milestone progress, validation commands, and next act
   - executed validation:
   - added unit tests (`TestPreflight_*`, `TestNew_*`, `TestClose_*`, `TestDefaultRuntimeConfig_ReadsEnv`) covering token presence/absence, default/custom timeouts, and idempotent close.
   - added optional real smoke test (`E2E_CLAUDE=1 go test ./internal/agents/claude/ -run TestClaudeE2ESmoke -v -timeout 120s`); confirmed `PONG` response and `stopReason=end_turn` (16.68s).
-  - added `go.mod` `replace` directive pointing to local `github.com/beyond5959/acp-adapter` for local development; refreshed module dependencies for the embedded Claude runtime integration.
   - wired claude into `cmd/ngent/main.go`: preflight call, `"claude"` in `AllowedAgentIDs`, `case "claude"` in `TurnAgentFactory`, real status in `supportedAgents`.
   - updated `main_test.go`: `supportedAgents` signature extended with `claudeAvailable bool`; added claude id/status assertions.
   - executed validation:

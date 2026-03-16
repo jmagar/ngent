@@ -796,16 +796,13 @@ Use this template for new decisions.
   - replace `codexacp` references with `claudeacp`; `Preflight()` checks `ANTHROPIC_AUTH_TOKEN != ""` (no binary lookup).
   - `DefaultRuntimeConfig()` delegates to `claudeacp.DefaultRuntimeConfig()`, which reads `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_BASE_URL` from environment.
   - wire into server startup: preflight, `/v1/agents` status, `AllowedAgentIDs`, and `TurnAgentFactory`.
-  - for local development, add `replace github.com/beyond5959/acp-adapter => /path/to/local/acp-adapter` in `go.mod`; remove or publish before production release.
 - Consequences:
   - claude availability is purely environment-variable dependent; no binary installation required beyond valid API credentials.
   - `ANTHROPIC_BASE_URL` allows pointing at a compatible proxy or local endpoint (e.g., for testing or corporate gateways).
-  - local `go.mod` replace directive must be removed or updated to a published version before CI/release builds.
 - Alternatives considered:
   - implement as an ACP stdio provider wrapping the `claude` CLI binary (rejected: CLI spawns its own runtime per invocation with higher latency and no direct permission bridge).
   - share implementation with codex via generics/interface (rejected: would couple two independently-versioned runtimes).
 - Follow-up actions:
-  - publish `acp-adapter` with `pkg/claudeacp` to a versioned tag and remove the `replace` directive from `go.mod`.
   - add permission round-trip E2E test for Claude (approved/declined/cancelled paths).
 
 ## ADR-025: Thread-level model switching via ACP session config options
