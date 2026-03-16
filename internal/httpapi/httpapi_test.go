@@ -2004,6 +2004,105 @@ func TestTurnsSSEIncludesPlanUpdatesAndPersistsHistory(t *testing.T) {
 	}
 }
 
+func TestTurnsSSEIncludesToolCallUpdatesAndPersistsHistory(t *testing.T) {
+	root := t.TempDir()
+	h := newTestServer(t, testServerOptions{
+		allowedRoots: []string{root},
+		agent:        &toolCallStreamer{},
+	})
+
+	threadID := createThreadForClient(t, h, "client-a", root)
+
+	turnRR := performJSONRequest(t, h, http.MethodPost, "/v1/threads/"+threadID+"/turns", map[string]any{
+		"input":  "run tool",
+		"stream": true,
+	}, map[string]string{"X-Client-ID": "client-a"})
+	if turnRR.Code != http.StatusOK {
+		t.Fatalf("turn status code = %d, want %d", turnRR.Code, http.StatusOK)
+	}
+
+	events := parseSSEEvents(t, turnRR.Body.String())
+	var seenToolCall bool
+	var seenToolCallUpdate bool
+	for _, ev := range events {
+		switch ev.Event {
+		case eventTypeToolCall:
+			seenToolCall = true
+			if got := stringField(ev.Data, "toolCallId"); got != "call-1" {
+				t.Fatalf("tool_call.toolCallId = %q, want %q", got, "call-1")
+			}
+			if got := stringField(ev.Data, "status"); got != "running" {
+				t.Fatalf("tool_call.status = %q, want %q", got, "running")
+			}
+			rawContent, ok := ev.Data["content"].([]any)
+			if !ok || len(rawContent) != 1 {
+				t.Fatalf("tool_call.content = %#v, want 1 content block", ev.Data["content"])
+			}
+		case eventTypeToolCallUpdate:
+			seenToolCallUpdate = true
+			if got := stringField(ev.Data, "toolCallId"); got != "call-1" {
+				t.Fatalf("tool_call_update.toolCallId = %q, want %q", got, "call-1")
+			}
+			if got := stringField(ev.Data, "status"); got != "completed" {
+				t.Fatalf("tool_call_update.status = %q, want %q", got, "completed")
+			}
+			rawOutput, ok := ev.Data["rawOutput"].(map[string]any)
+			if !ok {
+				t.Fatalf("tool_call_update.rawOutput type = %T, want map[string]any", ev.Data["rawOutput"])
+			}
+			if got, ok := rawOutput["ok"].(bool); !ok || !got {
+				t.Fatalf("tool_call_update.rawOutput.ok = %#v, want true", rawOutput["ok"])
+			}
+		}
+	}
+	if !seenToolCall {
+		t.Fatal("missing tool_call SSE event")
+	}
+	if !seenToolCallUpdate {
+		t.Fatal("missing tool_call_update SSE event")
+	}
+
+	historyRR := performJSONRequest(t, h, http.MethodGet, "/v1/threads/"+threadID+"/history?includeEvents=true", nil, map[string]string{"X-Client-ID": "client-a"})
+	if historyRR.Code != http.StatusOK {
+		t.Fatalf("history status code = %d, want %d", historyRR.Code, http.StatusOK)
+	}
+
+	var history struct {
+		Turns []struct {
+			ResponseText string `json:"responseText"`
+			Events       []struct {
+				Type string         `json:"type"`
+				Data map[string]any `json:"data"`
+			} `json:"events"`
+		} `json:"turns"`
+	}
+	if err := json.Unmarshal(historyRR.Body.Bytes(), &history); err != nil {
+		t.Fatalf("unmarshal history: %v", err)
+	}
+	if got, want := len(history.Turns), 1; got != want {
+		t.Fatalf("len(history.turns) = %d, want %d", got, want)
+	}
+	if got := history.Turns[0].ResponseText; got != "tool done" {
+		t.Fatalf("history responseText = %q, want %q", got, "tool done")
+	}
+
+	var historyToolCall, historyToolCallUpdate bool
+	for _, event := range history.Turns[0].Events {
+		switch event.Type {
+		case eventTypeToolCall:
+			historyToolCall = true
+		case eventTypeToolCallUpdate:
+			historyToolCallUpdate = true
+		}
+	}
+	if !historyToolCall {
+		t.Fatal("missing persisted tool_call event")
+	}
+	if !historyToolCallUpdate {
+		t.Fatal("missing persisted tool_call_update event")
+	}
+}
+
 func TestCodexTurnWorksWithoutBinaryPathConfig(t *testing.T) {
 	root := t.TempDir()
 	h := newTestServer(t, testServerOptions{allowedRoots: []string{root}})
@@ -3084,6 +3183,48 @@ func (s *reasoningStreamer) Stream(ctx context.Context, input string, onDelta fu
 		return agents.StopReasonEndTurn, err
 	}
 	if err := onDelta("final answer"); err != nil {
+		return agents.StopReasonEndTurn, err
+	}
+	return agents.StopReasonEndTurn, nil
+}
+
+type toolCallStreamer struct{}
+
+func (s *toolCallStreamer) Name() string {
+	return "tool-call-streamer"
+}
+
+func (s *toolCallStreamer) Stream(ctx context.Context, input string, onDelta func(delta string) error) (agents.StopReason, error) {
+	_ = input
+	if err := agents.NotifyToolCall(ctx, agents.ACPToolCall{
+		Type:       agents.ACPUpdateTypeToolCall,
+		ToolCallID: "call-1",
+		Title:      "Read file",
+		Kind:       "read_file",
+		Status:     "running",
+		Content: json.RawMessage(`[
+			{"type":"content","content":{"type":"text","text":"opening file"}}
+		]`),
+		RawInput:    json.RawMessage(`{"path":"/tmp/demo.txt"}`),
+		HasTitle:    true,
+		HasKind:     true,
+		HasStatus:   true,
+		HasContent:  true,
+		HasRawInput: true,
+	}); err != nil {
+		return agents.StopReasonEndTurn, err
+	}
+	if err := agents.NotifyToolCall(ctx, agents.ACPToolCall{
+		Type:         agents.ACPUpdateTypeToolCallUpdate,
+		ToolCallID:   "call-1",
+		Status:       "completed",
+		RawOutput:    json.RawMessage(`{"ok":true}`),
+		HasStatus:    true,
+		HasRawOutput: true,
+	}); err != nil {
+		return agents.StopReasonEndTurn, err
+	}
+	if err := onDelta("tool done"); err != nil {
 		return agents.StopReasonEndTurn, err
 	}
 	return agents.StopReasonEndTurn, nil

@@ -17,6 +17,7 @@ import type {
   PlanEntry,
   SessionInfo,
   SessionTranscriptMessage,
+  ToolCall,
 } from './types.ts'
 import type {
   TurnStream,
@@ -24,6 +25,7 @@ import type {
   PlanUpdatePayload,
   ReasoningDeltaPayload,
   SessionBoundPayload,
+  ToolCallPayload,
 } from './sse.ts'
 import { copyText, escHtml, formatRelativeTime, formatTimestamp, generateUUID } from './utils.ts'
 
@@ -202,6 +204,90 @@ function clonePlanEntries(entries: PlanEntry[] | null | undefined): PlanEntry[] 
   return cloned.length ? cloned : undefined
 }
 
+function cloneJSONValue<T>(value: T): T {
+  if (value === undefined) return value
+  return JSON.parse(JSON.stringify(value)) as T
+}
+
+let toolCallPreId = 0
+
+function nextToolCallPreID(): string {
+  toolCallPreId += 1
+  return `tool-call-pre-${toolCallPreId}`
+}
+
+function cloneToolCalls(toolCalls: ToolCall[] | null | undefined): ToolCall[] | undefined {
+  if (!toolCalls?.length) return undefined
+
+  const cloned: ToolCall[] = []
+  const seen = new Set<string>()
+  for (const rawToolCall of toolCalls) {
+    const toolCallId = rawToolCall.toolCallId?.trim() ?? ''
+    if (!toolCallId || seen.has(toolCallId)) continue
+    seen.add(toolCallId)
+    cloned.push({
+      toolCallId,
+      title: rawToolCall.title?.trim() || undefined,
+      kind: rawToolCall.kind?.trim() || undefined,
+      status: rawToolCall.status?.trim() || undefined,
+      content: Array.isArray(rawToolCall.content) ? cloneJSONValue(rawToolCall.content) : undefined,
+      locations: Array.isArray(rawToolCall.locations) ? cloneJSONValue(rawToolCall.locations) : undefined,
+      rawInput: rawToolCall.rawInput === undefined ? undefined : cloneJSONValue(rawToolCall.rawInput),
+      rawOutput: rawToolCall.rawOutput === undefined ? undefined : cloneJSONValue(rawToolCall.rawOutput),
+    })
+  }
+  return cloned.length ? cloned : undefined
+}
+
+function applyToolCallEvent(toolCalls: ToolCall[], payload: Record<string, unknown>): ToolCall[] {
+  const toolCallId = typeof payload.toolCallId === 'string' ? payload.toolCallId.trim() : ''
+  if (!toolCallId) return cloneToolCalls(toolCalls) ?? []
+
+  const next = cloneToolCalls(toolCalls) ?? []
+  const existingIndex = next.findIndex(toolCall => toolCall.toolCallId === toolCallId)
+  const current: ToolCall = existingIndex >= 0 ? next[existingIndex] : { toolCallId }
+  const merged: ToolCall = { ...current, toolCallId }
+
+  if (Object.prototype.hasOwnProperty.call(payload, 'title')) {
+    merged.title = typeof payload.title === 'string' && payload.title.trim()
+      ? payload.title.trim()
+      : undefined
+  }
+  if (Object.prototype.hasOwnProperty.call(payload, 'kind')) {
+    merged.kind = typeof payload.kind === 'string' && payload.kind.trim()
+      ? payload.kind.trim()
+      : undefined
+  }
+  if (Object.prototype.hasOwnProperty.call(payload, 'status')) {
+    merged.status = typeof payload.status === 'string' && payload.status.trim()
+      ? payload.status.trim()
+      : undefined
+  }
+  if (Object.prototype.hasOwnProperty.call(payload, 'content')) {
+    merged.content = Array.isArray(payload.content) ? cloneJSONValue(payload.content) : undefined
+  }
+  if (Object.prototype.hasOwnProperty.call(payload, 'locations')) {
+    merged.locations = Array.isArray(payload.locations) ? cloneJSONValue(payload.locations) : undefined
+  }
+  if (Object.prototype.hasOwnProperty.call(payload, 'rawInput')) {
+    merged.rawInput = payload.rawInput === undefined || payload.rawInput === null
+      ? undefined
+      : cloneJSONValue(payload.rawInput)
+  }
+  if (Object.prototype.hasOwnProperty.call(payload, 'rawOutput')) {
+    merged.rawOutput = payload.rawOutput === undefined || payload.rawOutput === null
+      ? undefined
+      : cloneJSONValue(payload.rawOutput)
+  }
+
+  if (existingIndex >= 0) {
+    next[existingIndex] = merged
+  } else {
+    next.push(merged)
+  }
+  return next
+}
+
 function hasReasoningText(value: string | null | undefined): value is string {
   return typeof value === 'string' && value.trim().length > 0
 }
@@ -272,6 +358,15 @@ function extractTurnPlanEntries(events: TurnEvent[] | undefined): PlanEntry[] | 
     latest = parsePlanEntries(event.data.entries)
   }
   return clonePlanEntries(latest)
+}
+
+function extractTurnToolCalls(events: TurnEvent[] | undefined): ToolCall[] | undefined {
+  let toolCalls: ToolCall[] = []
+  for (const event of events ?? []) {
+    if (event.type !== 'tool_call' && event.type !== 'tool_call_update') continue
+    toolCalls = applyToolCallEvent(toolCalls, event.data)
+  }
+  return cloneToolCalls(toolCalls)
 }
 
 function extractTurnReasoning(events: TurnEvent[] | undefined): string {
@@ -450,6 +545,7 @@ let activeStreamScopeKey = ''
 const streamsByScope = new Map<string, TurnStream>()
 const streamBufferByScope = new Map<string, string>()
 const streamPlanByScope = new Map<string, PlanEntry[]>()
+const streamToolCallsByScope = new Map<string, ToolCall[]>()
 const streamReasoningByScope = new Map<string, string>()
 const streamStartedAtByScope = new Map<string, string>()
 type PendingPermission = PermissionRequiredPayload & { deadlineMs: number }
@@ -787,15 +883,17 @@ function appendOrRestoreStreamingBubble(thread: Thread): void {
   div.className = 'message message--agent'
   div.dataset.msgId = streamState.messageId
   const livePlanEntries = streamPlanByScope.get(scopeKey)
+  const liveToolCalls = streamToolCallsByScope.get(scopeKey)
   const liveReasoning = streamReasoningByScope.get(scopeKey) ?? ''
   div.innerHTML = `
     <div class="message-avatar">${avatar}</div>
     <div class="message-group">
-      ${renderStreamingBubbleHTML(streamState.messageId, '', livePlanEntries, liveReasoning)}
+      ${renderStreamingBubbleHTML(streamState.messageId, '', livePlanEntries, liveToolCalls, liveReasoning)}
       <div class="message-meta">
         <span class="message-time">${formatTimestamp(startedAt)}</span>
       </div>
     </div>`
+  bindMarkdownControls(div)
 
   listEl.appendChild(div)
   activeStreamMsgId = streamState.messageId
@@ -805,6 +903,7 @@ function appendOrRestoreStreamingBubble(thread: Thread): void {
   if (buffered) {
     updateStreamingBubbleContent(streamState.messageId, buffered)
   }
+  updateStreamingBubbleToolCalls(streamState.messageId, liveToolCalls)
   updateStreamingBubbleReasoning(streamState.messageId, liveReasoning)
   updateStreamingBubblePlan(streamState.messageId, livePlanEntries)
   listEl.scrollTop = listEl.scrollHeight
@@ -814,6 +913,7 @@ function clearScopeStreamRuntime(scopeKey: string): void {
   streamsByScope.delete(scopeKey)
   streamBufferByScope.delete(scopeKey)
   streamPlanByScope.delete(scopeKey)
+  streamToolCallsByScope.delete(scopeKey)
   streamReasoningByScope.delete(scopeKey)
   streamStartedAtByScope.delete(scopeKey)
   setScopeStreamState(scopeKey, null)
@@ -843,6 +943,11 @@ function rebindScopeRuntime(oldScopeKey: string, nextScopeKey: string, nextSessi
     const plans = streamPlanByScope.get(oldScopeKey) ?? []
     streamPlanByScope.delete(oldScopeKey)
     streamPlanByScope.set(nextScopeKey, plans)
+  }
+  if (streamToolCallsByScope.has(oldScopeKey)) {
+    const toolCalls = streamToolCallsByScope.get(oldScopeKey) ?? []
+    streamToolCallsByScope.delete(oldScopeKey)
+    streamToolCallsByScope.set(nextScopeKey, toolCalls)
   }
   if (streamReasoningByScope.has(oldScopeKey)) {
     const reasoning = streamReasoningByScope.get(oldScopeKey) ?? ''
@@ -1810,6 +1915,7 @@ function turnsToMessages(turns: Turn[]): Message[] {
     if (t.status !== 'running') {
       const planEntries = extractTurnPlanEntries(t.events)
       const reasoning = extractTurnReasoning(t.events)
+      const toolCalls = extractTurnToolCalls(t.events)
       const agentStatus: Message['status'] =
         t.status === 'cancelled' ? 'cancelled' :
         t.status === 'error'     ? 'error'     :
@@ -1825,6 +1931,7 @@ function turnsToMessages(turns: Turn[]): Message[] {
         stopReason:   t.stopReason   || undefined,
         errorMessage: t.errorMessage || undefined,
         planEntries,
+        toolCalls,
         reasoning: hasReasoningText(reasoning) ? reasoning : undefined,
       })
     }
@@ -2024,6 +2131,164 @@ function renderPlanSectionHTML(entries: PlanEntry[] | undefined, extraClass = ''
   return `<div class="message-plan${extraClass}">${renderPlanInnerHTML(normalized)}</div>`
 }
 
+function formatToolCallLabel(value: string | undefined): string {
+  return (value ?? '').replace(/_/g, ' ').trim()
+}
+
+function toolCallStatusClassName(status: string | undefined): string {
+  const normalized = (status ?? '').trim().toLowerCase()
+  if (!normalized || !/^[a-z_]+$/.test(normalized)) return ''
+  return ` message-tool-call__card--${normalized}`
+}
+
+function renderToolCallPreHTML(text: string, collapsible = false): string {
+  const preID = nextToolCallPreID()
+  const collapsedClass = collapsible ? ' message-tool-call__pre--collapsed' : ''
+  const expandBtn = collapsible
+    ? `<button class="message-tool-call__expand-btn" data-target="${preID}" type="button" hidden>Show all</button>`
+    : ''
+  return `
+    <div class="message-tool-call__pre-wrap">
+      <pre class="message-tool-call__pre${collapsedClass}" id="${preID}">${escHtml(text)}</pre>
+      ${expandBtn}
+    </div>`
+}
+
+function renderToolCallJSON(value: unknown, collapsible = false): string {
+  if (value === undefined) return ''
+  const formatted = JSON.stringify(value, null, 2)
+  return renderToolCallPreHTML(formatted ?? String(value), collapsible)
+}
+
+function renderToolCallLocationHTML(location: unknown): string {
+  if (location && typeof location === 'object') {
+    const record = location as Record<string, unknown>
+    const path = typeof record.path === 'string' ? record.path.trim() : ''
+    if (path) {
+      const meta = Object.entries(record)
+        .filter(([key]) => key !== 'path')
+        .map(([key, value]) => `${key}: ${String(value)}`)
+        .join(' · ')
+      return `
+        <li class="message-tool-call__location-item">
+          <span class="message-tool-call__path">${escHtml(path)}</span>
+          ${meta ? `<span class="message-tool-call__location-meta">${escHtml(meta)}</span>` : ''}
+        </li>`
+    }
+  }
+  return `<li class="message-tool-call__location-item">${renderToolCallJSON(location)}</li>`
+}
+
+function renderToolCallContentHTML(item: unknown): string {
+  if (!item || typeof item !== 'object') {
+    return renderToolCallJSON(item, true)
+  }
+
+  const record = item as Record<string, unknown>
+  const type = typeof record.type === 'string' ? record.type.trim() : ''
+  const path = typeof record.path === 'string' ? record.path.trim() : ''
+  const command = typeof record.command === 'string' ? record.command.trim() : ''
+  const heading = [formatToolCallLabel(type), path].filter(Boolean).join(' · ')
+
+  if (type === 'content' && record.content && typeof record.content === 'object') {
+    const nested = record.content as Record<string, unknown>
+    const nestedType = typeof nested.type === 'string' ? nested.type.trim() : ''
+    const text = typeof nested.text === 'string' ? nested.text : ''
+    if (nestedType === 'text' && text) {
+      return `
+        <div class="message-tool-call__content-item">
+          ${heading ? `<div class="message-tool-call__content-label">${escHtml(heading)}</div>` : ''}
+          ${renderToolCallPreHTML(text, true)}
+        </div>`
+    }
+  }
+
+  if (type === 'command' && command) {
+    return `
+      <div class="message-tool-call__content-item">
+        ${heading ? `<div class="message-tool-call__content-label">${escHtml(heading)}</div>` : ''}
+        ${renderToolCallPreHTML(command, true)}
+      </div>`
+  }
+
+  if (type === 'diff') {
+    const oldText = typeof record.oldText === 'string' ? record.oldText : ''
+    const newText = typeof record.newText === 'string' ? record.newText : ''
+    return `
+      <div class="message-tool-call__content-item">
+        ${heading ? `<div class="message-tool-call__content-label">${escHtml(heading)}</div>` : ''}
+        ${oldText ? `<div class="message-tool-call__diff-block"><div class="message-tool-call__diff-label">Before</div>${renderToolCallPreHTML(oldText, true)}</div>` : ''}
+        ${newText ? `<div class="message-tool-call__diff-block"><div class="message-tool-call__diff-label">After</div>${renderToolCallPreHTML(newText, true)}</div>` : ''}
+      </div>`
+  }
+
+  return `
+    <div class="message-tool-call__content-item">
+      ${heading ? `<div class="message-tool-call__content-label">${escHtml(heading)}</div>` : ''}
+      ${renderToolCallJSON(item, true)}
+    </div>`
+}
+
+function renderToolCallCardHTML(toolCall: ToolCall): string {
+  const title = toolCall.title?.trim() || toolCall.kind?.trim() || toolCall.toolCallId
+  const kind = formatToolCallLabel(toolCall.kind)
+  const status = formatToolCallLabel(toolCall.status)
+  const toolCallID = toolCall.toolCallId.trim()
+  const meta = [
+    kind ? `<span class="message-tool-call__tag">${escHtml(kind)}</span>` : '',
+    status ? `<span class="message-tool-call__tag message-tool-call__tag--status">${escHtml(status)}</span>` : '',
+    title !== toolCallID ? `<span class="message-tool-call__tag">${escHtml(toolCallID)}</span>` : '',
+  ].filter(Boolean).join('')
+  const contentHTML = (toolCall.content ?? []).map(renderToolCallContentHTML).join('')
+  const locationsHTML = toolCall.locations?.length
+    ? `
+      <div class="message-tool-call__section">
+        <div class="message-tool-call__section-title">Locations</div>
+        <ul class="message-tool-call__location-list">
+          ${toolCall.locations.map(renderToolCallLocationHTML).join('')}
+        </ul>
+      </div>`
+    : ''
+  const rawInputHTML = toolCall.rawInput === undefined
+    ? ''
+    : `
+      <div class="message-tool-call__section">
+        <div class="message-tool-call__section-title">Input</div>
+        ${renderToolCallJSON(toolCall.rawInput, true)}
+      </div>`
+  const rawOutputHTML = toolCall.rawOutput === undefined
+    ? ''
+    : `
+      <div class="message-tool-call__section">
+        <div class="message-tool-call__section-title">Output</div>
+        ${renderToolCallJSON(toolCall.rawOutput, true)}
+      </div>`
+
+  return `
+    <article class="message-tool-call__card${toolCallStatusClassName(toolCall.status)}">
+      <div class="message-tool-call__header-row">
+        <div class="message-tool-call__title">${escHtml(title)}</div>
+        ${meta ? `<div class="message-tool-call__meta">${meta}</div>` : ''}
+      </div>
+      ${contentHTML ? `<div class="message-tool-call__section"><div class="message-tool-call__section-title">Content</div>${contentHTML}</div>` : ''}
+      ${locationsHTML}
+      ${rawInputHTML}
+      ${rawOutputHTML}
+    </article>`
+}
+
+function renderToolCallSectionHTML(toolCalls: ToolCall[] | undefined, extraClass = ''): string {
+  const normalized = cloneToolCalls(toolCalls)
+  if (!normalized?.length) return ''
+  return `
+    <div class="message-tool-calls${extraClass}">
+      <div class="message-tool-calls__header">Tool Calls</div>
+      <div class="message-tool-calls__list">
+        ${normalized.map(renderToolCallCardHTML).join('')}
+      </div>
+    </div>`
+}
+
 function reasoningPanelState(expanded: boolean): 'open' | 'closed' {
   return expanded ? 'open' : 'closed'
 }
@@ -2106,6 +2371,7 @@ function renderMessage(msg: Message, agentAvatar: string): string {
     ? (msg.errorCode ? `[${msg.errorCode}] ` : '') + (msg.errorMessage ?? 'Unknown error')
     : (msg.content || '…')
   const planHTML = renderPlanSectionHTML(msg.planEntries)
+  const toolCallsHTML = renderToolCallSectionHTML(msg.toolCalls)
   const reasoningHTML = renderReasoningSectionHTML(
     msg.id,
     msg.reasoning,
@@ -2114,7 +2380,7 @@ function renderMessage(msg: Message, agentAvatar: string): string {
     true,
     'Thought',
   )
-  const hasSupplementarySections = !!msg.planEntries?.length || hasReasoningText(msg.reasoning)
+  const hasSupplementarySections = !!msg.planEntries?.length || !!msg.toolCalls?.length || hasReasoningText(msg.reasoning)
   const shouldRenderBubble = !(isDone && !msg.content && hasSupplementarySections)
 
   // Render markdown only for finalised done messages
@@ -2142,6 +2408,7 @@ function renderMessage(msg: Message, agentAvatar: string): string {
       <div class="message-avatar">${agentAvatar}</div>
       <div class="message-group">
         ${planHTML}
+        ${toolCallsHTML}
         ${reasoningHTML}
         ${bubbleHTML}
         <div class="message-meta">
@@ -2153,13 +2420,22 @@ function renderMessage(msg: Message, agentAvatar: string): string {
     </div>`
 }
 
-function renderStreamingBubbleHTML(messageID: string, content = '', planEntries?: PlanEntry[], reasoning?: string): string {
+function renderStreamingBubbleHTML(
+  messageID: string,
+  content = '',
+  planEntries?: PlanEntry[],
+  toolCalls?: ToolCall[],
+  reasoning?: string,
+): string {
   const normalizedPlanEntries = clonePlanEntries(planEntries)
+  const normalizedToolCalls = cloneToolCalls(toolCalls)
   const planHiddenAttr = normalizedPlanEntries?.length ? '' : ' hidden'
+  const toolCallsHiddenAttr = normalizedToolCalls?.length ? '' : ' hidden'
   const reasoningHTML = renderReasoningSectionHTML(messageID, reasoning, ' message-reasoning--streaming', true)
   const reasoningHiddenAttr = hasReasoningText(reasoning) ? '' : ' hidden'
   return `
     <div class="message-plan message-plan--streaming" id="plan-${escHtml(messageID)}"${planHiddenAttr}>${normalizedPlanEntries ? renderPlanInnerHTML(normalizedPlanEntries) : ''}</div>
+    <div id="tool-calls-${escHtml(messageID)}"${toolCallsHiddenAttr}>${normalizedToolCalls ? renderToolCallSectionHTML(normalizedToolCalls, ' message-tool-calls--streaming') : ''}</div>
     <div id="reasoning-${escHtml(messageID)}"${reasoningHiddenAttr}>${reasoningHTML}</div>
     <div class="message-bubble message-bubble--streaming" id="bubble-${escHtml(messageID)}">
       <div class="message-bubble__text">${escHtml(content)}</div>
@@ -2185,6 +2461,19 @@ function updateStreamingBubbleReasoning(messageID: string, reasoning: string): v
   }
   reasoningEl.hidden = false
   reasoningEl.innerHTML = renderReasoningSectionHTML(messageID, reasoning, ' message-reasoning--streaming', true)
+}
+
+function updateStreamingBubbleToolCalls(messageID: string, toolCalls: ToolCall[] | undefined): void {
+  const toolCallsEl = document.getElementById(`tool-calls-${messageID}`)
+  if (!toolCallsEl) return
+  const normalized = cloneToolCalls(toolCalls)
+  toolCallsEl.hidden = !normalized?.length
+  if (!normalized?.length) {
+    toolCallsEl.innerHTML = ''
+    return
+  }
+  toolCallsEl.innerHTML = renderToolCallSectionHTML(normalized, ' message-tool-calls--streaming')
+  bindMarkdownControls(toolCallsEl)
 }
 
 function setReasoningPanelExpanded(panelEl: HTMLElement, expanded: boolean): void {
@@ -3027,6 +3316,7 @@ function handleSend(): void {
   activeStreamScopeKey = capturedScopeKey
   streamBufferByScope.set(capturedScopeKey, '')
   streamPlanByScope.delete(capturedScopeKey)
+  streamToolCallsByScope.delete(capturedScopeKey)
   streamReasoningByScope.delete(capturedScopeKey)
   streamStartedAtByScope.set(capturedScopeKey, now)
   setScopeStreamState(capturedScopeKey, {
@@ -3047,7 +3337,7 @@ function handleSend(): void {
     div.innerHTML = `
       <div class="message-avatar">${agentAvatar}</div>
       <div class="message-group">
-        ${renderStreamingBubbleHTML(agentMsgID, '', undefined, '')}
+        ${renderStreamingBubbleHTML(agentMsgID, '', undefined, undefined, '')}
         <div class="message-meta">
           <span class="message-time">${formatTimestamp(now)}</span>
         </div>
@@ -3100,6 +3390,30 @@ function handleSend(): void {
       if (atBottom && list) list.scrollTop = list.scrollHeight
     },
 
+    onToolCall(event: ToolCallPayload) {
+      const current = streamToolCallsByScope.get(capturedScopeKey) ?? []
+      const nextToolCalls = applyToolCallEvent(current, event as unknown as Record<string, unknown>)
+      streamToolCallsByScope.set(capturedScopeKey, nextToolCalls)
+
+      if (activeChatScopeKey() !== capturedScopeKey) return
+      const list = document.getElementById('message-list')
+      const atBottom = !list || isNearBottom(list)
+      updateStreamingBubbleToolCalls(agentMsgID, nextToolCalls)
+      if (atBottom && list) list.scrollTop = list.scrollHeight
+    },
+
+    onToolCallUpdate(event: ToolCallPayload) {
+      const current = streamToolCallsByScope.get(capturedScopeKey) ?? []
+      const nextToolCalls = applyToolCallEvent(current, event as unknown as Record<string, unknown>)
+      streamToolCallsByScope.set(capturedScopeKey, nextToolCalls)
+
+      if (activeChatScopeKey() !== capturedScopeKey) return
+      const list = document.getElementById('message-list')
+      const atBottom = !list || isNearBottom(list)
+      updateStreamingBubbleToolCalls(agentMsgID, nextToolCalls)
+      if (atBottom && list) list.scrollTop = list.scrollHeight
+    },
+
     onSessionBound({ sessionId }: SessionBoundPayload) {
       const nextSessionID = sessionId.trim()
       if (!nextSessionID || nextSessionID === capturedSessionID) return
@@ -3119,6 +3433,7 @@ function handleSend(): void {
       // Clear stream tracking BEFORE addMessageToStore (so subscribe calls updateMessageList)
       const finalContent = streamBufferByScope.get(capturedScopeKey) ?? ''
       const finalPlanEntries = clonePlanEntries(streamPlanByScope.get(capturedScopeKey))
+      const finalToolCalls = cloneToolCalls(streamToolCallsByScope.get(capturedScopeKey))
       const finalReasoning = streamReasoningByScope.get(capturedScopeKey) ?? ''
       clearScopeStreamRuntime(capturedScopeKey)
       clearPendingPermissions(capturedScopeKey)
@@ -3134,6 +3449,7 @@ function handleSend(): void {
         status:     stopReason === 'cancelled' ? 'cancelled' : 'done',
         stopReason,
         planEntries: finalPlanEntries,
+        toolCalls: finalToolCalls,
         reasoning: hasReasoningText(finalReasoning) ? finalReasoning : undefined,
       })
     },
@@ -3141,6 +3457,7 @@ function handleSend(): void {
     onError({ code, message: msg }) {
       const partialContent = streamBufferByScope.get(capturedScopeKey) ?? ''
       const finalPlanEntries = clonePlanEntries(streamPlanByScope.get(capturedScopeKey))
+      const finalToolCalls = cloneToolCalls(streamToolCallsByScope.get(capturedScopeKey))
       const finalReasoning = streamReasoningByScope.get(capturedScopeKey) ?? ''
       clearScopeStreamRuntime(capturedScopeKey)
       clearPendingPermissions(capturedScopeKey)
@@ -3156,6 +3473,7 @@ function handleSend(): void {
         errorCode:    code,
         errorMessage: msg,
         planEntries:  finalPlanEntries,
+        toolCalls:    finalToolCalls,
         reasoning:    hasReasoningText(finalReasoning) ? finalReasoning : undefined,
       })
     },
@@ -3163,6 +3481,7 @@ function handleSend(): void {
     onDisconnect() {
       const partialContent = streamBufferByScope.get(capturedScopeKey) ?? ''
       const finalPlanEntries = clonePlanEntries(streamPlanByScope.get(capturedScopeKey))
+      const finalToolCalls = cloneToolCalls(streamToolCallsByScope.get(capturedScopeKey))
       const finalReasoning = streamReasoningByScope.get(capturedScopeKey) ?? ''
       clearScopeStreamRuntime(capturedScopeKey)
       clearPendingPermissions(capturedScopeKey)
@@ -3177,6 +3496,7 @@ function handleSend(): void {
         status:       'error',
         errorMessage: 'Connection lost',
         planEntries:  finalPlanEntries,
+        toolCalls:    finalToolCalls,
         reasoning:    hasReasoningText(finalReasoning) ? finalReasoning : undefined,
       })
     },

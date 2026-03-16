@@ -571,3 +571,49 @@ and upstream ACP schema:
 - Before the first visible assistant delta arrives, the live streaming bubble keeps its text region empty and only shows the typing indicator.
 - The first real delta populates the existing bubble without changing any other streaming semantics.
 - Hidden `agent_thought_chunk` content still remains non-user-visible while the assistant is waiting on a visible delta.
+
+## 18. ACP Tool Calls in Streaming and History (2026-03-16)
+
+### 18.1 Backend Event Model
+
+- Shared ACP `session/update` parsing must recognize:
+  - `tool_call`
+  - `tool_call_update`
+- Parsed tool-call events keep the ACP field structure instead of flattening to text:
+  - `toolCallId`
+  - optional `title`
+  - optional `kind`
+  - optional `status`
+  - optional raw JSON `content`
+  - optional raw JSON `locations`
+  - optional raw JSON `rawInput`
+  - optional raw JSON `rawOutput`
+- Providers bridge those parsed events through one per-turn callback, just like plan/reasoning callbacks.
+- HTTP turn handling persists and streams the same event names (`tool_call`, `tool_call_update`) with:
+  - `turnId`
+  - the ACP tool-call fields listed above
+- Event persistence remains append-only at the turn-event layer; ngent does not store a second derived tool-call snapshot table.
+
+### 18.2 History Reconstruction
+
+- `GET /v1/threads/{threadId}/history?includeEvents=true` returns the persisted `tool_call` / `tool_call_update` events unchanged in turn event history.
+- Tool-call updates are partial replacements:
+  - clients must merge them by `toolCallId`
+  - omitted fields mean "leave previous value unchanged"
+  - explicitly present empty string / empty array / `null` payloads mean "clear or replace with empty value"
+- Session transcript replay stays separate from tool-call history:
+  - `session/load` replay collectors still ignore tool-call notifications because transcript replay only reconstructs user/assistant message content.
+
+### 18.3 Web UI
+
+- Stream state keeps one per-scope tool-call collection keyed by `toolCallId`.
+- Live SSE `tool_call` / `tool_call_update` events update that collection in place and render tool-call cards above the streaming assistant bubble.
+- Finalized message history rebuilds the same tool-call snapshot by replaying persisted turn events in order.
+- The Web UI renders:
+  - title / kind / status badges
+  - text content blocks
+  - command blocks
+  - diff before/after blocks
+  - path/location lists
+  - raw JSON input/output blocks
+- Unsupported non-text ACP tool-call payload shapes are still shown via generic JSON fallback so the information is visible even when no richer renderer exists yet.

@@ -1180,3 +1180,25 @@ Use this template for new decisions.
 - Alternatives considered:
   - keep using the single empty-session scope `${threadId}::` for all fresh-session attempts (rejected: this is the bug).
   - persist a backend-generated fresh-session nonce in thread metadata (rejected for now: more invasive than needed for the Web UI reset bug).
+
+## ADR-049: Preserve ACP tool-call updates as first-class turn events
+
+- Status: Accepted
+- Date: 2026-03-16
+- Context:
+  - ACP tool execution progress is reported through `session/update` variants `tool_call` and `tool_call_update`, not through normal assistant text deltas.
+  - those payloads can carry structured fields such as `toolCallId`, `status`, `content[]`, `locations[]`, `rawInput`, and `rawOutput`.
+  - ngent previously tolerated non-text tool-call payloads during transcript replay, but live turn streaming still discarded them because only message/plan/reasoning updates were bridged into HTTP/SSE and the Web UI.
+- Decision:
+  - extend shared ACP update parsing to normalize `tool_call` and `tool_call_update` into one structured ngent event model without flattening the payload into plain text.
+  - preserve the raw structured JSON for `content`, `locations`, `rawInput`, and `rawOutput` so downstream clients can evolve their rendering without changing the transport contract again.
+  - add a per-turn tool-call callback in the agent layer, persist those updates into SQLite turn events, and emit them over SSE using the same event names (`tool_call`, `tool_call_update`).
+  - have the Web UI merge tool-call events by `toolCallId`, so live streaming and history reload reconstruct the same final tool state.
+- Consequences:
+  - clients can now observe structured tool activity during a turn and after reload/history fetch.
+  - ngent keeps ACP semantics intact instead of inventing a hub-specific flattened tool transcript format.
+  - the current Web UI renders common text/diff/command/path payloads directly and falls back to generic JSON blocks for unsupported tool-call content shapes.
+- Alternatives considered:
+  - continue ignoring tool-call updates outside transcript replay (rejected: loses important execution state in the UI).
+  - flatten tool-call payloads into `message_delta` text (rejected: destroys structure and makes incremental updates ambiguous).
+  - keep tool-call state only in browser memory (rejected: reload/history would still lose it).

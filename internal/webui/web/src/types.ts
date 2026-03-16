@@ -76,6 +76,17 @@ export interface PlanEntry {
   priority?: string
 }
 
+export interface ToolCall {
+  toolCallId: string
+  title?: string
+  kind?: string
+  status?: string
+  content?: unknown[]
+  locations?: unknown[]
+  rawInput?: unknown
+  rawOutput?: unknown
+}
+
 export interface Turn {
   turnId: string
   requestText: string
@@ -113,6 +124,8 @@ export interface Message {
   permissionRequest?: PermissionRequest
   /** Populated when the agent emits plan_update */
   planEntries?: PlanEntry[]
+  /** Populated when the agent emits tool_call/tool_call_update */
+  toolCalls?: ToolCall[]
 }
 
 // ── Permission ─────────────────────────────────────────────────────────────

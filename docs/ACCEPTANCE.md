@@ -402,3 +402,23 @@ This checklist defines executable acceptance checks for requirements 1-16.
   - `go test ./internal/agents/kimi ./internal/agents/opencode ./internal/agents/gemini ./internal/agents/qwen -run 'Test(StreamCapturesSlashCommandsEmittedBeforePrompt|SlashCommandsAfterConfigOptionsInit|WithFakeProcess|WithFakeProcessModelID)$' -count=1`
   - `go test ./...`
   - Kimi, OpenCode, Gemini, and Qwen now all keep the latest `available_commands_update` snapshot in the same provider-local cache across both `Stream()` and `ConfigOptions()` probes, so `/slash-commands` backfill uses one consistent source for these direct ACP agents
+
+## Requirement 25: ACP Tool-Call Streaming and History
+
+- Operation:
+  - run a turn against an ACP-backed agent that emits `tool_call` followed by `tool_call_update` for the same `toolCallId`.
+  - observe the SSE stream from `POST /v1/threads/{threadId}/turns`.
+  - query `GET /v1/threads/{threadId}/history?includeEvents=true`.
+  - open the same thread in the Web UI during streaming and again after reload/history fetch.
+- Expected:
+  - shared ACP parsing accepts `tool_call` and `tool_call_update` without flattening them into plain text or dropping their structured payload.
+  - SSE emits `tool_call` / `tool_call_update` events with `turnId`, `toolCallId`, and the corresponding structured ACP fields (`status`, `content`, `locations`, `rawInput`, `rawOutput`) when present.
+  - turn history persists those same event types and payloads.
+  - the Web UI merges updates by `toolCallId`, so the same tool-call card progresses from its initial state to its updated/final state both live and after reload.
+  - tool-call cards remain separate from the main assistant text bubble.
+- Verification commands (executed 2026-03-16):
+  - `go test ./internal/agents -run 'TestParseACPUpdateToolCall|TestParseACPUpdateToolCallUpdateKeepsExplicitClears' -count=1`
+  - `go test ./internal/agents -run 'TestNewACPNotificationHandlerRoutesToolCallsToToolCallHandler' -count=1`
+  - `go test ./internal/httpapi -run 'TestTurnsSSEIncludesToolCallUpdatesAndPersistsHistory' -count=1`
+  - `cd internal/webui/web && npm run build`
+  - `go test ./...`

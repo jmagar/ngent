@@ -124,6 +124,8 @@ const (
 
 	threadAgentOptionFreshSessionKey = "_ngentFreshSession"
 	eventTypeReasoningDelta          = "reasoning_delta"
+	eventTypeToolCall                = "tool_call"
+	eventTypeToolCallUpdate          = "tool_call_update"
 )
 
 const (
@@ -837,6 +839,16 @@ func (s *Server) handleCreateTurnStream(w http.ResponseWriter, r *http.Request, 
 			"delta":  delta,
 		})
 	})
+	turnCtx = agents.WithToolCallHandler(turnCtx, func(toolCallCtx context.Context, event agents.ACPToolCall) error {
+		_ = toolCallCtx
+		eventType := strings.TrimSpace(event.Type)
+		switch eventType {
+		case eventTypeToolCall, eventTypeToolCallUpdate:
+		default:
+			return nil
+		}
+		return emit(eventType, event.EventPayload(turnID))
+	})
 	turnCtx = agents.WithSlashCommandsHandler(turnCtx, func(commandsCtx context.Context, commands []agents.SlashCommand) error {
 		_ = commandsCtx
 		if err := s.persistAgentSlashCommands(persistCtx, thread.AgentID, commands); err != nil {
@@ -1050,6 +1062,16 @@ func (s *Server) handleCompactThread(w http.ResponseWriter, r *http.Request, cli
 			"turnId": turnID,
 			"delta":  delta,
 		})
+	})
+	turnCtx = agents.WithToolCallHandler(turnCtx, func(toolCallCtx context.Context, event agents.ACPToolCall) error {
+		_ = toolCallCtx
+		eventType := strings.TrimSpace(event.Type)
+		switch eventType {
+		case eventTypeToolCall, eventTypeToolCallUpdate:
+		default:
+			return nil
+		}
+		return appendOnlyEvent(eventType, event.EventPayload(turnID))
 	})
 	stopReason, streamErr := streamAgent.Stream(turnCtx, compactPrompt, func(delta string) error {
 		aggregated.WriteString(delta)

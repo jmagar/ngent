@@ -345,6 +345,19 @@
 - Follow-up plan:
   - add an explicit background fetch path for missing target-model catalogs so the picker can self-heal without waiting for the next turn.
 
+- ID: KI-034
+- Title: Some ACP tool-call payload shapes render as generic JSON
+- Status: Open
+- Severity: Low
+- Affects: Web UI display of `tool_call` / `tool_call_update` events carrying non-text or provider-specific content blocks
+- Symptom:
+  - common text, diff, command, and path/location payloads render as structured cards.
+  - richer ACP payloads such as media/resource-specific blocks currently fall back to raw JSON sections in the same tool-call card.
+- Workaround:
+  - inspect the JSON block shown in the tool-call card; the full structured payload is still preserved in SSE/history.
+- Follow-up plan:
+  - add richer renderers for additional ACP content block variants once real provider payloads stabilize.
+
 ## Recently Closed
 
 - ID: KI-033

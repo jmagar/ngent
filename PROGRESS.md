@@ -13,6 +13,14 @@ This file is the source of milestone progress, validation commands, and next act
 
 ## Latest Update (2026-03-16)
 
+- `Post-M8` ACP tool-call streaming completed:
+  - extended shared ACP `session/update` parsing to preserve structured `tool_call` and `tool_call_update` payloads, including `toolCallId`, status/title/kind, content blocks, locations, and raw input/output payloads.
+  - added first-class turn callbacks plus HTTP/SSE/history persistence for those tool-call events instead of dropping them at the provider boundary.
+  - updated the Web UI stream state and history reconstruction to merge tool-call events by `toolCallId` and render live/persisted tool-call cards alongside plan/reasoning/message output.
+  - validation:
+    - pass: `cd internal/webui/web && npm run build`
+    - pass: `go test ./...`
+
 - `Post-M8` Web UI fresh-session reset fix completed:
   - explicit `New session` now allocates a client-side fresh-session scope even when the active thread already has no persisted `sessionId`, so repeated `New session` clicks no longer reuse the same anonymous chat buffer.
   - empty-session history replay now drops cancelled turns that never emitted `session_bound` and never produced visible response text, preventing stale cancelled placeholders from reappearing after reload.
