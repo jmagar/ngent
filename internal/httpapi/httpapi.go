@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -315,6 +316,11 @@ func (s *Server) routeV1(w http.ResponseWriter, r *http.Request, clientID string
 		return
 	}
 
+	if r.URL.Path == "/v1/path-search" {
+		s.handlePathSearch(w, r)
+		return
+	}
+
 	if r.URL.Path == "/v1/threads" {
 		s.handleThreadsCollection(w, r, clientID)
 		return
@@ -467,7 +473,20 @@ func (s *Server) handleCreateThread(w http.ResponseWriter, r *http.Request, clie
 	}
 
 	cwd := strings.TrimSpace(req.CWD)
-	if cwd == "" || !filepath.IsAbs(cwd) {
+	if cwd == "" {
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "cwd is required", map[string]any{"field": "cwd"})
+		return
+	}
+
+	// Expand ~ to home directory
+	expandedCWD, err := expandPath(cwd)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "failed to expand path", map[string]any{"field": "cwd", "reason": err.Error()})
+		return
+	}
+	cwd = expandedCWD
+
+	if !filepath.IsAbs(cwd) {
 		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "cwd must be an absolute path", map[string]any{"field": "cwd"})
 		return
 	}
@@ -3366,4 +3385,154 @@ func writeError(w http.ResponseWriter, statusCode int, code, message string, det
 			"details": details,
 		},
 	})
+}
+
+// handlePathSearch handles path search requests for the working directory input.
+// It searches for directories under $HOME matching the query.
+// Search is triggered only when query has 3 or more characters.
+// Priority: first level, then second level, then third level.
+func (s *Server) handlePathSearch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeMethodNotAllowed(w, r)
+		return
+	}
+
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	if len(query) < 3 {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"query":   query,
+			"results": []string{},
+		})
+		return
+	}
+
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		s.logger.Warn("path_search.home_dir_failed", "error", err.Error())
+		writeError(w, http.StatusInternalServerError, codeInternal, "failed to get home directory", nil)
+		return
+	}
+
+	results := s.searchDirectories(homeDir, query)
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"query":   query,
+		"results": results,
+	})
+}
+
+// searchDirectories searches for directories matching the query.
+// Priority: first level, then second level, then third level.
+func (s *Server) searchDirectories(homeDir, query string) []string {
+	queryLower := strings.ToLower(query)
+	var results []string
+
+	// First pass: search top-level directories
+	entries, err := os.ReadDir(homeDir)
+	if err != nil {
+		s.logger.Warn("path_search.read_dir_failed", "dir", homeDir, "error", err.Error())
+		return results
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if strings.Contains(strings.ToLower(name), queryLower) {
+			results = append(results, filepath.Join(homeDir, name))
+		}
+	}
+
+	// If found matches at first level, return immediately
+	if len(results) > 0 {
+		return results
+	}
+
+	// Second pass: search second-level directories
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		firstLevelPath := filepath.Join(homeDir, entry.Name())
+
+		subEntries, err := os.ReadDir(firstLevelPath)
+		if err != nil {
+			continue // Skip directories we can't read
+		}
+
+		for _, subEntry := range subEntries {
+			if !subEntry.IsDir() {
+				continue
+			}
+			subName := subEntry.Name()
+			if strings.Contains(strings.ToLower(subName), queryLower) {
+				results = append(results, filepath.Join(firstLevelPath, subName))
+			}
+		}
+	}
+
+	// If found matches at second level, return immediately
+	if len(results) > 0 {
+		return results
+	}
+
+	// Third pass: search third-level directories
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		firstLevelPath := filepath.Join(homeDir, entry.Name())
+
+		subEntries, err := os.ReadDir(firstLevelPath)
+		if err != nil {
+			continue // Skip directories we can't read
+		}
+
+		for _, subEntry := range subEntries {
+			if !subEntry.IsDir() {
+				continue
+			}
+			secondLevelPath := filepath.Join(firstLevelPath, subEntry.Name())
+
+			thirdEntries, err := os.ReadDir(secondLevelPath)
+			if err != nil {
+				continue // Skip directories we can't read
+			}
+
+			for _, thirdEntry := range thirdEntries {
+				if !thirdEntry.IsDir() {
+					continue
+				}
+				thirdName := thirdEntry.Name()
+				if strings.Contains(strings.ToLower(thirdName), queryLower) {
+					results = append(results, filepath.Join(secondLevelPath, thirdName))
+				}
+			}
+		}
+	}
+
+	return results
+}
+
+
+// expandPath expands ~ to the user's home directory.
+// If the path starts with ~/, it replaces ~ with the home directory.
+// Otherwise, it returns the path as-is.
+func expandPath(path string) (string, error) {
+	if path == "~" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		return home, nil
+	}
+	if strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		return filepath.Join(home, path[2:]), nil
+	}
+	return path, nil
 }

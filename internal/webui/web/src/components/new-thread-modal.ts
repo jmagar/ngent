@@ -1,7 +1,7 @@
 import { store } from '../store.ts'
 import { api, ApiError } from '../api.ts'
 import type { AgentInfo } from '../types.ts'
-import { isAbsolutePath, escHtml } from '../utils.ts'
+import { isAbsolutePath, escHtml, debounce } from '../utils.ts'
 
 // ── Icons ──────────────────────────────────────────────────────────────────
 
@@ -46,6 +46,10 @@ interface ModalState {
   advancedOpen: boolean
   submitting: boolean
   error: string
+  pathSearchQuery: string
+  pathSearchResults: string[]
+  pathSearchLoading: boolean
+  pathSearchSelectedIndex: number
 }
 
 // ── Render ─────────────────────────────────────────────────────────────────
@@ -97,15 +101,27 @@ function renderModal(s: ModalState, agents: AgentInfo[]): string {
             <label class="form-label" for="cwd-input">
               Working Directory <span class="form-required">*</span>
             </label>
-            <input
-              id="cwd-input"
-              class="settings-input ${cwdInvalid ? 'settings-input--error' : ''}"
-              type="text"
-              placeholder="/home/user/my-project"
-              value="${escHtml(s.cwd)}"
-              autocomplete="off"
-              spellcheck="false"
-            />
+            <div class="path-search-container">
+              <input
+                id="cwd-input"
+                class="settings-input ${cwdInvalid ? 'settings-input--error' : ''}"
+                type="text"
+                placeholder="Type to search directories in home folder..."
+                value="${escHtml(s.cwd)}"
+                autocomplete="off"
+                spellcheck="false"
+              />
+              ${s.pathSearchResults.length > 0 ? `
+                <div class="path-search-dropdown" id="path-search-dropdown">
+                  ${s.pathSearchResults.map((path, idx) => `
+                    <div class="path-search-item ${idx === s.pathSearchSelectedIndex ? 'path-search-item--selected' : ''}" data-path="${escHtml(path)}">
+                      ${escHtml(path)}
+                    </div>
+                  `).join('')}
+                </div>
+              ` : ''}
+              ${s.pathSearchLoading ? '<div class="path-search-loading">Searching...</div>' : ''}
+            </div>
             ${cwdInvalid
               ? `<p class="form-hint form-hint--error" id="cwd-hint">Path must be absolute (start with /)</p>`
               : `<p class="form-hint" id="cwd-hint">Absolute path to the project directory.</p>`}
@@ -175,6 +191,10 @@ let modalState: ModalState = {
   advancedOpen: false,
   submitting: false,
   error: '',
+  pathSearchQuery: '',
+  pathSearchResults: [],
+  pathSearchLoading: false,
+  pathSearchSelectedIndex: -1,
 }
 
 function rerender(): void {
@@ -185,6 +205,8 @@ function rerender(): void {
 }
 
 function unmount(): void {
+  // Clean up any floating dropdowns
+  document.querySelectorAll('#path-search-dropdown, .path-search-loading').forEach(el => el.remove())
   if (container) { container.remove(); container = null }
   store.set({ newThreadOpen: false })
   onCreated = null
@@ -205,6 +227,10 @@ function mount(cb: (threadId: string) => void): void {
     advancedOpen: false,
     submitting: false,
     error: '',
+    pathSearchQuery: '',
+    pathSearchResults: [],
+    pathSearchLoading: false,
+    pathSearchSelectedIndex: -1,
   }
 
   container = document.createElement('div')
@@ -248,9 +274,58 @@ function bindEvents(): void {
   })
 
   container.querySelector<HTMLInputElement>('#cwd-input')?.addEventListener('input', e => {
-    modalState = { ...modalState, cwd: (e.target as HTMLInputElement).value.trim(), error: '' }
+    const value = (e.target as HTMLInputElement).value.trim()
+    modalState = { ...modalState, cwd: value, error: '', pathSearchQuery: value, pathSearchSelectedIndex: -1 }
     refreshCwdHint()
     refreshSubmitButton()
+    // Clear results immediately if input is less than 3 chars
+    if (!value || value.length < 3) {
+      modalState = { ...modalState, pathSearchResults: [], pathSearchLoading: false }
+      refreshPathSearchDropdown()
+    }
+    debouncedPathSearch(value)
+  })
+
+  container.querySelector<HTMLInputElement>('#cwd-input')?.addEventListener('keydown', e => {
+    if (modalState.pathSearchResults.length === 0) return
+
+    switch (e.key) {
+      case 'ArrowDown':
+        e.preventDefault()
+        modalState = {
+          ...modalState,
+          pathSearchSelectedIndex: (modalState.pathSearchSelectedIndex + 1) % modalState.pathSearchResults.length
+        }
+        refreshPathSearchDropdown()
+        break
+      case 'ArrowUp':
+        e.preventDefault()
+        modalState = {
+          ...modalState,
+          pathSearchSelectedIndex: modalState.pathSearchSelectedIndex <= 0
+            ? modalState.pathSearchResults.length - 1
+            : modalState.pathSearchSelectedIndex - 1
+        }
+        refreshPathSearchDropdown()
+        break
+      case 'Enter':
+        e.preventDefault()
+        if (modalState.pathSearchSelectedIndex >= 0) {
+          selectPathSearchResult(modalState.pathSearchResults[modalState.pathSearchSelectedIndex])
+        }
+        break
+      case 'Escape':
+        modalState = { ...modalState, pathSearchResults: [], pathSearchSelectedIndex: -1 }
+        refreshPathSearchDropdown()
+        break
+    }
+  })
+
+  container.querySelector('#path-search-dropdown')?.addEventListener('click', e => {
+    const item = (e.target as HTMLElement).closest('.path-search-item') as HTMLElement | null
+    if (item?.dataset.path) {
+      selectPathSearchResult(item.dataset.path)
+    }
   })
 
   container.querySelector<HTMLInputElement>('#title-input')?.addEventListener('input', e => {
@@ -309,6 +384,106 @@ function clearModalErrorBanner(): void {
   if (banner) {
     banner.remove()
   }
+}
+
+// ── Path Search ────────────────────────────────────────────────────────────
+
+const debouncedPathSearch = debounce(async (query: string) => {
+  if (!query || query.length < 3) {
+    modalState = { ...modalState, pathSearchResults: [], pathSearchLoading: false }
+    refreshPathSearchDropdown()
+    return
+  }
+
+  modalState = { ...modalState, pathSearchLoading: true }
+  refreshPathSearchDropdown()
+
+  try {
+    const results = await api.searchPaths(query)
+    // Only update if the query hasn't changed
+    if (modalState.pathSearchQuery === query) {
+      modalState = { ...modalState, pathSearchResults: results, pathSearchLoading: false }
+      refreshPathSearchDropdown()
+    }
+  } catch {
+    if (modalState.pathSearchQuery === query) {
+      modalState = { ...modalState, pathSearchResults: [], pathSearchLoading: false }
+      refreshPathSearchDropdown()
+    }
+  }
+}, 200)
+
+function refreshPathSearchDropdown(): void {
+  if (!container) return
+
+  // Remove existing dropdown and loading indicator (they are attached to document.body)
+  document.querySelectorAll('#path-search-dropdown, .path-search-loading').forEach(el => el.remove())
+
+  const input = container.querySelector<HTMLInputElement>('#cwd-input')
+  const pathContainer = container.querySelector('.path-search-container')
+  if (!input || !pathContainer) return
+
+  // Calculate position relative to viewport
+  const rect = input.getBoundingClientRect()
+  const dropdownTop = rect.bottom + 4
+  const dropdownLeft = rect.left
+  const dropdownWidth = rect.width
+
+  // Add loading indicator
+  if (modalState.pathSearchLoading) {
+    const loadingEl = document.createElement('div')
+    loadingEl.className = 'path-search-loading'
+    loadingEl.textContent = 'Searching...'
+    loadingEl.style.top = `${dropdownTop}px`
+    loadingEl.style.left = `${dropdownLeft}px`
+    loadingEl.style.width = `${dropdownWidth}px`
+    document.body.appendChild(loadingEl)
+    return
+  }
+
+  // Add dropdown if there are results
+  if (modalState.pathSearchResults.length > 0) {
+    const dropdown = document.createElement('div')
+    dropdown.id = 'path-search-dropdown'
+    dropdown.className = 'path-search-dropdown'
+    dropdown.style.top = `${dropdownTop}px`
+    dropdown.style.left = `${dropdownLeft}px`
+    dropdown.style.width = `${dropdownWidth}px`
+    dropdown.innerHTML = modalState.pathSearchResults.map((path, idx) => `
+      <div class="path-search-item ${idx === modalState.pathSearchSelectedIndex ? 'path-search-item--selected' : ''}" data-path="${escHtml(path)}">
+        ${escHtml(path)}
+      </div>
+    `).join('')
+    document.body.appendChild(dropdown)
+
+    // Bind click events
+    dropdown.querySelectorAll('.path-search-item').forEach(item => {
+      item.addEventListener('click', () => {
+        const path = (item as HTMLElement).dataset.path
+        if (path) selectPathSearchResult(path)
+      })
+    })
+  }
+}
+
+function selectPathSearchResult(path: string): void {
+  modalState = {
+    ...modalState,
+    cwd: path,
+    pathSearchResults: [],
+    pathSearchSelectedIndex: -1,
+    pathSearchQuery: path
+  }
+
+  const input = container?.querySelector<HTMLInputElement>('#cwd-input')
+  if (input) {
+    input.value = path
+    input.focus()
+  }
+
+  refreshPathSearchDropdown()
+  refreshCwdHint()
+  refreshSubmitButton()
 }
 
 // ── Submit ─────────────────────────────────────────────────────────────────
