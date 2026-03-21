@@ -2474,6 +2474,14 @@ function formatToolCallLabel(value: string | undefined): string {
   return (value ?? '').replace(/_/g, ' ').trim()
 }
 
+function toolCallDisplayTitle(toolCall: ToolCall): string {
+  const title = toolCall.title?.trim()
+  if (title) return title
+  const kind = formatToolCallLabel(toolCall.kind)
+  if (kind) return kind
+  return 'Tool call'
+}
+
 function toolCallStatusClassName(status: string | undefined): string {
   const normalized = (status ?? '').trim().toLowerCase()
   if (!normalized || !/^[a-z_]+$/.test(normalized)) return ''
@@ -2497,6 +2505,11 @@ function renderToolCallJSON(value: unknown, collapsible = false): string {
   if (value === undefined) return ''
   const formatted = JSON.stringify(value, null, 2)
   return renderToolCallPreHTML(formatted ?? String(value), collapsible)
+}
+
+function renderToolCallTagHTML(value: string, extraClass = ''): string {
+  const className = `message-tool-call__tag${extraClass ? ` ${extraClass}` : ''}`
+  return `<span class="${className}" title="${escHtml(value)}">${escHtml(value)}</span>`
 }
 
 function renderToolCallLocationHTML(location: unknown): string {
@@ -2569,14 +2582,12 @@ function renderToolCallContentHTML(item: unknown): string {
 }
 
 function renderToolCallCardHTML(toolCall: ToolCall): string {
-  const title = toolCall.title?.trim() || toolCall.kind?.trim() || toolCall.toolCallId
+  const title = toolCallDisplayTitle(toolCall)
   const kind = formatToolCallLabel(toolCall.kind)
   const status = formatToolCallLabel(toolCall.status)
-  const toolCallID = toolCall.toolCallId.trim()
   const meta = [
-    kind ? `<span class="message-tool-call__tag">${escHtml(kind)}</span>` : '',
-    status ? `<span class="message-tool-call__tag message-tool-call__tag--status">${escHtml(status)}</span>` : '',
-    title !== toolCallID ? `<span class="message-tool-call__tag">${escHtml(toolCallID)}</span>` : '',
+    kind ? renderToolCallTagHTML(kind) : '',
+    status ? renderToolCallTagHTML(status, 'message-tool-call__tag--status') : '',
   ].filter(Boolean).join('')
   const contentHTML = (toolCall.content ?? []).map(renderToolCallContentHTML).join('')
   const locationsHTML = toolCall.locations?.length
@@ -2606,7 +2617,7 @@ function renderToolCallCardHTML(toolCall: ToolCall): string {
   return `
     <article class="message-tool-call__card${toolCallStatusClassName(toolCall.status)}">
       <div class="message-tool-call__header-row">
-        <div class="message-tool-call__title">${escHtml(title)}</div>
+        <div class="message-tool-call__title" title="${escHtml(title)}">${escHtml(title)}</div>
         ${meta ? `<div class="message-tool-call__meta">${meta}</div>` : ''}
       </div>
       ${contentHTML ? `<div class="message-tool-call__section"><div class="message-tool-call__section-title">Content</div>${contentHTML}</div>` : ''}
@@ -2628,7 +2639,7 @@ function renderToolCallPanelHTML(
 ): string {
   const state = reasoningPanelState(expanded)
   const contentID = toolCallContentID(segmentID)
-  const title = toolCall.title?.trim() || toolCall.kind?.trim() || toolCall.toolCallId
+  const title = toolCallDisplayTitle(toolCall)
   const kind = formatToolCallLabel(toolCall.kind)
   const status = formatToolCallLabel(toolCall.status)
   return `
@@ -2647,11 +2658,11 @@ function renderToolCallPanelHTML(
       >
         <span class="message-tool-call__toggle-main">
           <span class="message-tool-call__toggle-icon" aria-hidden="true">${iconTool}</span>
-          <span class="message-tool-call__toggle-title">${escHtml(title)}</span>
+          <span class="message-tool-call__toggle-title" title="${escHtml(title)}">${escHtml(title)}</span>
         </span>
         <span class="message-tool-call__toggle-meta">
-          ${kind ? `<span class="message-tool-call__tag">${escHtml(kind)}</span>` : ''}
-          ${status ? `<span class="message-tool-call__tag message-tool-call__tag--status">${escHtml(status)}</span>` : ''}
+          ${kind ? renderToolCallTagHTML(kind) : ''}
+          ${status ? renderToolCallTagHTML(status, 'message-tool-call__tag--status') : ''}
           <span class="message-tool-call__chevron" aria-hidden="true">${iconChevronRight}</span>
         </span>
       </button>
