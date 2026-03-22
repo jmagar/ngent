@@ -71,6 +71,8 @@ type Client struct {
 	configOptions  []agents.ConfigOption
 	canLoadSession bool
 
+	adapterInfo *agents.AdapterInfo
+
 	requestSeq uint64
 }
 
@@ -156,6 +158,16 @@ func (c *Client) Name() string {
 		return "claude-embedded"
 	}
 	return c.name
+}
+
+// AdapterInfo returns adapter identity captured during ACP initialize, if available.
+func (c *Client) AdapterInfo() *agents.AdapterInfo {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.adapterInfo
 }
 
 // ConfigOptions returns current ACP session config options.
@@ -791,6 +803,22 @@ func (c *Client) startRuntime(
 		_ = runtime.Close()
 		return nil, acpsession.Capabilities{}, err
 	}
+
+	var initResult struct {
+		AgentInfo *struct {
+			Name    string `json:"name"`
+			Version string `json:"version"`
+		} `json:"agentInfo"`
+	}
+	if jsonErr := json.Unmarshal(initResp.Result, &initResult); jsonErr == nil && initResult.AgentInfo != nil {
+		c.mu.Lock()
+		c.adapterInfo = &agents.AdapterInfo{
+			Name:    initResult.AgentInfo.Name,
+			Version: initResult.AgentInfo.Version,
+		}
+		c.mu.Unlock()
+	}
+
 	return runtime, acpsession.ParseInitializeCapabilities(initResp.Result), nil
 }
 

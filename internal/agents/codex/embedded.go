@@ -1153,6 +1153,22 @@ func (c *Client) startRuntime(
 		_ = runtime.Close()
 		return nil, acpsession.Capabilities{}, err
 	}
+
+	var initResult struct {
+		AgentInfo *struct {
+			Name    string `json:"name"`
+			Version string `json:"version"`
+		} `json:"agentInfo"`
+	}
+	if jsonErr := json.Unmarshal(initResp.Result, &initResult); jsonErr == nil && initResult.AgentInfo != nil {
+		c.mu.Lock()
+		c.adapterInfo = &agents.AdapterInfo{
+			Name:    initResult.AgentInfo.Name,
+			Version: initResult.AgentInfo.Version,
+		}
+		c.mu.Unlock()
+	}
+
 	return runtime, acpsession.ParseInitializeCapabilities(initResp.Result), nil
 }
 
