@@ -84,13 +84,13 @@ type AgentModelsFactory func(ctx context.Context, agentID string) ([]agents.Mode
 type AgentSessionsFactory func(ctx context.Context, agentID, cwd, cursor string) (agents.SessionListResult, error)
 
 // AgentMCPServersFactory lists MCP servers for one agent. May be nil.
-type AgentMCPServersFactory func(ctx context.Context, agentID string) ([]agents.MCPServer, error)
+type AgentMCPServersFactory func(ctx context.Context, agentID, cwd string) ([]agents.MCPServer, error)
 
 // AgentMCPCallFactory invokes an MCP tool for one agent. May be nil.
-type AgentMCPCallFactory func(ctx context.Context, agentID string, params agents.MCPCallParams) (agents.MCPCallResult, error)
+type AgentMCPCallFactory func(ctx context.Context, agentID, cwd string, params agents.MCPCallParams) (agents.MCPCallResult, error)
 
 // AgentMCPOAuthFactory starts MCP OAuth for one agent. May be nil.
-type AgentMCPOAuthFactory func(ctx context.Context, agentID string, server string) (agents.MCPOAuthResult, error)
+type AgentMCPOAuthFactory func(ctx context.Context, agentID, cwd string, server string) (agents.MCPOAuthResult, error)
 
 // Config controls HTTP API behavior.
 type Config struct {
@@ -545,7 +545,8 @@ func (s *Server) handleAgentMCPServers(w http.ResponseWriter, r *http.Request, a
 			"MCP is not configured", map[string]any{"agent": agentID})
 		return
 	}
-	servers, err := s.mcpServersFactory(r.Context(), agentID)
+	cwd := strings.TrimSpace(r.URL.Query().Get("cwd"))
+	servers, err := s.mcpServersFactory(r.Context(), agentID, cwd)
 	if err != nil {
 		if errors.Is(err, agents.ErrMCPUnsupported) {
 			writeError(w, http.StatusServiceUnavailable, codeUpstreamUnavailable,
@@ -576,13 +577,21 @@ func (s *Server) handleAgentMCPCall(w http.ResponseWriter, r *http.Request, agen
 			"MCP is not configured", map[string]any{"agent": agentID})
 		return
 	}
-	var params agents.MCPCallParams
-	if err := decodeJSONBody(r, &params); err != nil {
+	var body struct {
+		CWD       string `json:"cwd"`
+		Server    string `json:"server"`
+		Tool      string `json:"tool"`
+		Arguments string `json:"arguments"`
+	}
+	if err := decodeJSONBody(r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, codeInvalidArgument, "invalid JSON body", map[string]any{"reason": err.Error()})
 		return
 	}
-	params.Server = strings.TrimSpace(params.Server)
-	params.Tool = strings.TrimSpace(params.Tool)
+	params := agents.MCPCallParams{
+		Server:    strings.TrimSpace(body.Server),
+		Tool:      strings.TrimSpace(body.Tool),
+		Arguments: body.Arguments,
+	}
 	if params.Server == "" {
 		writeError(w, http.StatusBadRequest, codeInvalidArgument, "server is required", map[string]any{"field": "server"})
 		return
@@ -591,7 +600,11 @@ func (s *Server) handleAgentMCPCall(w http.ResponseWriter, r *http.Request, agen
 		writeError(w, http.StatusBadRequest, codeInvalidArgument, "tool is required", map[string]any{"field": "tool"})
 		return
 	}
-	result, err := s.mcpCallFactory(r.Context(), agentID, params)
+	cwd := strings.TrimSpace(body.CWD)
+	if cwd == "" {
+		cwd = strings.TrimSpace(r.URL.Query().Get("cwd"))
+	}
+	result, err := s.mcpCallFactory(r.Context(), agentID, cwd, params)
 	if err != nil {
 		if errors.Is(err, agents.ErrMCPUnsupported) {
 			writeError(w, http.StatusServiceUnavailable, codeUpstreamUnavailable,
@@ -621,6 +634,7 @@ func (s *Server) handleAgentMCPOAuth(w http.ResponseWriter, r *http.Request, age
 	}
 	var body struct {
 		Server string `json:"server"`
+		CWD    string `json:"cwd"`
 	}
 	if err := decodeJSONBody(r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, codeInvalidArgument, "invalid JSON body", map[string]any{"reason": err.Error()})
@@ -631,7 +645,11 @@ func (s *Server) handleAgentMCPOAuth(w http.ResponseWriter, r *http.Request, age
 		writeError(w, http.StatusBadRequest, codeInvalidArgument, "server is required", map[string]any{"field": "server"})
 		return
 	}
-	result, err := s.mcpOAuthFactory(r.Context(), agentID, body.Server)
+	cwd := body.CWD
+	if cwd == "" {
+		cwd = r.URL.Query().Get("cwd")
+	}
+	result, err := s.mcpOAuthFactory(r.Context(), agentID, cwd, body.Server)
 	if err != nil {
 		if errors.Is(err, agents.ErrMCPUnsupported) {
 			writeError(w, http.StatusServiceUnavailable, codeUpstreamUnavailable,
@@ -646,11 +664,21 @@ func (s *Server) handleAgentMCPOAuth(w http.ResponseWriter, r *http.Request, age
 }
 
 // handleThreadMCPResource handles /v1/threads/{threadID}/mcp/{sub} requests.
+// It injects the thread's cwd into the request URL so agent MCP handlers
+// automatically receive the correct working directory.
 func (s *Server) handleThreadMCPResource(w http.ResponseWriter, r *http.Request, clientID, threadID, mcpSub string) {
 	thread, ok := s.getOwnedThread(r.Context(), clientID, threadID)
 	if !ok {
 		writeError(w, http.StatusNotFound, codeNotFound, "thread not found", map[string]any{})
 		return
+	}
+	// Inject thread.CWD into the query string if not already provided.
+	if thread.CWD != "" && r.URL.Query().Get("cwd") == "" {
+		q := r.URL.Query()
+		q.Set("cwd", thread.CWD)
+		r2 := r.Clone(r.Context())
+		r2.URL.RawQuery = q.Encode()
+		r = r2
 	}
 	agentID := thread.AgentID
 	switch mcpSub {

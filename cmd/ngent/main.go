@@ -301,13 +301,14 @@ func main() {
 				return agentimpl.SessionListResult{}, agentimpl.ErrSessionListUnsupported
 			}
 		},
-		MCPServersFactory: func(ctx context.Context, agentID string) ([]agentimpl.MCPServer, error) {
+		MCPServersFactory: func(ctx context.Context, agentID, cwd string) ([]agentimpl.MCPServer, error) {
 			switch agentID {
 			case agentimpl.AgentIDCodex:
 				if codexPreflightErr != nil {
 					return nil, agentimpl.ErrMCPUnsupported
 				}
 				client, err := codexagent.New(codexagent.Config{
+					Dir:           cwd,
 					Name:          "codex-embedded",
 					RuntimeConfig: codexRuntimeConfig,
 				})
@@ -323,6 +324,7 @@ func main() {
 					return nil, agentimpl.ErrMCPUnsupported
 				}
 				client, err := claudeagent.New(claudeagent.Config{
+					Dir:  cwd,
 					Name: "claude-embedded",
 				})
 				if err != nil {
@@ -336,13 +338,14 @@ func main() {
 				return nil, agentimpl.ErrMCPUnsupported
 			}
 		},
-		MCPCallFactory: func(ctx context.Context, agentID string, params agentimpl.MCPCallParams) (agentimpl.MCPCallResult, error) {
+		MCPCallFactory: func(ctx context.Context, agentID, cwd string, params agentimpl.MCPCallParams) (agentimpl.MCPCallResult, error) {
 			switch agentID {
 			case agentimpl.AgentIDCodex:
 				if codexPreflightErr != nil {
 					return agentimpl.MCPCallResult{}, agentimpl.ErrMCPUnsupported
 				}
 				client, err := codexagent.New(codexagent.Config{
+					Dir:           cwd,
 					Name:          "codex-embedded",
 					RuntimeConfig: codexRuntimeConfig,
 				})
@@ -358,6 +361,7 @@ func main() {
 					return agentimpl.MCPCallResult{}, agentimpl.ErrMCPUnsupported
 				}
 				client, err := claudeagent.New(claudeagent.Config{
+					Dir:  cwd,
 					Name: "claude-embedded",
 				})
 				if err != nil {
@@ -371,13 +375,14 @@ func main() {
 				return agentimpl.MCPCallResult{}, agentimpl.ErrMCPUnsupported
 			}
 		},
-		MCPOAuthFactory: func(ctx context.Context, agentID string, server string) (agentimpl.MCPOAuthResult, error) {
+		MCPOAuthFactory: func(ctx context.Context, agentID, cwd, server string) (agentimpl.MCPOAuthResult, error) {
 			switch agentID {
 			case agentimpl.AgentIDCodex:
 				if codexPreflightErr != nil {
 					return agentimpl.MCPOAuthResult{}, agentimpl.ErrMCPUnsupported
 				}
 				client, err := codexagent.New(codexagent.Config{
+					Dir:           cwd,
 					Name:          "codex-embedded",
 					RuntimeConfig: codexRuntimeConfig,
 				})
@@ -393,6 +398,7 @@ func main() {
 					return agentimpl.MCPOAuthResult{}, agentimpl.ErrMCPUnsupported
 				}
 				client, err := claudeagent.New(claudeagent.Config{
+					Dir:  cwd,
 					Name: "claude-embedded",
 				})
 				if err != nil {

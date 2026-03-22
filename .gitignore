@@ -10,7 +10,7 @@ internal/webui/web/dist/
 internal/webui/web/tsconfig.tsbuildinfo
 .codex
 # Build output
-ngent
+/ngent
 
 # Claude Code worktrees and session data
 .claude/
