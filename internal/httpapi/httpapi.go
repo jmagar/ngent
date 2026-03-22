@@ -645,9 +645,9 @@ func (s *Server) handleAgentMCPOAuth(w http.ResponseWriter, r *http.Request, age
 		writeError(w, http.StatusBadRequest, codeInvalidArgument, "server is required", map[string]any{"field": "server"})
 		return
 	}
-	cwd := body.CWD
+	cwd := strings.TrimSpace(body.CWD)
 	if cwd == "" {
-		cwd = r.URL.Query().Get("cwd")
+		cwd = strings.TrimSpace(r.URL.Query().Get("cwd"))
 	}
 	result, err := s.mcpOAuthFactory(r.Context(), agentID, cwd, body.Server)
 	if err != nil {
@@ -672,13 +672,16 @@ func (s *Server) handleThreadMCPResource(w http.ResponseWriter, r *http.Request,
 		writeError(w, http.StatusNotFound, codeNotFound, "thread not found", map[string]any{})
 		return
 	}
-	// Inject thread.CWD into the query string if not already provided.
-	if thread.CWD != "" && r.URL.Query().Get("cwd") == "" {
+	// Inject thread.CWD into the query string so agent handlers receive the
+	// correct working directory without callers needing to supply it explicitly.
+	if thread.CWD != "" {
 		q := r.URL.Query()
-		q.Set("cwd", thread.CWD)
-		r2 := r.Clone(r.Context())
-		r2.URL.RawQuery = q.Encode()
-		r = r2
+		if q.Get("cwd") == "" {
+			q.Set("cwd", thread.CWD)
+			r2 := r.Clone(r.Context())
+			r2.URL.RawQuery = q.Encode()
+			r = r2
+		}
 	}
 	agentID := thread.AgentID
 	switch mcpSub {
