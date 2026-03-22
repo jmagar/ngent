@@ -1,6 +1,7 @@
 package agents
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 )
@@ -316,5 +317,106 @@ func TestParseACPUpdateAvailableCommands(t *testing.T) {
 	}
 	if got := update.Commands[1]; got.Name != "clear" || got.Description != "Clear the context" {
 		t.Fatalf("second command = %+v, want clear command", got)
+	}
+}
+
+func TestParseACPUpdateWithTodoItems(t *testing.T) {
+	t.Parallel()
+
+	raw := json.RawMessage(`{
+		"todo": [
+			{"text": "Write tests", "done": false},
+			{"text": "Review PR", "done": true}
+		]
+	}`)
+
+	update, err := ParseACPUpdate(raw)
+	if err != nil {
+		t.Fatalf("ParseACPUpdate() error = %v", err)
+	}
+	if got, want := len(update.TodoItems), 2; got != want {
+		t.Fatalf("len(update.TodoItems) = %d, want %d", got, want)
+	}
+	if got := update.TodoItems[0]; got.Text != "Write tests" || got.Done != false {
+		t.Fatalf("TodoItems[0] = %+v, want {Text:\"Write tests\",Done:false}", got)
+	}
+	if got := update.TodoItems[1]; got.Text != "Review PR" || got.Done != true {
+		t.Fatalf("TodoItems[1] = %+v, want {Text:\"Review PR\",Done:true}", got)
+	}
+}
+
+func TestParseACPUpdateTodoItemsWithDelta(t *testing.T) {
+	t.Parallel()
+
+	// TodoItems should be carried even alongside a delta payload.
+	raw := json.RawMessage(`{
+		"delta": "hello",
+		"todo": [
+			{"text": "Do something", "done": false}
+		]
+	}`)
+
+	update, err := ParseACPUpdate(raw)
+	if err != nil {
+		t.Fatalf("ParseACPUpdate() error = %v", err)
+	}
+	if update.Type != ACPUpdateTypeMessageChunk {
+		t.Fatalf("update.Type = %q, want %q", update.Type, ACPUpdateTypeMessageChunk)
+	}
+	if update.Delta != "hello" {
+		t.Fatalf("update.Delta = %q, want %q", update.Delta, "hello")
+	}
+	if got, want := len(update.TodoItems), 1; got != want {
+		t.Fatalf("len(update.TodoItems) = %d, want %d", got, want)
+	}
+	if got := update.TodoItems[0].Text; got != "Do something" {
+		t.Fatalf("TodoItems[0].Text = %q, want %q", got, "Do something")
+	}
+}
+
+func TestNotifyTodoUpdateCallsHandler(t *testing.T) {
+	t.Parallel()
+
+	var received []TodoItem
+	handler := TodoUpdateHandler(func(_ context.Context, items []TodoItem) error {
+		received = append(received, items...)
+		return nil
+	})
+	ctx := WithTodoUpdateHandler(context.Background(), handler)
+
+	items := []TodoItem{
+		{Text: "Task one", Done: false},
+		{Text: "Task two", Done: true},
+	}
+	if err := NotifyTodoUpdate(ctx, items); err != nil {
+		t.Fatalf("NotifyTodoUpdate() error = %v", err)
+	}
+	if got, want := len(received), 2; got != want {
+		t.Fatalf("len(received) = %d, want %d", got, want)
+	}
+	if received[0].Text != "Task one" || received[0].Done != false {
+		t.Fatalf("received[0] = %+v, want {Task one false}", received[0])
+	}
+	if received[1].Text != "Task two" || received[1].Done != true {
+		t.Fatalf("received[1] = %+v, want {Task two true}", received[1])
+	}
+}
+
+func TestNotifyTodoUpdateNoOpWithoutHandler(t *testing.T) {
+	t.Parallel()
+
+	// Should not panic or error when no handler is bound.
+	if err := NotifyTodoUpdate(context.Background(), []TodoItem{{Text: "X"}}); err != nil {
+		t.Fatalf("NotifyTodoUpdate() without handler error = %v", err)
+	}
+}
+
+func TestTodoUpdateHandlerFromContextNilContext(t *testing.T) {
+	t.Parallel()
+
+	//nolint:staticcheck
+	_, ok := TodoUpdateHandlerFromContext(nil)
+	if ok {
+		t.Fatal("TodoUpdateHandlerFromContext(nil) ok = true, want false")
 	}
 }

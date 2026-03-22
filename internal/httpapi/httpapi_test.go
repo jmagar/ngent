@@ -2938,16 +2938,18 @@ func TestRestartRecoveryWithInjectedContext(t *testing.T) {
 }
 
 type testServerOptions struct {
-	authToken          string
-	allowedRoots       []string
-	allowedAgentIDs    []string
-	agentList          []AgentInfo
-	agent              agents.Streamer
-	turnAgentFactory   TurnAgentFactory
-	agentModelsFactory AgentModelsFactory
-	agentIdleTTL       time.Duration
-	permissionTimeout  time.Duration
-	logger             *slog.Logger
+	authToken            string
+	allowedRoots         []string
+	allowedAgentIDs      []string
+	agentList            []AgentInfo
+	agent                agents.Streamer
+	turnAgentFactory     TurnAgentFactory
+	agentModelsFactory   AgentModelsFactory
+	agentSessionsFactory AgentSessionsFactory
+	agentProfilesMap     map[string][]AgentProfile
+	agentIdleTTL         time.Duration
+	permissionTimeout    time.Duration
+	logger               *slog.Logger
 }
 
 func newTestServer(t *testing.T, opt testServerOptions) *Server {
@@ -2990,17 +2992,19 @@ func newTestServer(t *testing.T, opt testServerOptions) *Server {
 	}
 
 	server := New(Config{
-		AuthToken:          opt.authToken,
-		Agents:             agentList,
-		AllowedAgentIDs:    allowedAgentIDs,
-		AllowedRoots:       allowedRoots,
-		Store:              store,
-		TurnController:     runtimectl.NewTurnController(),
-		TurnAgentFactory:   turnAgentFactory,
-		AgentModelsFactory: opt.agentModelsFactory,
-		AgentIdleTTL:       opt.agentIdleTTL,
-		PermissionTimeout:  opt.permissionTimeout,
-		Logger:             opt.logger,
+		AuthToken:            opt.authToken,
+		Agents:               agentList,
+		AllowedAgentIDs:      allowedAgentIDs,
+		AllowedRoots:         allowedRoots,
+		Store:                store,
+		TurnController:       runtimectl.NewTurnController(),
+		TurnAgentFactory:     turnAgentFactory,
+		AgentModelsFactory:   opt.agentModelsFactory,
+		AgentSessionsFactory: opt.agentSessionsFactory,
+		AgentProfilesMap:     opt.agentProfilesMap,
+		AgentIdleTTL:         opt.agentIdleTTL,
+		PermissionTimeout:    opt.permissionTimeout,
+		Logger:               opt.logger,
 	})
 	t.Cleanup(func() {
 		_ = server.Close()
@@ -3049,21 +3053,426 @@ func newTestServerWithDBPath(t *testing.T, dbPath string, opt testServerOptions)
 	}
 
 	server := New(Config{
-		AuthToken:          opt.authToken,
-		Agents:             agentList,
-		AllowedAgentIDs:    allowedAgentIDs,
-		AllowedRoots:       allowedRoots,
-		Store:              store,
-		TurnController:     runtimectl.NewTurnController(),
-		TurnAgentFactory:   turnAgentFactory,
-		AgentModelsFactory: opt.agentModelsFactory,
-		AgentIdleTTL:       opt.agentIdleTTL,
-		PermissionTimeout:  opt.permissionTimeout,
-		Logger:             opt.logger,
+		AuthToken:            opt.authToken,
+		Agents:               agentList,
+		AllowedAgentIDs:      allowedAgentIDs,
+		AllowedRoots:         allowedRoots,
+		Store:                store,
+		TurnController:       runtimectl.NewTurnController(),
+		TurnAgentFactory:     turnAgentFactory,
+		AgentModelsFactory:   opt.agentModelsFactory,
+		AgentSessionsFactory: opt.agentSessionsFactory,
+		AgentProfilesMap:     opt.agentProfilesMap,
+		AgentIdleTTL:         opt.agentIdleTTL,
+		PermissionTimeout:    opt.permissionTimeout,
+		Logger:               opt.logger,
 	})
 	return server, func() {
 		_ = server.Close()
 		_ = store.Close()
+	}
+}
+
+// ---------- Feature 1: todo_update SSE event ----------
+
+type todoStreamer struct{}
+
+func (s *todoStreamer) Name() string { return "todo-streamer" }
+
+func (s *todoStreamer) Stream(ctx context.Context, input string, onDelta func(delta string) error) (agents.StopReason, error) {
+	_ = input
+	if err := agents.NotifyTodoUpdate(ctx, []agents.TodoItem{
+		{Text: "Write tests", Done: false},
+		{Text: "Run CI", Done: true},
+	}); err != nil {
+		return agents.StopReasonEndTurn, err
+	}
+	if err := onDelta("done"); err != nil {
+		return agents.StopReasonEndTurn, err
+	}
+	return agents.StopReasonEndTurn, nil
+}
+
+func TestTurnsSSEIncludesTodoUpdateAndPersistsHistory(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	h := newTestServer(t, testServerOptions{
+		allowedRoots: []string{root},
+		agent:        &todoStreamer{},
+	})
+
+	threadID := createThreadForClient(t, h, "client-a", root)
+
+	turnRR := performJSONRequest(t, h, http.MethodPost, "/v1/threads/"+threadID+"/turns", map[string]any{
+		"input":  "go",
+		"stream": true,
+	}, map[string]string{"X-Client-ID": "client-a"})
+	if turnRR.Code != http.StatusOK {
+		t.Fatalf("turn status code = %d, want %d", turnRR.Code, http.StatusOK)
+	}
+
+	events := parseSSEEvents(t, turnRR.Body.String())
+	var todoEvent *parsedSSEEvent
+	for i := range events {
+		if events[i].Event == "todo_update" {
+			todoEvent = &events[i]
+			break
+		}
+	}
+	if todoEvent == nil {
+		t.Fatalf("missing todo_update SSE event; got events: %v", events)
+	}
+	rawItems, ok := todoEvent.Data["items"].([]any)
+	if !ok {
+		t.Fatalf("todo_update.items type = %T, want []any", todoEvent.Data["items"])
+	}
+	if got, want := len(rawItems), 2; got != want {
+		t.Fatalf("len(todo_update.items) = %d, want %d", got, want)
+	}
+	first, ok := rawItems[0].(map[string]any)
+	if !ok {
+		t.Fatalf("items[0] type = %T, want map[string]any", rawItems[0])
+	}
+	if got := stringField(first, "text"); got != "Write tests" {
+		t.Fatalf("items[0].text = %q, want %q", got, "Write tests")
+	}
+	if done, _ := first["done"].(bool); done {
+		t.Fatal("items[0].done = true, want false")
+	}
+
+	// Verify the event is also persisted to history.
+	historyRR := performJSONRequest(t, h, http.MethodGet, "/v1/threads/"+threadID+"/history?includeEvents=true", nil, map[string]string{"X-Client-ID": "client-a"})
+	if historyRR.Code != http.StatusOK {
+		t.Fatalf("history status code = %d, want %d", historyRR.Code, http.StatusOK)
+	}
+	var history struct {
+		Turns []struct {
+			Events []struct {
+				Type string `json:"type"`
+			} `json:"events"`
+		} `json:"turns"`
+	}
+	if err := json.Unmarshal(historyRR.Body.Bytes(), &history); err != nil {
+		t.Fatalf("unmarshal history: %v", err)
+	}
+	if len(history.Turns) == 0 {
+		t.Fatal("no turns in history")
+	}
+	seenTodoUpdate := false
+	for _, ev := range history.Turns[0].Events {
+		if ev.Type == "todo_update" {
+			seenTodoUpdate = true
+			break
+		}
+	}
+	if !seenTodoUpdate {
+		t.Fatal("missing persisted todo_update event in history")
+	}
+}
+
+// ---------- Feature 3: content/resources/promptConfig turn params ----------
+
+func TestCreateTurnAcceptsContentResourcesAndPromptConfig(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	h := newTestServer(t, testServerOptions{
+		allowedRoots: []string{root},
+	})
+
+	threadID := createThreadForClient(t, h, "client-a", root)
+
+	// Send a turn with all new fields — must not 400.
+	turnRR := performJSONRequest(t, h, http.MethodPost, "/v1/threads/"+threadID+"/turns", map[string]any{
+		"input":  "hello",
+		"stream": true,
+		"content": []map[string]any{
+			{"type": "text", "text": "context block"},
+		},
+		"resources": []map[string]any{
+			{"name": "README.md", "path": "/tmp/README.md"},
+		},
+		"promptConfig": map[string]any{
+			"profile":        "fast",
+			"approvalPolicy": "auto",
+		},
+	}, map[string]string{"X-Client-ID": "client-a"})
+
+	if turnRR.Code != http.StatusOK {
+		t.Fatalf("turn status code = %d, want %d; body=%s", turnRR.Code, http.StatusOK, turnRR.Body.String())
+	}
+}
+
+// ---------- Feature 4: agent sessions endpoint ----------
+
+func TestAgentSessionsEndpointReturnsSessionsForKnownAgent(t *testing.T) {
+	t.Parallel()
+
+	h := newTestServer(t, testServerOptions{
+		allowedAgentIDs: []string{"codex"},
+		agentList: []AgentInfo{
+			{ID: "codex", Name: "Codex", Status: "available"},
+		},
+		agentSessionsFactory: func(ctx context.Context, agentID, cwd, cursor string) (agents.SessionListResult, error) {
+			if agentID != "codex" {
+				return agents.SessionListResult{}, agents.ErrSessionListUnsupported
+			}
+			return agents.SessionListResult{
+				Sessions: []agents.SessionInfo{
+					{SessionID: "ses_001", CWD: cwd, Title: "Session 1", UpdatedAt: "2026-01-01T00:00:00Z"},
+				},
+				NextCursor: "",
+			}, nil
+		},
+	})
+
+	rr := performJSONRequest(t, h, http.MethodGet, "/v1/agents/codex/sessions?cwd=/tmp", nil, map[string]string{
+		"X-Client-ID": "client-a",
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+
+	var body agents.SessionListResult
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if got, want := len(body.Sessions), 1; got != want {
+		t.Fatalf("len(sessions) = %d, want %d", got, want)
+	}
+	if body.Sessions[0].SessionID != "ses_001" {
+		t.Fatalf("sessions[0].sessionId = %q, want ses_001", body.Sessions[0].SessionID)
+	}
+}
+
+func TestAgentSessionsEndpointReturns503ForUnsupportedAgent(t *testing.T) {
+	t.Parallel()
+
+	h := newTestServer(t, testServerOptions{
+		allowedAgentIDs: []string{"codex", "claude"},
+		agentList: []AgentInfo{
+			{ID: "codex", Name: "Codex", Status: "available"},
+			{ID: "claude", Name: "Claude", Status: "available"},
+		},
+		agentSessionsFactory: func(ctx context.Context, agentID, cwd, cursor string) (agents.SessionListResult, error) {
+			if agentID == "claude" {
+				return agents.SessionListResult{}, agents.ErrSessionListUnsupported
+			}
+			return agents.SessionListResult{}, nil
+		},
+	})
+
+	rr := performJSONRequest(t, h, http.MethodGet, "/v1/agents/claude/sessions?cwd=/tmp", nil, map[string]string{
+		"X-Client-ID": "client-a",
+	})
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusServiceUnavailable, rr.Body.String())
+	}
+	assertErrorCode(t, rr.Body.Bytes(), codeUpstreamUnavailable)
+}
+
+func TestAgentSessionsEndpointReturns404ForUnknownAgent(t *testing.T) {
+	t.Parallel()
+
+	h := newTestServer(t, testServerOptions{
+		allowedAgentIDs: []string{"codex"},
+		agentList: []AgentInfo{
+			{ID: "codex", Name: "Codex", Status: "available"},
+		},
+	})
+
+	rr := performJSONRequest(t, h, http.MethodGet, "/v1/agents/doesnotexist/sessions?cwd=/tmp", nil, map[string]string{
+		"X-Client-ID": "client-a",
+	})
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusNotFound, rr.Body.String())
+	}
+	assertErrorCode(t, rr.Body.Bytes(), codeNotFound)
+}
+
+func TestAgentSessionsEndpointReturns503WhenFactoryNotConfigured(t *testing.T) {
+	t.Parallel()
+
+	// No agentSessionsFactory configured → 503.
+	h := newTestServer(t, testServerOptions{
+		allowedAgentIDs: []string{"codex"},
+		agentList: []AgentInfo{
+			{ID: "codex", Name: "Codex", Status: "available"},
+		},
+	})
+
+	rr := performJSONRequest(t, h, http.MethodGet, "/v1/agents/codex/sessions?cwd=/tmp", nil, map[string]string{
+		"X-Client-ID": "client-a",
+	})
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusServiceUnavailable, rr.Body.String())
+	}
+	assertErrorCode(t, rr.Body.Bytes(), codeUpstreamUnavailable)
+}
+
+// ---------- Feature 5: profiles endpoint ----------
+
+func TestAgentProfilesEndpointReturnsConfiguredProfiles(t *testing.T) {
+	t.Parallel()
+
+	h := newTestServer(t, testServerOptions{
+		allowedAgentIDs: []string{"codex"},
+		agentList: []AgentInfo{
+			{ID: "codex", Name: "Codex", Status: "available"},
+		},
+		agentProfilesMap: map[string][]AgentProfile{
+			"codex": {
+				{Name: "fast", Model: "gpt-5-mini", ApprovalPolicy: "auto"},
+				{Name: "smart", Model: "gpt-5", ApprovalPolicy: "suggest"},
+			},
+		},
+	})
+
+	rr := performJSONRequest(t, h, http.MethodGet, "/v1/agents/codex/profiles", nil, map[string]string{
+		"X-Client-ID": "client-a",
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+
+	var body struct {
+		Profiles []AgentProfile `json:"profiles"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if got, want := len(body.Profiles), 2; got != want {
+		t.Fatalf("len(profiles) = %d, want %d", got, want)
+	}
+	if body.Profiles[0].Name != "fast" {
+		t.Fatalf("profiles[0].name = %q, want fast", body.Profiles[0].Name)
+	}
+	if body.Profiles[1].Name != "smart" {
+		t.Fatalf("profiles[1].name = %q, want smart", body.Profiles[1].Name)
+	}
+}
+
+func TestAgentProfilesEndpointReturnsEmptyArrayWhenNoneConfigured(t *testing.T) {
+	t.Parallel()
+
+	h := newTestServer(t, testServerOptions{
+		allowedAgentIDs: []string{"codex"},
+		agentList: []AgentInfo{
+			{ID: "codex", Name: "Codex", Status: "available"},
+		},
+		// No agentProfilesMap entry for codex.
+	})
+
+	rr := performJSONRequest(t, h, http.MethodGet, "/v1/agents/codex/profiles", nil, map[string]string{
+		"X-Client-ID": "client-a",
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+
+	var body struct {
+		Profiles []AgentProfile `json:"profiles"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	// Must be an empty array (not null) per spec.
+	if body.Profiles == nil {
+		t.Fatal("profiles = null, want empty array []")
+	}
+	if len(body.Profiles) != 0 {
+		t.Fatalf("len(profiles) = %d, want 0", len(body.Profiles))
+	}
+}
+
+func TestAgentProfilesEndpointReturns404ForUnknownAgent(t *testing.T) {
+	t.Parallel()
+
+	h := newTestServer(t, testServerOptions{
+		allowedAgentIDs: []string{"codex"},
+		agentList: []AgentInfo{
+			{ID: "codex", Name: "Codex", Status: "available"},
+		},
+	})
+
+	rr := performJSONRequest(t, h, http.MethodGet, "/v1/agents/doesnotexist/profiles", nil, map[string]string{
+		"X-Client-ID": "client-a",
+	})
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusNotFound, rr.Body.String())
+	}
+	assertErrorCode(t, rr.Body.Bytes(), codeNotFound)
+}
+
+// ---------- Feature 6: AdapterInfo in agent listing ----------
+
+func TestAgentListingIncludesAdapterInfoWhenPopulated(t *testing.T) {
+	t.Parallel()
+
+	h := newTestServer(t, testServerOptions{
+		allowedAgentIDs: []string{"codex"},
+		agentList: []AgentInfo{
+			{
+				ID:     "codex",
+				Name:   "Codex",
+				Status: "available",
+				AdapterInfo: &agents.AdapterInfo{
+					Name:    "codex-acp",
+					Version: "0.3.3",
+				},
+			},
+		},
+	})
+
+	rr := performJSONRequest(t, h, http.MethodGet, "/v1/agents", nil, map[string]string{
+		"X-Client-ID": "client-a",
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+
+	var body struct {
+		Agents []AgentInfo `json:"agents"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if len(body.Agents) == 0 {
+		t.Fatal("no agents in response")
+	}
+	if body.Agents[0].AdapterInfo == nil {
+		t.Fatal("adapterInfo is nil, want populated")
+	}
+	if body.Agents[0].AdapterInfo.Name != "codex-acp" {
+		t.Fatalf("adapterInfo.name = %q, want codex-acp", body.Agents[0].AdapterInfo.Name)
+	}
+	if body.Agents[0].AdapterInfo.Version != "0.3.3" {
+		t.Fatalf("adapterInfo.version = %q, want 0.3.3", body.Agents[0].AdapterInfo.Version)
+	}
+}
+
+func TestAgentListingOmitsAdapterInfoWhenNil(t *testing.T) {
+	t.Parallel()
+
+	h := newTestServer(t, testServerOptions{
+		allowedAgentIDs: []string{"codex"},
+		agentList: []AgentInfo{
+			{ID: "codex", Name: "Codex", Status: "available", AdapterInfo: nil},
+		},
+	})
+
+	rr := performJSONRequest(t, h, http.MethodGet, "/v1/agents", nil, map[string]string{
+		"X-Client-ID": "client-a",
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+
+	// Check raw JSON to confirm omitempty is working.
+	raw := rr.Body.String()
+	if strings.Contains(raw, "adapterInfo") {
+		t.Fatalf("response contains adapterInfo field, want omitted when nil; body=%s", raw)
 	}
 }
 
