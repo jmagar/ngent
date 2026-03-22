@@ -67,23 +67,28 @@ type TurnAgentFactory func(thread storage.Thread) (agents.Streamer, error)
 // AgentModelsFactory resolves selectable model options for one agent.
 type AgentModelsFactory func(ctx context.Context, agentID string) ([]agents.ModelOption, error)
 
+// AgentSessionsFactory lists historical sessions for one agent.
+// Returns agents.ErrSessionListUnsupported if the agent does not support session listing.
+type AgentSessionsFactory func(ctx context.Context, agentID, cwd, cursor string) (agents.SessionListResult, error)
+
 // Config controls HTTP API behavior.
 type Config struct {
-	AuthToken          string
-	Agents             []AgentInfo
-	AllowedAgentIDs    []string
-	AllowedRoots       []string
-	Store              ThreadStore
-	TurnController     *runtime.TurnController
-	Agent              agents.Streamer
-	TurnAgentFactory   TurnAgentFactory
-	AgentModelsFactory AgentModelsFactory
-	AgentIdleTTL       time.Duration
-	Logger             *slog.Logger
-	ContextRecentTurns int
-	ContextMaxChars    int
-	CompactMaxChars    int
-	PermissionTimeout  time.Duration
+	AuthToken            string
+	Agents               []AgentInfo
+	AllowedAgentIDs      []string
+	AllowedRoots         []string
+	Store                ThreadStore
+	TurnController       *runtime.TurnController
+	Agent                agents.Streamer
+	TurnAgentFactory     TurnAgentFactory
+	AgentModelsFactory   AgentModelsFactory
+	AgentSessionsFactory AgentSessionsFactory
+	AgentIdleTTL         time.Duration
+	Logger               *slog.Logger
+	ContextRecentTurns   int
+	ContextMaxChars      int
+	CompactMaxChars      int
+	PermissionTimeout    time.Duration
 	// FrontendHandler, if non-nil, is served for any request that does not
 	// match /healthz or /v1/*. Intended for the embedded web UI.
 	FrontendHandler http.Handler
@@ -91,21 +96,22 @@ type Config struct {
 
 // Server serves the HTTP API.
 type Server struct {
-	authToken          string
-	agents             []AgentInfo
-	allowedRoots       []string
-	store              ThreadStore
-	allowedAgent       map[string]struct{}
-	turns              *runtime.TurnController
-	turnAgentFactory   TurnAgentFactory
-	agentModelsFactory AgentModelsFactory
-	agentIdleTTL       time.Duration
-	logger             *slog.Logger
-	contextRecentTurns int
-	contextMaxChars    int
-	compactMaxChars    int
-	permissionTimeout  time.Duration
-	frontendHandler    http.Handler
+	authToken            string
+	agents               []AgentInfo
+	allowedRoots         []string
+	store                ThreadStore
+	allowedAgent         map[string]struct{}
+	turns                *runtime.TurnController
+	turnAgentFactory     TurnAgentFactory
+	agentModelsFactory   AgentModelsFactory
+	agentSessionsFactory AgentSessionsFactory
+	agentIdleTTL         time.Duration
+	logger               *slog.Logger
+	contextRecentTurns   int
+	contextMaxChars      int
+	compactMaxChars      int
+	permissionTimeout    time.Duration
+	frontendHandler      http.Handler
 
 	permissionsMu sync.Mutex
 	permissions   map[string]*pendingPermission
@@ -212,25 +218,26 @@ func New(cfg Config) *Server {
 	}
 
 	server := &Server{
-		authToken:          cfg.AuthToken,
-		agents:             agentsList,
-		allowedRoots:       roots,
-		store:              cfg.Store,
-		allowedAgent:       allowedAgent,
-		turns:              turnController,
-		turnAgentFactory:   turnAgentFactory,
-		agentModelsFactory: cfg.AgentModelsFactory,
-		agentIdleTTL:       agentIdleTTL,
-		logger:             logger,
-		contextRecentTurns: contextRecentTurns,
-		contextMaxChars:    contextMaxChars,
-		compactMaxChars:    compactMaxChars,
-		permissionTimeout:  permissionTimeout,
-		frontendHandler:    cfg.FrontendHandler,
-		permissions:        make(map[string]*pendingPermission),
-		agentsByScope:      make(map[string]*managedAgent),
-		janitorStop:        make(chan struct{}),
-		janitorDone:        make(chan struct{}),
+		authToken:            cfg.AuthToken,
+		agents:               agentsList,
+		allowedRoots:         roots,
+		store:                cfg.Store,
+		allowedAgent:         allowedAgent,
+		turns:                turnController,
+		turnAgentFactory:     turnAgentFactory,
+		agentModelsFactory:   cfg.AgentModelsFactory,
+		agentSessionsFactory: cfg.AgentSessionsFactory,
+		agentIdleTTL:         agentIdleTTL,
+		logger:               logger,
+		contextRecentTurns:   contextRecentTurns,
+		contextMaxChars:      contextMaxChars,
+		compactMaxChars:      compactMaxChars,
+		permissionTimeout:    permissionTimeout,
+		frontendHandler:      cfg.FrontendHandler,
+		permissions:          make(map[string]*pendingPermission),
+		agentsByScope:        make(map[string]*managedAgent),
+		janitorStop:          make(chan struct{}),
+		janitorDone:          make(chan struct{}),
 	}
 	go server.idleJanitorLoop()
 	return server
@@ -314,6 +321,10 @@ func (s *Server) routeV1(w http.ResponseWriter, r *http.Request, clientID string
 	}
 	if agentID, ok := parseAgentModelsPath(r.URL.Path); ok {
 		s.handleAgentModels(w, r, agentID)
+		return
+	}
+	if agentID, ok := parseAgentSessionsPath(r.URL.Path); ok {
+		s.handleAgentSessions(w, r, agentID)
 		return
 	}
 
@@ -406,6 +417,39 @@ func (s *Server) handleAgentModels(w http.ResponseWriter, r *http.Request, agent
 		"agentId": agentID,
 		"models":  models,
 	})
+}
+
+func (s *Server) handleAgentSessions(w http.ResponseWriter, r *http.Request, agentID string) {
+	if r.Method != http.MethodGet {
+		writeMethodNotAllowed(w, r)
+		return
+	}
+	if _, ok := s.allowedAgent[agentID]; !ok {
+		writeError(w, http.StatusNotFound, codeNotFound, "agent not found", map[string]any{"agent": agentID})
+		return
+	}
+	if s.agentSessionsFactory == nil {
+		writeError(w, http.StatusServiceUnavailable, codeUpstreamUnavailable,
+			"session listing is not configured", map[string]any{"agent": agentID})
+		return
+	}
+
+	cwd := strings.TrimSpace(r.URL.Query().Get("cwd"))
+	cursor := strings.TrimSpace(r.URL.Query().Get("cursor"))
+
+	result, err := s.agentSessionsFactory(r.Context(), agentID, cwd, cursor)
+	if err != nil {
+		if errors.Is(err, agents.ErrSessionListUnsupported) {
+			writeError(w, http.StatusServiceUnavailable, codeUpstreamUnavailable,
+				"agent does not support session listing", map[string]any{"agent": agentID})
+			return
+		}
+		writeError(w, http.StatusInternalServerError, codeInternal,
+			"failed to list sessions", map[string]any{"agent": agentID, "reason": err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) handleThreadsCollection(w http.ResponseWriter, r *http.Request, clientID string) {
@@ -738,8 +782,12 @@ func (s *Server) handleCreateTurnStream(w http.ResponseWriter, r *http.Request, 
 	}
 
 	var req struct {
-		Input  string `json:"input"`
-		Stream bool   `json:"stream"`
+		Input        string                      `json:"input"`
+		Stream       bool                        `json:"stream"`
+		SessionID    string                      `json:"sessionId,omitempty"`
+		Content      []agents.PromptContentBlock `json:"content,omitempty"`
+		Resources    []agents.PromptResource     `json:"resources,omitempty"`
+		PromptConfig *agents.TurnPromptConfig    `json:"promptConfig,omitempty"`
 	}
 	if err := decodeJSONBody(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid JSON body", map[string]any{"reason": err.Error()})
@@ -838,6 +886,27 @@ func (s *Server) handleCreateTurnStream(w http.ResponseWriter, r *http.Request, 
 			"command":      req.Command,
 			"requestId":    req.RequestID,
 		}
+		if len(req.Files) > 0 {
+			payload["files"] = req.Files
+		}
+		if req.Host != "" {
+			payload["host"] = req.Host
+		}
+		if req.Protocol != "" {
+			payload["protocol"] = req.Protocol
+		}
+		if req.Port != 0 {
+			payload["port"] = req.Port
+		}
+		if req.MCPServer != "" {
+			payload["mcpServer"] = req.MCPServer
+		}
+		if req.MCPTool != "" {
+			payload["mcpTool"] = req.MCPTool
+		}
+		if req.Message != "" {
+			payload["message"] = req.Message
+		}
 		if err := emit("permission_required", payload); err != nil {
 			pending.Resolve(agents.PermissionOutcomeDeclined)
 			return agents.PermissionResponse{Outcome: agents.PermissionOutcomeDeclined}, err
@@ -864,6 +933,10 @@ func (s *Server) handleCreateTurnStream(w http.ResponseWriter, r *http.Request, 
 			"delta":  delta,
 		})
 	})
+	turnCtx = agents.WithLifecycleHandler(turnCtx, func(lifecycleCtx context.Context, eventType string) error {
+		_ = lifecycleCtx
+		return emit(eventType, map[string]any{"turnId": turnID})
+	})
 	turnCtx = agents.WithToolCallHandler(turnCtx, func(toolCallCtx context.Context, event agents.ACPToolCall) error {
 		_ = toolCallCtx
 		eventType := strings.TrimSpace(event.Type)
@@ -883,7 +956,24 @@ func (s *Server) handleCreateTurnStream(w http.ResponseWriter, r *http.Request, 
 				"reason", err.Error(),
 			)
 		}
-		return nil
+		return emit("available_commands", map[string]any{
+			"turnId":   turnID,
+			"commands": commands,
+		})
+	})
+	turnCtx = agents.WithConfigOptionsHandler(turnCtx, func(configCtx context.Context, options []agents.ConfigOption) error {
+		_ = configCtx
+		if persistErr := s.persistAgentConfigCatalog(persistCtx, thread.AgentID, thread.AgentOptionsJSON, options); persistErr != nil {
+			s.logger.Warn("config_catalog.persist_failed",
+				"threadId", thread.ThreadID,
+				"agent", thread.AgentID,
+				"reason", persistErr.Error(),
+			)
+		}
+		return emit("config_options_update", map[string]any{
+			"turnId":        turnID,
+			"configOptions": options,
+		})
 	})
 	turnCtx = agents.WithSessionBoundHandler(turnCtx, func(sessionCtx context.Context, sessionID string) error {
 		_ = sessionCtx
@@ -943,6 +1033,16 @@ func (s *Server) handleCreateTurnStream(w http.ResponseWriter, r *http.Request, 
 		}
 		return nil
 	})
+
+	if len(req.Content) > 0 {
+		turnCtx = agents.WithTurnContent(turnCtx, req.Content)
+	}
+	if len(req.Resources) > 0 {
+		turnCtx = agents.WithTurnResources(turnCtx, req.Resources)
+	}
+	if req.PromptConfig != nil {
+		turnCtx = agents.WithTurnPromptConfig(turnCtx, *req.PromptConfig)
+	}
 
 	if err := emit("turn_started", map[string]any{"turnId": turnID}); err != nil {
 		s.finalizeTurnWithBestEffort(persistCtx, turnID, "failed", "error", "", err.Error())
@@ -1087,6 +1187,10 @@ func (s *Server) handleCompactThread(w http.ResponseWriter, r *http.Request, cli
 			"turnId": turnID,
 			"delta":  delta,
 		})
+	})
+	turnCtx = agents.WithLifecycleHandler(turnCtx, func(lifecycleCtx context.Context, eventType string) error {
+		_ = lifecycleCtx
+		return appendOnlyEvent(eventType, map[string]any{"turnId": turnID})
 	})
 	turnCtx = agents.WithToolCallHandler(turnCtx, func(toolCallCtx context.Context, event agents.ACPToolCall) error {
 		_ = toolCallCtx
@@ -2362,6 +2466,21 @@ func parseThreadPath(path string) (threadID, subresource string, ok bool) {
 func parseAgentModelsPath(path string) (agentID string, ok bool) {
 	const prefix = "/v1/agents/"
 	const suffix = "/models"
+	if !strings.HasPrefix(path, prefix) || !strings.HasSuffix(path, suffix) {
+		return "", false
+	}
+	raw := strings.TrimSuffix(strings.TrimPrefix(path, prefix), suffix)
+	raw = strings.Trim(raw, "/")
+	if raw == "" || strings.Contains(raw, "/") {
+		return "", false
+	}
+	return raw, true
+}
+
+// parseAgentSessionsPath matches /v1/agents/{agentId}/sessions
+func parseAgentSessionsPath(path string) (agentID string, ok bool) {
+	const prefix = "/v1/agents/"
+	const suffix = "/sessions"
 	if !strings.HasPrefix(path, prefix) || !strings.HasSuffix(path, suffix) {
 		return "", false
 	}

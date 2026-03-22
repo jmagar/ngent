@@ -22,6 +22,16 @@ const (
 	ACPUpdateTypePlan = "plan"
 	// ACPUpdateTypeAvailableCommands replaces the current slash-command list.
 	ACPUpdateTypeAvailableCommands = "available_commands_update"
+	// ACPUpdateTypeThinkingStarted signals that hidden reasoning has begun.
+	ACPUpdateTypeThinkingStarted = "thinking_started"
+	// ACPUpdateTypeThinkingCompleted signals that hidden reasoning has finished.
+	ACPUpdateTypeThinkingCompleted = "thinking_completed"
+	// ACPUpdateTypeAgentWriting signals that the agent has started a new message segment.
+	ACPUpdateTypeAgentWriting = "agent_message_started"
+	// ACPUpdateTypeAgentDoneWriting signals that the agent's current message segment ended.
+	ACPUpdateTypeAgentDoneWriting = "agent_message_completed"
+	// ACPUpdateTypeConfigOptionsUpdate replaces the current session config options.
+	ACPUpdateTypeConfigOptionsUpdate = "config_options_update"
 )
 
 // PlanEntry is one ACP plan entry shown to the user.
@@ -33,14 +43,15 @@ type PlanEntry struct {
 
 // ACPUpdate is one normalized ACP session/update payload.
 type ACPUpdate struct {
-	Type        string
-	Role        string
-	Delta       string
-	MessageID   string
-	Timestamp   string
-	PlanEntries []PlanEntry
-	Commands    []SlashCommand
-	ToolCall    *ACPToolCall
+	Type          string
+	Role          string
+	Delta         string
+	MessageID     string
+	Timestamp     string
+	PlanEntries   []PlanEntry
+	Commands      []SlashCommand
+	ConfigOptions []ConfigOption
+	ToolCall      *ACPToolCall
 }
 
 // ParseACPUpdate normalizes provider-specific session/update payloads.
@@ -54,7 +65,11 @@ func ParseACPUpdate(raw json.RawMessage) (ACPUpdate, error) {
 		MessageID string         `json:"messageId"`
 		Timestamp string         `json:"timestamp"`
 		Meta      map[string]any `json:"_meta"`
-		Update    struct {
+		// Codex commandExecution lifecycle fields (top-level, not inside update)
+		ItemID   string `json:"itemId"`
+		ItemType string `json:"itemType"`
+		Status   string `json:"status"`
+		Update   struct {
 			SessionUpdate     string            `json:"sessionUpdate"`
 			MessageID         string            `json:"messageId"`
 			Timestamp         string            `json:"timestamp"`
@@ -69,10 +84,39 @@ func ParseACPUpdate(raw json.RawMessage) (ACPUpdate, error) {
 			RawOutput         json.RawMessage   `json:"rawOutput"`
 			Entries           []PlanEntry       `json:"entries"`
 			AvailableCommands []json.RawMessage `json:"availableCommands"`
+			ConfigOptions     []json.RawMessage `json:"configOptions"`
 		} `json:"update"`
 	}
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return ACPUpdate{}, fmt.Errorf("decode ACP session/update payload: %w", err)
+	}
+
+	// Codex wraps item lifecycle events as agent_thought_chunk updates.
+	// Translate known itemType values into structured ACP update types.
+	// Note: commandExecution is handled by acp-adapter v0.3.3+ directly as
+	// tool_call/tool_call_update sessionUpdates with real command text and output.
+	switch strings.TrimSpace(payload.ItemType) {
+	case "reasoning":
+		switch strings.TrimSpace(payload.Status) {
+		case "item_started":
+			return ACPUpdate{Type: ACPUpdateTypeThinkingStarted}, nil
+		case "item_completed":
+			return ACPUpdate{Type: ACPUpdateTypeThinkingCompleted}, nil
+		default:
+			return ACPUpdate{}, nil
+		}
+	case "agentMessage":
+		switch strings.TrimSpace(payload.Status) {
+		case "item_started":
+			return ACPUpdate{Type: ACPUpdateTypeAgentWriting}, nil
+		case "item_completed":
+			return ACPUpdate{Type: ACPUpdateTypeAgentDoneWriting}, nil
+		default:
+			return ACPUpdate{}, nil
+		}
+	case "userMessage":
+		// Not actionable for display.
+		return ACPUpdate{}, nil
 	}
 
 	switch strings.TrimSpace(payload.Update.SessionUpdate) {
@@ -139,16 +183,23 @@ func ParseACPUpdate(raw json.RawMessage) (ACPUpdate, error) {
 			Type:     ACPUpdateTypeAvailableCommands,
 			Commands: parseACPUpdateSlashCommands(payload.Update.AvailableCommands),
 		}, nil
+	case ACPUpdateTypeConfigOptionsUpdate:
+		return ACPUpdate{
+			Type:          ACPUpdateTypeConfigOptionsUpdate,
+			ConfigOptions: parseACPUpdateConfigOptions(payload.Update.ConfigOptions),
+		}, nil
 	case ACPUpdateTypeToolCall, ACPUpdateTypeToolCallUpdate:
 		title, hasTitle := normalizeACPOptionalString(payload.Update.Title)
 		kind, hasKind := normalizeACPOptionalString(payload.Update.Kind)
 		status, hasStatus := normalizeACPOptionalString(payload.Update.Status)
+		delta, hasDelta := extractACPContentText(payload.Update.Content)
 		toolCall := ACPToolCall{
 			Type:         normalizeACPUpdateType(payload.Update.SessionUpdate),
 			ToolCallID:   strings.TrimSpace(payload.Update.ToolCallID),
 			Title:        title,
 			Kind:         kind,
 			Status:       status,
+			Delta:        delta,
 			Content:      cloneACPUpdateJSON(payload.Update.Content),
 			Locations:    cloneACPUpdateJSON(payload.Update.Locations),
 			RawInput:     cloneACPUpdateJSON(payload.Update.RawInput),
@@ -156,6 +207,7 @@ func ParseACPUpdate(raw json.RawMessage) (ACPUpdate, error) {
 			HasTitle:     hasTitle,
 			HasKind:      hasKind,
 			HasStatus:    hasStatus,
+			HasDelta:     hasDelta,
 			HasContent:   hasACPUpdateJSON(payload.Update.Content),
 			HasLocations: hasACPUpdateJSON(payload.Update.Locations),
 			HasRawInput:  hasACPUpdateJSON(payload.Update.RawInput),
@@ -287,6 +339,31 @@ func ClonePlanEntries(entries []PlanEntry) []PlanEntry {
 	return normalizePlanEntries(entries)
 }
 
+// extractACPContentText extracts the text value from an ACP content block
+// of the form {"type":"text","text":"..."}, returning ("", false) for any
+// other shape (non-text type, array, missing, etc.).
+func extractACPContentText(raw json.RawMessage) (string, bool) {
+	raw = json.RawMessage(strings.TrimSpace(string(raw)))
+	if len(raw) == 0 || string(raw) == "null" {
+		return "", false
+	}
+	var content struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(raw, &content); err != nil {
+		return "", false
+	}
+	if t := strings.TrimSpace(content.Type); t != "" && t != "text" {
+		return "", false
+	}
+	text := strings.TrimSpace(content.Text)
+	if text == "" {
+		return "", false
+	}
+	return text, true
+}
+
 func normalizePlanEntries(entries []PlanEntry) []PlanEntry {
 	if len(entries) == 0 {
 		return nil
@@ -308,6 +385,84 @@ func normalizePlanEntries(entries []PlanEntry) []PlanEntry {
 		return nil
 	}
 	return normalized
+}
+
+// parseACPUpdateConfigOptions decodes a []json.RawMessage configOptions slice
+// into normalized ConfigOption values for the ACPUpdate payload.
+func parseACPUpdateConfigOptions(rawOptions []json.RawMessage) []ConfigOption {
+	if len(rawOptions) == 0 {
+		return nil
+	}
+
+	var out []ConfigOption
+	seen := make(map[string]struct{}, len(rawOptions))
+	for _, raw := range rawOptions {
+		raw = json.RawMessage(strings.TrimSpace(string(raw)))
+		if len(raw) == 0 || string(raw) == "null" {
+			continue
+		}
+		var entry struct {
+			ID           string `json:"id"`
+			Category     string `json:"category"`
+			Name         string `json:"name"`
+			Description  string `json:"description"`
+			Type         string `json:"type"`
+			CurrentValue string `json:"currentValue"`
+			Options      []struct {
+				Value       string `json:"value"`
+				Name        string `json:"name"`
+				Description string `json:"description"`
+			} `json:"options"`
+		}
+		if err := json.Unmarshal(raw, &entry); err != nil {
+			continue
+		}
+		id := strings.TrimSpace(entry.ID)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+
+		values := make([]ConfigOptionValue, 0, len(entry.Options))
+		for _, v := range entry.Options {
+			val := strings.TrimSpace(v.Value)
+			if val == "" {
+				continue
+			}
+			name := strings.TrimSpace(v.Name)
+			if name == "" {
+				name = val
+			}
+			values = append(values, ConfigOptionValue{
+				Value:       val,
+				Name:        name,
+				Description: strings.TrimSpace(v.Description),
+			})
+		}
+
+		name := strings.TrimSpace(entry.Name)
+		if name == "" {
+			name = id
+		}
+		configType := strings.TrimSpace(entry.Type)
+		if configType == "" && len(values) > 0 {
+			configType = "select"
+		}
+
+		out = append(out, ConfigOption{
+			ID:           id,
+			Category:     strings.TrimSpace(entry.Category),
+			Name:         name,
+			Description:  strings.TrimSpace(entry.Description),
+			Type:         configType,
+			CurrentValue: strings.TrimSpace(entry.CurrentValue),
+			Options:      values,
+		})
+	}
+	return out
 }
 
 // PlanHandler receives ACP plan replacements for the active turn.

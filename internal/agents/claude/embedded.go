@@ -355,10 +355,34 @@ func (c *Client) streamOnce(
 	}
 	promptDone := make(chan promptResult, 1)
 	go func() {
-		resp, reqErr := c.clientRequest(promptCtx, runtime, methodSessionPrompt, map[string]any{
+		params := map[string]any{
 			"sessionId": sessionID,
 			"prompt":    input,
-		})
+		}
+		if content := agents.TurnContentFromContext(ctx); len(content) > 0 {
+			params["content"] = content
+		}
+		if resources := agents.TurnResourcesFromContext(ctx); len(resources) > 0 {
+			params["resources"] = resources
+		}
+		if cfg, ok := agents.TurnPromptConfigFromContext(ctx); ok {
+			if cfg.Profile != "" {
+				params["profile"] = cfg.Profile
+			}
+			if cfg.ApprovalPolicy != "" {
+				params["approvalPolicy"] = cfg.ApprovalPolicy
+			}
+			if cfg.Sandbox != "" {
+				params["sandbox"] = cfg.Sandbox
+			}
+			if cfg.Personality != "" {
+				params["personality"] = cfg.Personality
+			}
+			if cfg.SystemInstructions != "" {
+				params["systemInstructions"] = cfg.SystemInstructions
+			}
+		}
+		resp, reqErr := c.clientRequest(promptCtx, runtime, methodSessionPrompt, params)
 		promptDone <- promptResult{response: resp, err: reqErr}
 	}()
 
@@ -459,6 +483,19 @@ func (c *Client) handleUpdate(
 				c.sendSessionCancel(runtime, c.currentSessionID())
 				return err
 			}
+		case agents.ACPUpdateTypeConfigOptionsUpdate:
+			if err := agents.NotifyConfigOptions(ctx, update.ConfigOptions); err != nil {
+				c.sendSessionCancel(runtime, c.currentSessionID())
+				return err
+			}
+		case agents.ACPUpdateTypeThoughtMessageChunk:
+			if update.Delta == "" {
+				return nil
+			}
+			if err := agents.NotifyReasoningDelta(ctx, update.Delta); err != nil {
+				c.sendSessionCancel(runtime, c.currentSessionID())
+				return err
+			}
 		case agents.ACPUpdateTypeToolCall, agents.ACPUpdateTypeToolCallUpdate:
 			if update.ToolCall == nil {
 				return nil
@@ -466,6 +503,20 @@ func (c *Client) handleUpdate(
 			if err := agents.NotifyToolCall(ctx, *update.ToolCall); err != nil {
 				c.sendSessionCancel(runtime, c.currentSessionID())
 				return err
+			}
+		case agents.ACPUpdateTypeThinkingStarted,
+			agents.ACPUpdateTypeThinkingCompleted,
+			agents.ACPUpdateTypeAgentWriting,
+			agents.ACPUpdateTypeAgentDoneWriting:
+			if err := agents.NotifyLifecycle(ctx, update.Type); err != nil {
+				c.sendSessionCancel(runtime, c.currentSessionID())
+				return err
+			}
+		default:
+			// Forward unrecognized event types (e.g. review_mode_entered,
+			// review_mode_exited) as lifecycle events so they reach the SSE layer.
+			if update.Type != "" {
+				_ = agents.NotifyLifecycle(ctx, update.Type)
 			}
 		}
 		return nil
@@ -475,9 +526,28 @@ func (c *Client) handleUpdate(
 		return c.handlePermissionRequest(ctx, runtime, msg)
 	}
 
-	if msg.Method != "" && msg.ID != nil {
-		c.sendSessionCancel(runtime, c.currentSessionID())
-		return fmt.Errorf("claude: unsupported embedded request method %q", msg.Method)
+	switch msg.Method {
+	case "fs/write_text_file":
+		if msg.ID != nil {
+			respondCtx, cancel := context.WithTimeout(context.Background(), c.requestTimeout)
+			defer cancel()
+			_ = runtime.RespondPermission(respondCtx, *msg.ID,
+				claudeacp.PermissionDecision{Outcome: "declined"})
+		}
+	case "fs/read_text_file":
+		if msg.ID != nil {
+			respondCtx, cancel := context.WithTimeout(context.Background(), c.requestTimeout)
+			defer cancel()
+			_ = runtime.RespondPermission(respondCtx, *msg.ID,
+				claudeacp.PermissionDecision{})
+		}
+	default:
+		if msg.Method != "" && msg.ID != nil {
+			// Unknown inbound request — log and do NOT cancel the turn.
+			observability.LogACPMessage(c.Name(), "unsupported-inbound", map[string]any{
+				"method": msg.Method,
+			})
+		}
 	}
 	return nil
 }
@@ -502,6 +572,13 @@ func (c *Client) handlePermissionRequest(
 		RequestID: idToString(*msg.ID),
 		Approval:  mapString(rawParams, "approval"),
 		Command:   mapString(rawParams, "command"),
+		Files:     mapStringSlice(rawParams, "files"),
+		Host:      mapString(rawParams, "host"),
+		Protocol:  mapString(rawParams, "protocol"),
+		Port:      mapInt(rawParams, "port"),
+		MCPServer: mapString(rawParams, "mcpServer"),
+		MCPTool:   mapString(rawParams, "mcpTool"),
+		Message:   mapString(rawParams, "message"),
 		RawParams: rawParams,
 	}
 
@@ -808,6 +885,44 @@ func mapString(values map[string]any, key string) string {
 	value, _ := values[key]
 	text, _ := value.(string)
 	return text
+}
+
+func mapStringSlice(values map[string]any, key string) []string {
+	value, ok := values[key]
+	if !ok {
+		return nil
+	}
+	switch v := value.(type) {
+	case []string:
+		return v
+	case []any:
+		result := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				result = append(result, s)
+			}
+		}
+		return result
+	default:
+		return nil
+	}
+}
+
+func mapInt(values map[string]any, key string) int {
+	value, ok := values[key]
+	if !ok {
+		return 0
+	}
+	switch v := value.(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	default:
+		return 0
+	}
 }
 
 func idToString(raw json.RawMessage) string {
