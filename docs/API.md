@@ -182,6 +182,100 @@ All errors use:
   - `updatedAt` — last-modified timestamp as reported by the provider (omitted if unknown).
   - `_meta` — opaque provider metadata (omitted if empty).
 
+2.4 `GET /v1/agents/{agentId}/mcp/servers`
+- Headers: `X-Client-ID` (required), optional bearer auth if enabled.
+- Query parameters:
+  - `cwd` (optional but recommended) — working directory to pass to the embedded runtime. Required for providers that need a project root (codex, claude).
+- Behavior:
+  - starts a transient embedded runtime for the agent and calls ACP `mcpServer/list`.
+  - returns `503 UPSTREAM_UNAVAILABLE` when the agent does not implement MCP (`ErrMCPUnsupported`) or when the factory is not configured.
+  - returns `404 NOT_FOUND` when `agentId` is not in the runtime allowlist.
+- Response `200`:
+
+```json
+{
+  "servers": [
+    {
+      "name": "filesystem",
+      "description": "Local filesystem access",
+      "enabled": true
+    }
+  ]
+}
+```
+
+- Server fields (all omitempty):
+  - `name` — server identifier as reported by the ACP provider.
+  - `description` — human-readable description.
+  - `enabled` — whether the server is currently active.
+
+2.5 `POST /v1/agents/{agentId}/mcp/call`
+- Headers: `X-Client-ID` (required), `Content-Type: application/json`, optional bearer auth if enabled.
+- Behavior:
+  - starts a transient embedded runtime and invokes an MCP tool via ACP `mcpServer/call`.
+  - returns `503 UPSTREAM_UNAVAILABLE` when the agent does not implement MCP.
+  - returns `404 NOT_FOUND` when `agentId` is not in the runtime allowlist.
+- Request:
+
+```json
+{
+  "cwd": "/abs/path",
+  "server": "filesystem",
+  "tool": "read_file",
+  "arguments": {"path": "/etc/hosts"}
+}
+```
+
+- Request fields:
+  - `cwd` (optional but recommended) — working directory for the embedded runtime.
+  - `server` (required) — MCP server name.
+  - `tool` (required) — tool name to invoke.
+  - `arguments` (optional) — tool arguments object.
+
+- Response `200`:
+
+```json
+{
+  "result": { "content": "..." },
+  "isError": false
+}
+```
+
+2.6 `POST /v1/agents/{agentId}/mcp/oauth`
+- Headers: `X-Client-ID` (required), `Content-Type: application/json`, optional bearer auth if enabled.
+- Behavior:
+  - starts a transient embedded runtime and initiates an MCP OAuth flow via ACP `mcpServer/oauth/login`.
+  - returns `503 UPSTREAM_UNAVAILABLE` when the agent does not implement MCP OAuth.
+  - returns `404 NOT_FOUND` when `agentId` is not in the runtime allowlist.
+- Request:
+
+```json
+{
+  "cwd": "/abs/path",
+  "server": "github"
+}
+```
+
+- Request fields:
+  - `cwd` (optional but recommended) — working directory for the embedded runtime.
+  - `server` (required) — MCP server name to authenticate.
+
+- Response `200`:
+
+```json
+{
+  "loginUrl": "https://github.com/login/oauth/authorize?...",
+  "status": "pending"
+}
+```
+
+**Thread-scoped MCP endpoints:** All three endpoints above are also available scoped to a thread:
+- `GET /v1/threads/{threadId}/mcp/servers` — automatically uses `thread.cwd`; no `?cwd=` needed.
+- `POST /v1/threads/{threadId}/mcp/call` — automatically uses `thread.cwd`; no `cwd` in body needed.
+- `POST /v1/threads/{threadId}/mcp/oauth` — automatically uses `thread.cwd`; no `cwd` in body needed.
+- All thread-scoped endpoints require `X-Client-ID` ownership validation and return `404` for missing/unowned threads.
+- `cwd` from the request overrides the thread's `cwd` if explicitly provided.
+
 3. `POST /v1/threads`
 - Headers: `X-Client-ID` (required), optional bearer auth if enabled.
 - Request:

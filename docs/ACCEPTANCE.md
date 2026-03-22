@@ -433,3 +433,23 @@ This checklist defines executable acceptance checks for requirements 1-16.
   - `go test ./internal/httpapi -run 'TestTurnsSSEIncludesToolCallUpdatesAndPersistsHistory' -count=1`
   - `cd internal/webui/web && npm run build`
   - `go test ./...`
+
+## Requirement 26: MCP Server Management Endpoints
+
+- Operation:
+  - call `GET /v1/agents/{agentId}/mcp/servers?cwd=<dir>` for a supported (embedded) and an unsupported (stdio) agent.
+  - call `POST /v1/agents/{agentId}/mcp/call` with `server`, `tool`, `arguments`, `cwd` in body.
+  - call `POST /v1/agents/{agentId}/mcp/oauth` with `server`, `cwd` in body.
+  - repeat each call via thread-scoped routes `GET /v1/threads/{threadId}/mcp/servers`, `POST /v1/threads/{threadId}/mcp/call`, `POST /v1/threads/{threadId}/mcp/oauth` (omitting `cwd` — thread record supplies it).
+- Expected:
+  - embedded providers (codex, claude) route to the ACP runtime; result depends on runtime MCP config.
+  - non-embedded providers (gemini, opencode, qwen, kimi) return `503 UPSTREAM_UNAVAILABLE`.
+  - thread-scoped routes inject `thread.cwd` automatically; no `cwd` field/parameter required from caller.
+  - missing `server` or `tool` fields return `400 INVALID_ARGUMENT`.
+  - unknown `agentId` returns `404 NOT_FOUND`.
+  - thread-scoped routes return `404 NOT_FOUND` for missing or unowned threads.
+- Verification commands (executed 2026-03-22):
+  - `go build ./...` (pass)
+  - `go test ./...` (pass)
+  - live: `curl -s -H "X-Client-ID: test" "http://localhost:8787/v1/agents/codex/mcp/servers?cwd=/tmp"` → ACP call routed to codex runtime
+  - live: `curl -s -H "X-Client-ID: test" "http://localhost:8787/v1/agents/gemini/mcp/servers?cwd=/tmp"` → `{"error":{"code":"UPSTREAM_UNAVAILABLE",...}}`

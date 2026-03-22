@@ -801,3 +801,29 @@ Both embedded providers (`codex`, `claude`) now have a `default:` arm in their `
 - `Message`
 
 Unknown inbound methods (for example `fs/write_text_file`, `fs/read_text_file`) now receive a graceful error response instead of crashing the turn.
+
+### 21.5 MCP Server Management
+
+ngent exposes three ACP MCP methods as HTTP endpoints at both the agent level and the thread level.
+
+**Agent-scoped endpoints:**
+- `GET /v1/agents/{agentId}/mcp/servers?cwd=<dir>` — lists MCP servers registered with the agent.
+- `POST /v1/agents/{agentId}/mcp/call` — invokes an MCP tool (`server`, `tool`, `arguments`, `cwd` in body).
+- `POST /v1/agents/{agentId}/mcp/oauth` — starts an MCP OAuth login flow (`server`, `cwd` in body).
+
+**Thread-scoped endpoints (preferred when working within a thread):**
+- `GET /v1/threads/{threadId}/mcp/servers` — same as agent-scoped but uses `thread.cwd` automatically.
+- `POST /v1/threads/{threadId}/mcp/call` — same as agent-scoped with auto `thread.cwd`.
+- `POST /v1/threads/{threadId}/mcp/oauth` — same as agent-scoped with auto `thread.cwd`.
+
+**Implementation:**
+- All six routes are dispatched through `AgentMCPServersFactory`, `AgentMCPCallFactory`, and `AgentMCPOAuthFactory` in `httpapi.Config`.
+- Each factory creates a transient embedded runtime (`codexagent.New(Config{Dir: cwd, ...})` or `claudeagent.New`) for the duration of the call, then closes it.
+- `cwd` is required by embedded providers (codex, claude). When omitted on agent-scoped endpoints, the embedded runtime may fail; when using thread-scoped endpoints `thread.cwd` is injected automatically via `r.Clone()` with the cwd query parameter set.
+- Non-embedded providers (`gemini`, `opencode`, `qwen`, `kimi`) return `503 UPSTREAM_UNAVAILABLE` (`ErrMCPUnsupported`).
+- When the factory is not configured (nil), all three endpoints return `503 UPSTREAM_UNAVAILABLE`.
+
+**ACP methods called:**
+- `mcpServer/list` — returns an array of registered server objects.
+- `mcpServer/call` — forwards `server`, `tool`, `arguments`; returns `result` + `isError`.
+- `mcpServer/oauth/login` — forwards `server`; returns `loginUrl` and `status`.

@@ -13,6 +13,18 @@ This file is the source of milestone progress, validation commands, and next act
 
 ## Latest Update (2026-03-22)
 
+- `Post-M8` MCP server management endpoints completed:
+  - added `GET /v1/agents/{agentId}/mcp/servers`, `POST /v1/agents/{agentId}/mcp/call`, `POST /v1/agents/{agentId}/mcp/oauth` routes.
+  - added matching thread-scoped routes: `GET /v1/threads/{threadId}/mcp/servers`, `POST /v1/threads/{threadId}/mcp/call`, `POST /v1/threads/{threadId}/mcp/oauth`.
+  - thread-scoped handlers inject `thread.cwd` into the request automatically so callers do not need to supply it.
+  - `AgentMCPServersFactory`, `AgentMCPCallFactory`, `AgentMCPOAuthFactory` factory types added to `httpapi.Config`; all three wired in `cmd/ngent/main.go` for `codex` and `claude` embedded providers.
+  - each factory creates a transient embedded runtime with `Config.Dir = cwd`, calls the ACP method, and closes the runtime.
+  - non-embedded providers return `503 UPSTREAM_UNAVAILABLE`.
+  - validation:
+    - pass: `go build ./...`
+    - pass: `go test ./...`
+    - live: `GET /v1/agents/codex/mcp/servers?cwd=/tmp` → ACP call reached codex runtime (mcpServer/list method not found in /tmp context, confirming routing is correct); `GET /v1/agents/gemini/mcp/servers?cwd=/tmp` → `503 UPSTREAM_UNAVAILABLE` (correct for non-embedded provider)
+
 - `Post-M8` TODO checklist events completed:
   - added `agents.TodoItem` struct and `agents.TodoUpdateHandler` callback in `internal/agents/agents.go`.
   - extended `ParseACPUpdate` in `internal/agents/acp_update.go` to extract the top-level `todo` array from every `session/update` payload, regardless of the primary update type.
