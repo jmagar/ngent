@@ -933,15 +933,51 @@ func (c *Client) startRuntime(
 		AgentInfo *struct {
 			Name    string `json:"name"`
 			Version string `json:"version"`
+			Title   string `json:"title"`
 		} `json:"agentInfo"`
+		AgentCapabilities struct {
+			LoadSession         bool `json:"loadSession"`
+			SessionCapabilities struct {
+				List   json.RawMessage `json:"list"`
+				Fork   json.RawMessage `json:"fork"`
+				Resume json.RawMessage `json:"resume"`
+			} `json:"sessionCapabilities"`
+			PromptCapabilities struct {
+				Image bool `json:"image"`
+				Audio bool `json:"audio"`
+			} `json:"promptCapabilities"`
+			MCPCapabilities struct {
+				HTTP bool `json:"http"`
+				SSE  bool `json:"sse"`
+			} `json:"mcpCapabilities"`
+		} `json:"agentCapabilities"`
 	}
-	if jsonErr := json.Unmarshal(initResp.Result, &initResult); jsonErr == nil && initResult.AgentInfo != nil {
-		c.mu.Lock()
-		c.adapterInfo = &agents.AdapterInfo{
-			Name:    initResult.AgentInfo.Name,
-			Version: initResult.AgentInfo.Version,
+	if jsonErr := json.Unmarshal(initResp.Result, &initResult); jsonErr == nil {
+		info := &agents.AdapterInfo{}
+		if initResult.AgentInfo != nil {
+			info.Name = initResult.AgentInfo.Name
+			info.Version = initResult.AgentInfo.Version
+			info.Title = initResult.AgentInfo.Title
 		}
-		c.mu.Unlock()
+		ac := initResult.AgentCapabilities
+		caps := &agents.AdapterCapabilities{
+			LoadSession:  ac.LoadSession || agentutil.IsTruthy(ac.SessionCapabilities.Resume),
+			ListSessions: agentutil.IsTruthy(ac.SessionCapabilities.List),
+			ForkSession:  agentutil.IsTruthy(ac.SessionCapabilities.Fork),
+			ImagePrompt:  ac.PromptCapabilities.Image,
+			AudioPrompt:  ac.PromptCapabilities.Audio,
+			MCPOverHTTP:  ac.MCPCapabilities.HTTP,
+			MCPOverSSE:   ac.MCPCapabilities.SSE,
+		}
+		if caps.LoadSession || caps.ListSessions || caps.ForkSession ||
+			caps.ImagePrompt || caps.AudioPrompt || caps.MCPOverHTTP || caps.MCPOverSSE {
+			info.Capabilities = caps
+		}
+		if info.Name != "" || info.Version != "" || info.Capabilities != nil {
+			c.mu.Lock()
+			c.adapterInfo = info
+			c.mu.Unlock()
+		}
 	}
 
 	return runtime, acpsession.ParseInitializeCapabilities(initResp.Result), nil

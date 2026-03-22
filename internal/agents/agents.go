@@ -97,10 +97,23 @@ func TurnPromptConfigFromContext(ctx context.Context) (TurnPromptConfig, bool) {
 	return cfg, ok
 }
 
-// AdapterInfo describes the ACP adapter identity returned on initialize.
+// AdapterCapabilities describes ACP feature flags returned on initialize.
+type AdapterCapabilities struct {
+	LoadSession  bool `json:"loadSession,omitempty"`
+	ListSessions bool `json:"listSessions,omitempty"`
+	ImagePrompt  bool `json:"imagePrompt,omitempty"`
+	AudioPrompt  bool `json:"audioPrompt,omitempty"`
+	MCPOverHTTP  bool `json:"mcpOverHTTP,omitempty"`
+	MCPOverSSE   bool `json:"mcpOverSSE,omitempty"`
+	ForkSession  bool `json:"forkSession,omitempty"`
+}
+
+// AdapterInfo describes the ACP adapter identity and capabilities returned on initialize.
 type AdapterInfo struct {
-	Name    string `json:"name,omitempty"`
-	Version string `json:"version,omitempty"`
+	Name         string               `json:"name,omitempty"`
+	Version      string               `json:"version,omitempty"`
+	Title        string               `json:"title,omitempty"`
+	Capabilities *AdapterCapabilities `json:"capabilities,omitempty"`
 }
 
 // StopReason represents why a streamed turn stopped.

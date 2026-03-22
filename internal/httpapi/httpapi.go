@@ -433,9 +433,41 @@ func (s *Server) handleAgents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Merge in any adapterInfo captured lazily from warm cached agents.
+	enriched := make([]AgentInfo, len(s.agents))
+	copy(enriched, s.agents)
+	for i, a := range enriched {
+		if a.AdapterInfo == nil {
+			if info := s.cachedAdapterInfo(a.ID); info != nil {
+				enriched[i].AdapterInfo = info
+			}
+		}
+	}
+
 	writeJSON(w, http.StatusOK, struct {
 		Agents []AgentInfo `json:"agents"`
-	}{Agents: s.agents})
+	}{Agents: enriched})
+}
+
+// cachedAdapterInfo returns the AdapterInfo from any warm cached agent
+// matching agentID, or nil if no such agent is currently warm.
+func (s *Server) cachedAdapterInfo(agentID string) *agents.AdapterInfo {
+	type adapterInfoProvider interface {
+		AdapterInfo() *agents.AdapterInfo
+	}
+	s.agentMu.Lock()
+	defer s.agentMu.Unlock()
+	for _, entry := range s.agentsByScope {
+		if entry.agentID != agentID {
+			continue
+		}
+		if aip, ok := entry.provider.(adapterInfoProvider); ok {
+			if info := aip.AdapterInfo(); info != nil {
+				return info
+			}
+		}
+	}
+	return nil
 }
 
 func (s *Server) handleAgentModels(w http.ResponseWriter, r *http.Request, agentID string) {
@@ -2184,6 +2216,7 @@ func (s *Server) resolveTurnAgent(thread storage.Thread) (agents.Streamer, error
 	s.agentsByScope[scopeKey] = &managedAgent{
 		scopeKey:  scopeKey,
 		threadID:  thread.ThreadID,
+		agentID:   thread.AgentID,
 		sessionID: sessionID,
 		provider:  provider,
 		closer:    closer,
@@ -2656,6 +2689,7 @@ type pendingPermission struct {
 type managedAgent struct {
 	scopeKey  string
 	threadID  string
+	agentID   string
 	sessionID string
 	provider  agents.Streamer
 	closer    io.Closer
