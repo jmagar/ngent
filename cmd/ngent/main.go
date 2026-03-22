@@ -65,6 +65,20 @@ func main() {
 
 	codexRuntimeConfig := codexagent.DefaultRuntimeConfig()
 	codexPreflightErr := codexagent.Preflight(codexRuntimeConfig)
+
+	codexProfiles := make([]httpapi.AgentProfile, 0, len(codexRuntimeConfig.Profiles))
+	for name, p := range codexRuntimeConfig.Profiles {
+		codexProfiles = append(codexProfiles, httpapi.AgentProfile{
+			Name:               name,
+			Model:              p.Model,
+			ThoughtLevel:       p.ThoughtLevel,
+			ApprovalPolicy:     p.ApprovalPolicy,
+			Sandbox:            p.Sandbox,
+			Personality:        p.Personality,
+			SystemInstructions: p.SystemInstructions,
+		})
+	}
+
 	opencodePreflightErr := opencodeagent.Preflight()
 	geminiPreflightErr := geminiagent.Preflight()
 	kimiPreflightErr := kimiagent.Preflight()
@@ -285,6 +299,10 @@ func main() {
 			default:
 				return agentimpl.SessionListResult{}, agentimpl.ErrSessionListUnsupported
 			}
+		},
+		AgentProfilesMap: map[string][]httpapi.AgentProfile{
+			agentimpl.AgentIDCodex:  codexProfiles,
+			agentimpl.AgentIDClaude: {},
 		},
 		ContextRecentTurns: *contextRecentTurns,
 		ContextMaxChars:    *contextMaxChars,

@@ -445,6 +445,24 @@ func (s *Server) handleAgentModels(w http.ResponseWriter, r *http.Request, agent
 	})
 }
 
+func (s *Server) handleAgentProfiles(w http.ResponseWriter, r *http.Request, agentID string) {
+	if r.Method != http.MethodGet {
+		writeMethodNotAllowed(w, r)
+		return
+	}
+	if _, ok := s.allowedAgent[agentID]; !ok {
+		writeError(w, http.StatusNotFound, codeNotFound, "agent not found", map[string]any{"agent": agentID})
+		return
+	}
+	profiles := s.agentProfilesMap[agentID]
+	if profiles == nil {
+		profiles = []AgentProfile{}
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Profiles []AgentProfile `json:"profiles"`
+	}{Profiles: profiles})
+}
+
 func (s *Server) handleAgentSessions(w http.ResponseWriter, r *http.Request, agentID string) {
 	if r.Method != http.MethodGet {
 		writeMethodNotAllowed(w, r)
@@ -2489,9 +2507,10 @@ func parseThreadPath(path string) (threadID, subresource string, ok bool) {
 	return "", "", false
 }
 
-func parseAgentModelsPath(path string) (agentID string, ok bool) {
+// parseAgentSubPath matches /v1/agents/{agentId}/{sub} and returns the agentID.
+// The suffix must begin with "/" (e.g. "/models", "/sessions", "/profiles").
+func parseAgentSubPath(path, suffix string) (agentID string, ok bool) {
 	const prefix = "/v1/agents/"
-	const suffix = "/models"
 	if !strings.HasPrefix(path, prefix) || !strings.HasSuffix(path, suffix) {
 		return "", false
 	}
@@ -2503,19 +2522,16 @@ func parseAgentModelsPath(path string) (agentID string, ok bool) {
 	return raw, true
 }
 
-// parseAgentSessionsPath matches /v1/agents/{agentId}/sessions
+func parseAgentModelsPath(path string) (agentID string, ok bool) {
+	return parseAgentSubPath(path, "/models")
+}
+
 func parseAgentSessionsPath(path string) (agentID string, ok bool) {
-	const prefix = "/v1/agents/"
-	const suffix = "/sessions"
-	if !strings.HasPrefix(path, prefix) || !strings.HasSuffix(path, suffix) {
-		return "", false
-	}
-	raw := strings.TrimSuffix(strings.TrimPrefix(path, prefix), suffix)
-	raw = strings.Trim(raw, "/")
-	if raw == "" || strings.Contains(raw, "/") {
-		return "", false
-	}
-	return raw, true
+	return parseAgentSubPath(path, "/sessions")
+}
+
+func parseAgentProfilesPath(path string) (agentID string, ok bool) {
+	return parseAgentSubPath(path, "/profiles")
 }
 
 func parsePermissionPath(path string) (permissionID string, ok bool) {

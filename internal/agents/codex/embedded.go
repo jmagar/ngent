@@ -82,6 +82,8 @@ type Client struct {
 	slashCommandsKnown bool
 	slashCommandsReady chan struct{}
 
+	adapterInfo *agents.AdapterInfo
+
 	requestSeq uint64
 }
 
@@ -200,6 +202,16 @@ func (c *Client) Name() string {
 		return "codex-embedded"
 	}
 	return c.name
+}
+
+// AdapterInfo returns adapter identity captured during ACP initialize, if available.
+func (c *Client) AdapterInfo() *agents.AdapterInfo {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.adapterInfo
 }
 
 // ConfigOptions returns current ACP session config options.

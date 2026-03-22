@@ -92,6 +92,12 @@ func TurnPromptConfigFromContext(ctx context.Context) (TurnPromptConfig, bool) {
 	return cfg, ok
 }
 
+// AdapterInfo describes the ACP adapter identity returned on initialize.
+type AdapterInfo struct {
+	Name    string `json:"name,omitempty"`
+	Version string `json:"version,omitempty"`
+}
+
 // StopReason represents why a streamed turn stopped.
 type StopReason string
 
